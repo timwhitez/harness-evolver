@@ -1,0 +1,60 @@
+name: Validate issue 1 fix
+
+on:
+  push:
+    branches:
+      - fix/issue-1-wheel-entrypoints
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.event.head_commit.message != 'chore: remove issue 1 validation workflow'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact branch commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Validate setuptools package discovery
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import tomllib
+          from setuptools.discovery import PEP420PackageFinder
+
+          root = Path.cwd()
+          config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+          include = config["tool"]["setuptools"]["packages"]["find"]["include"]
+          discovered = set(PEP420PackageFinder.find(where=str(root), include=include))
+          required = {
+              "harness_evolver",
+              "scripts",
+              "scripts.run_trial",
+              "scripts.regression_check",
+              "scripts.compare_trials",
+              "scripts.mission_debug",
+          }
+          missing = sorted(required - discovered)
+          assert not missing, f"packages omitted from wheel discovery: {missing}"
+          PY
+
+      - name: Remove one-shot validation workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git checkout -B fix/issue-1-wheel-entrypoints
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/validate-issue-1.yml
+          git commit -m "chore: remove issue 1 validation workflow"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:fix/issue-1-wheel-entrypoints
