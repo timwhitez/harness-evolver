@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shlex
-import signal
 import sys
 import time
 
