@@ -1,0 +1,74 @@
+# Harbor / TerminalBench downloaded tasks
+terminal-bench/
+terminal-bench-tasks/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+.claude/settings.local.json
+.codex/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*
+!.env.example
+*.env
+config/local.yaml
+config/local.yml
+
+# Harbor runtime jobs
+jobs/
+
+# Trials data (runtime artifacts)
+trials/runs/
+trials/summaries/
+trials/diffs/
+trials/goals/
+trials/memory/
+trials/regressions/
+trials/submissions/
+trials/background_logs/
+trials/*/
+
+# But keep the directory structure
+!trials/runs/.gitkeep
+!trials/summaries/.gitkeep
+!trials/diffs/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.tar
+*.tar.gz
+
+# Local reports and scratch files
+*.log
+*.tmp
+*.bak
+*.orig
+coverage.xml
+.tox/
+
+# Rust
+target/
+crates/*/target/

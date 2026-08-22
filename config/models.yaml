@@ -1,0 +1,80 @@
+# Role/provider configuration for HarnessEvolver.
+# Secret values are never stored here; only environment variable names are.
+
+roles:
+  # For provider-backed roles, timeout_seconds is a single model-provider
+  # request timeout passed to LiteLLM. It is not a master, sub-agent, Codex
+  # update, diagnostic/context, or Worker loop deadline; request timeouts are
+  # recorded and routed through Worker recovery.
+  worker:
+    provider: openai_compatible
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    model: deepseek-v4-pro
+    reasoning:
+      effort: max
+      max_tokens: null
+      exclude: false
+    max_output_tokens: 8000
+    timeout_seconds: 1800
+    max_retries: 5
+
+  worker_gpt:
+    provider: openai
+    # Null uses the provider's normal endpoint. Put private proxies or custom
+    # gateways in gitignored config/local.yaml instead.
+    base_url: null
+    api_key_env: OPENAI_API_KEY
+    model: gpt-5.4
+    reasoning:
+      effort: xhigh
+      max_tokens: null
+      exclude: false
+    max_output_tokens: 8000
+    timeout_seconds: 1800
+    max_retries: 5
+
+  worker_deepseek:
+    provider: openai_compatible
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    model: deepseek-v4-pro
+    reasoning:
+      effort: max
+      max_tokens: null
+      exclude: false
+    max_output_tokens: 8000
+    timeout_seconds: 1800
+    max_retries: 5
+
+  orchestrator:
+    runner: codex
+    model: gpt-5.4
+    reasoning:
+      effort: xhigh
+      max_tokens: null
+      exclude: false
+    sandbox: danger-full-access
+    # Compatibility/audit only. Codex updater sub-agent, diagnostic/context
+    # sub-agent, master, and Worker loops are never killed by this value.
+    # Leave null to record no wall-clock reference.
+    timeout_seconds: null
+
+  validator:
+    provider: anthropic
+    base_url: null
+    api_key_env: ANTHROPIC_API_KEY
+    model: claude-sonnet-4-6
+    reasoning:
+      effort: max
+      max_tokens: 32000
+      exclude: false
+    max_output_tokens: 8000
+    timeout_seconds: 300
+    max_retries: 3
+
+defaults:
+  temperature: 0.0
+  # Provider-request default only; not a loop stop condition.
+  timeout: 300
+  max_retries: 3

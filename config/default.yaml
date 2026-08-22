@@ -1,0 +1,167 @@
+# Default harness configuration for HarnessEvolver
+# This is the versioned, serializable state of all harness components.
+# The meta-agent updates this file when it edits components.
+
+version: "0.1.0"
+created_at: "2026-05-11T00:00:00"
+updated_at: "2026-05-11T00:00:00"
+
+model: "claude-sonnet-4-6"
+# Compatibility/progress reference only. 0 means no turn-count reference;
+# Worker loops do not stop on turn count.
+max_turns_audit: 0
+# Legacy single model-provider request timeout reference. This is not a
+# master, sub-agent, Codex update, diagnostic/context, or Worker loop deadline.
+timeout_seconds: 1800
+thinking_budget: 16000
+reasoning:
+  effort: xhigh
+  max_tokens: 16000
+  exclude: false
+
+prompts:
+  worker_policy:
+    name: "worker_policy"
+    path: "crates/hl-worker-core/src/main.rs"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  recovery:
+    name: "recovery"
+    path: "harness/prompts/recovery.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+
+tools:
+  shell:
+    name: "bash"
+    path: "harness/tools/shell.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  file_read:
+    name: "read"
+    path: "harness/tools/file_read.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  file_edit:
+    name: "edit"
+    path: "harness/tools/file_edit.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  file_write:
+    name: "write"
+    path: "harness/tools/file_write.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  grep:
+    name: "grep"
+    path: "harness/tools/search.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  glob:
+    name: "glob"
+    path: "harness/tools/search.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+
+planning:
+  todo_enforcement:
+    name: "todo_enforcement"
+    path: "harness/planning/todo_enforcement.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  progressive_thinking:
+    name: "progressive_thinking"
+    path: "harness/planning/progressive_thinking.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  decomposition:
+    name: "task_decomposition"
+    path: "harness/planning/decomposition.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+
+context:
+  compaction:
+    name: "compaction"
+    path: "harness/context/compaction.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  isolation:
+    name: "context_isolation"
+    path: "harness/context/isolation.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+
+entrypoint:
+  bounded_scan:
+    name: "bounded_entrypoint_scan"
+    path: "crates/hl-worker-core/src/main.rs"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  environment:
+    name: "environment_awareness"
+    path: "harness/entrypoint/environment.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+
+recovery:
+  patterns:
+    name: "error_patterns"
+    path: "harness/recovery/patterns.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  retry:
+    name: "retry_strategy"
+    path: "harness/recovery/retry.py"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+
+verification:
+  checks:
+    name: "post_task_checks"
+    path: "crates/hl-worker-core/src/main.rs"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true
+  self_test:
+    name: "self_test"
+    path: "crates/hl-worker-core/src/main.rs"
+    version: "0.1.0"
+    content_hash: "initial"
+    dependencies: []
+    enabled: true

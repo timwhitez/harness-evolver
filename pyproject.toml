@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness-evolver"
+version = "0.1.0"
+description = "Heuristic Learning Framework for TerminalBench 2.0 Harness Optimization"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "HarnessEvolver Team"}
+]
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "litellm>=1.50.0",
+    "harbor>=0.1.0",
+    "click>=8.0",
+    "rich>=13.0",
+    "jinja2>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+harness-evolver-trial = "harness_evolver.cli:trial"
+harness-evolver-regression = "harness_evolver.cli:regression"
+harness-evolver-compare = "harness_evolver.cli:compare"
+harness-evolver-mission-debug = "harness_evolver.cli:mission_debug"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hl*", "harness*", "bench*", "meta*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
