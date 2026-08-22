@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
-import time
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +13,7 @@ from harness.tools.base import (
     operation_timeout_metadata,
     policy_guard_metadata,
 )
+from harness.tools.process_runner import run_bounded_shell
 from harness.tools.shell import external_agent_command_reason, shell_semantic_failure_kind
 
 
@@ -301,43 +300,52 @@ class VerifyTool(ToolDef):
                     nested_sub_agent_creation_stop_condition=False,
                 ),
             )
-        timeout = timeout or self.timeout_seconds
-        start = time.time()
+
+        effective_timeout = self.timeout_seconds if timeout is None else timeout
         try:
-            completed = subprocess.run(
+            completed = run_bounded_shell(
                 command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                timeout_seconds=effective_timeout,
                 cwd=kwargs.get("cwd"),
             )
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    f"verification timed out after {timeout}s. This is an "
-                    "operation timeout, not a Worker, sub-agent, or master "
-                    "loop stop condition."
-                ),
-                duration_ms=(time.time() - start) * 1000,
-                metadata=operation_timeout_metadata(
-                    timeout_seconds=timeout,
-                    requested_timeout_seconds=timeout,
-                    elapsed_ms=(time.time() - start) * 1000,
-                    telemetry_source="verify",
-                ),
-            )
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
         output = completed.stdout
         if completed.stderr:
             output += f"\n[stderr]\n{completed.stderr}"
+
+        if completed.timed_out:
+            return ToolResult(
+                success=False,
+                output=output,
+                error=(
+                    f"verification timed out after {effective_timeout}s. The complete "
+                    "verification process tree was terminated. This is an operation "
+                    "timeout, not a Worker, sub-agent, or master loop stop condition."
+                ),
+                duration_ms=completed.elapsed_ms,
+                metadata=operation_timeout_metadata(
+                    timeout_seconds=effective_timeout,
+                    requested_timeout_seconds=timeout,
+                    elapsed_ms=completed.elapsed_ms,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    telemetry_source="verify",
+                    process_tree_terminated=True,
+                    output_bounded=True,
+                ),
+            )
+
         semantic_failure = verify_semantic_failure_kind(
             output,
             command=command,
             returncode=completed.returncode,
         )
-        metadata = {"exit_code": completed.returncode}
+        metadata = {
+            "exit_code": completed.returncode,
+            "output_bounded": True,
+        }
         if semantic_failure:
             metadata.update(
                 {
@@ -356,6 +364,6 @@ class VerifyTool(ToolDef):
                 if semantic_failure
                 else "" if completed.returncode == 0 else f"exit code: {completed.returncode}"
             ),
-            duration_ms=(time.time() - start) * 1000,
+            duration_ms=completed.elapsed_ms,
             metadata=metadata,
         )
