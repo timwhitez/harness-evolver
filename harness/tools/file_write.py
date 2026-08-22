@@ -1,13 +1,16 @@
-"""FileWrite tool — atomic whole-file write.
+"""FileWrite tool — atomic whole-file replacement.
 
-Creates or overwrites a file atomically.  Used for creating new files
-or completely rewriting existing ones.
+Content is written to a same-directory temporary file and committed with
+``os.replace``. A failure before replacement leaves the prior target intact.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import stat
+import tempfile
 from typing import Any
 
 from harness.tools.base import ToolDef, ToolResult, ToolSchema, policy_guard_metadata
@@ -23,13 +26,57 @@ from harness.tools.shell import (
 )
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace ``path`` with UTF-8 text.
+
+    The temporary file lives in the destination directory so ``os.replace``
+    remains an atomic same-filesystem operation. Existing permission bits are
+    copied before replacement. The temporary file is removed on every failure
+    path.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode: int | None = None
+    try:
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        pass
+
+    file_descriptor = -1
+    temporary_path: Path | None = None
+    try:
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.hl-write-",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline=None) as stream:
+            file_descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        if existing_mode is not None:
+            os.chmod(temporary_path, existing_mode)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 @dataclass
 class FileWriteTool(ToolDef):
     name: str = "write"
     version: str = "0.1.0"
     dependencies: list[str] = field(default_factory=list)
     description: str = (
-        "Write a file to the filesystem. Overwrites existing files. "
+        "Atomically write a file to the filesystem. Overwrites existing files. "
         "Use this for creating new files or completely rewriting existing ones. "
         "For editing existing files, prefer the 'edit' tool."
     )
@@ -97,15 +144,21 @@ class FileWriteTool(ToolDef):
                 ),
             )
 
-        # Ensure parent directory exists
-        path.parent.mkdir(parents=True, exist_ok=True)
-
         try:
-            path.write_text(content)
+            _atomic_write_text(path, content)
             return ToolResult(
                 success=True,
                 output=f"Wrote {len(content)} chars to {file_path}",
-                metadata={"chars_written": len(content), "lines": content.count("\n") + 1},
+                metadata={
+                    "chars_written": len(content),
+                    "lines": content.count("\n") + 1,
+                    "atomic_replace": True,
+                },
             )
-        except Exception as e:
-            return ToolResult(success=False, output="", error=str(e))
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=str(exc),
+                metadata={"atomic_replace": False},
+            )
