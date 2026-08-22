@@ -11,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -45,6 +46,15 @@ OFFICIAL_LIMITS_ERROR = (
     "timeouts/resources unchanged. Remove {source}; timeout failures must be "
     "fixed by Worker strategy within the task's official limits."
 )
+
+
+T = TypeVar("T")
+
+
+def _prefer_explicit(value: T | None, fallback: T | None) -> T | None:
+    """Use a fallback only when the higher-precedence value is absent."""
+
+    return fallback if value is None else value
 
 
 def add_docker_resource_args(parser: argparse.ArgumentParser) -> None:
@@ -359,17 +369,29 @@ def resolve_agent_config(
         models = ModelsConfig.from_yaml(models_path)
         if worker_role in models.roles:
             worker = models.get_role(worker_role)
-            model = model or worker.model
-            provider = provider or worker.provider
-            base_url = base_url or worker.base_url
-            api_key_env = api_key_env or worker.api_key_env
-            reasoning_effort = reasoning_effort or worker.reasoning.effort
-            reasoning_max_tokens = reasoning_max_tokens or worker.reasoning.max_tokens
-            max_output_tokens = max_output_tokens or (
-                str(worker.max_output_tokens) if worker.max_output_tokens else None
+            model = _prefer_explicit(model, worker.model)
+            provider = _prefer_explicit(provider, worker.provider)
+            base_url = _prefer_explicit(base_url, worker.base_url)
+            api_key_env = _prefer_explicit(api_key_env, worker.api_key_env)
+            reasoning_effort = _prefer_explicit(reasoning_effort, worker.reasoning.effort)
+            reasoning_max_tokens = _prefer_explicit(
+                reasoning_max_tokens,
+                worker.reasoning.max_tokens,
             )
-            llm_timeout_seconds = llm_timeout_seconds or worker.timeout_seconds
-            max_retries = max_retries or worker.max_retries
+            worker_max_output_tokens = (
+                str(worker.max_output_tokens)
+                if worker.max_output_tokens is not None
+                else None
+            )
+            max_output_tokens = _prefer_explicit(
+                max_output_tokens,
+                worker_max_output_tokens,
+            )
+            llm_timeout_seconds = _prefer_explicit(
+                llm_timeout_seconds,
+                worker.timeout_seconds,
+            )
+            max_retries = _prefer_explicit(max_retries, worker.max_retries)
             custom_llm_provider = worker.extra.get("custom_llm_provider")
         elif getattr(args, "worker_role", None):
             parser.error(
