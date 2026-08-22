@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
+import sys
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -172,14 +174,43 @@ class RetryStrategy(ErrorRecovery):
         )
 
     def delay_for_attempt(self, retry_attempt: int) -> float:
-        """Return the deterministic exponential backoff delay for a retry attempt."""
+        """Return a finite, saturating exponential backoff delay.
+
+        A configured ``max_delay_seconds`` is applied before exponentiation can
+        overflow. In uncapped mode the delay saturates at the largest finite
+        Python float, preserving the method's finite-float return contract.
+        """
 
         if retry_attempt < 1:
             raise ValueError("retry_attempt must be >= 1")
-        delay = self.base_delay_seconds * (self.backoff_multiplier ** (retry_attempt - 1))
-        if self.max_delay_seconds is not None:
-            delay = min(delay, self.max_delay_seconds)
-        return float(delay)
+
+        base = float(self.base_delay_seconds)
+        multiplier = float(self.backoff_multiplier)
+        configured_cap = self.max_delay_seconds
+        cap = float(configured_cap) if configured_cap is not None else sys.float_info.max
+
+        if not math.isfinite(base) or base < 0:
+            raise ValueError("base_delay_seconds must be finite and >= 0")
+        if not math.isfinite(multiplier) or multiplier < 1:
+            raise ValueError("backoff_multiplier must be finite and >= 1")
+        if not math.isfinite(cap) or cap < 0:
+            raise ValueError("max_delay_seconds must be finite and >= 0 when set")
+
+        if base == 0 or cap == 0:
+            return 0.0
+        if multiplier == 1:
+            return min(base, cap)
+        if base >= cap:
+            return cap
+
+        exponent = retry_attempt - 1
+        saturation_exponent = math.log(cap / base) / math.log(multiplier)
+        if exponent >= saturation_exponent:
+            return cap
+
+        # The logarithmic saturation check above guarantees that this
+        # intermediate remains within the selected finite cap.
+        return min(float(base * (multiplier**exponent)), cap)
 
     def failure_signature(
         self,
@@ -227,12 +258,14 @@ class RetryStrategy(ErrorRecovery):
         errors: list[str] = []
         if self.max_retries < 0:
             errors.append("max_retries must be >= 0")
-        if self.base_delay_seconds < 0:
-            errors.append("base_delay_seconds must be >= 0")
-        if self.backoff_multiplier < 1:
-            errors.append("backoff_multiplier must be >= 1")
-        if self.max_delay_seconds is not None and self.max_delay_seconds < 0:
-            errors.append("max_delay_seconds must be >= 0 when set")
+        if not math.isfinite(self.base_delay_seconds) or self.base_delay_seconds < 0:
+            errors.append("base_delay_seconds must be finite and >= 0")
+        if not math.isfinite(self.backoff_multiplier) or self.backoff_multiplier < 1:
+            errors.append("backoff_multiplier must be finite and >= 1")
+        if self.max_delay_seconds is not None and (
+            not math.isfinite(self.max_delay_seconds) or self.max_delay_seconds < 0
+        ):
+            errors.append("max_delay_seconds must be finite and >= 0 when set")
         return errors
 
     def raw_content(self) -> str:
