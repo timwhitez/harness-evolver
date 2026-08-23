@@ -103,25 +103,24 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         _reap_process(process)
         return
 
-    if process.poll() is not None:
-        return
-
     if os.name == "nt":
-        try:
-            process.send_signal(signal.CTRL_BREAK_EVENT)
-        except (OSError, ValueError):
-            pass
-        if _wait_for_exit(process, _TERMINATION_GRACE_SECONDS):
-            return
+        # A shell can exit after a console control event while descendants keep
+        # running. Invoke taskkill on the still-known root PID immediately and
+        # let Windows terminate the complete tree in one operation; never treat
+        # parent exit alone as proof that cleanup completed.
         subprocess.run(
             ["taskkill", "/PID", str(process.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
         )
-        _wait_for_exit(process, _TERMINATION_GRACE_SECONDS)
+        if not _wait_for_exit(process, _TERMINATION_GRACE_SECONDS):
+            process.kill()
+            _wait_for_exit(process, _TERMINATION_GRACE_SECONDS)
         return
 
+    if process.poll() is not None:
+        return
     process.terminate()
     if not _wait_for_exit(process, _TERMINATION_GRACE_SECONDS):
         process.kill()
