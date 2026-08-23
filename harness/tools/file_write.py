@@ -9,8 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import secrets
 import stat
-import tempfile
 from typing import Any
 
 from harness.tools.base import ToolDef, ToolResult, ToolSchema, policy_guard_metadata
@@ -26,30 +26,47 @@ from harness.tools.shell import (
 )
 
 
+def _create_same_directory_temp(path: Path) -> tuple[int, Path]:
+    """Create a unique temporary file using normal create-mode semantics.
+
+    ``tempfile.mkstemp`` always creates mode 0600, which would silently change
+    the behavior of a newly created FileWrite target. Opening an unpredictable
+    O_EXCL name with mode 0666 preserves the process umask just like the former
+    direct ``Path.write_text`` implementation.
+    """
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for _ in range(128):
+        temporary_path = path.parent / f".{path.name}.hl-write-{secrets.token_hex(8)}"
+        try:
+            return os.open(temporary_path, flags, 0o666), temporary_path
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Could not allocate a unique temporary file beside {path}")
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Atomically replace ``path`` with UTF-8 text.
 
     The temporary file lives in the destination directory so ``os.replace``
-    remains an atomic same-filesystem operation. Existing permission bits are
-    copied before replacement. The temporary file is removed on every failure
-    path.
+    remains an atomic same-filesystem operation. Existing ordinary permission
+    bits are copied before replacement; new files retain normal umask-derived
+    creation permissions. The temporary file is removed on every failure path.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     existing_mode: int | None = None
     try:
-        existing_mode = stat.S_IMODE(path.stat().st_mode)
+        # Preserve ordinary rwx permissions. Do not recreate setuid/setgid bits
+        # on newly written content; an in-place write would clear them as well.
+        existing_mode = stat.S_IMODE(path.stat().st_mode) & 0o777
     except FileNotFoundError:
         pass
 
     file_descriptor = -1
     temporary_path: Path | None = None
     try:
-        file_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.hl-write-",
-            dir=path.parent,
-        )
-        temporary_path = Path(temporary_name)
+        file_descriptor, temporary_path = _create_same_directory_temp(path)
         with os.fdopen(file_descriptor, "w", encoding="utf-8", newline=None) as stream:
             file_descriptor = -1
             stream.write(content)
@@ -66,7 +83,9 @@ def _atomic_write_text(path: Path, content: str) -> None:
         if temporary_path is not None:
             try:
                 temporary_path.unlink()
-            except FileNotFoundError:
+            except OSError:
+                # Preserve the original write/replace error. A stale temporary
+                # path is less harmful than masking the actual failed operation.
                 pass
 
 
