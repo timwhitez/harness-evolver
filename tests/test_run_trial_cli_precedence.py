@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import pytest
@@ -100,9 +101,16 @@ def test_valid_explicit_zero_values_override_positive_role_values(
         ({"max_output_tokens": "0"}, "max_output_tokens must be positive"),
         ({"max_retries": -1}, "max_retries must be non-negative"),
         ({"reasoning_max_tokens": -1}, "reasoning_max_tokens must be non-negative"),
+        ({"max_retries": True}, "max_retries must be an integer, not a boolean"),
+        (
+            {"reasoning_max_tokens": False},
+            "reasoning_max_tokens must be an integer, not a boolean",
+        ),
+        ({"llm_timeout_seconds": math.inf}, "timeout_seconds must be a finite integer"),
+        ({"max_output_tokens": math.nan}, "max_output_tokens must be a finite integer"),
     ],
 )
-def test_invalid_falsy_or_negative_values_fail_instead_of_falling_back(
+def test_invalid_falsy_negative_or_non_integer_values_fail_instead_of_falling_back(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -120,6 +128,28 @@ def test_invalid_falsy_or_negative_values_fail_instead_of_falling_back(
         )
 
     assert message in capsys.readouterr().err
+
+
+def test_integral_finite_float_is_normalized_deterministically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models_config = tmp_path / "models.yaml"
+    _write_models_config(models_config)
+    monkeypatch.chdir(tmp_path)
+
+    result = resolve_agent_config(
+        _args(
+            models_config,
+            tmp_path / "missing-trials.yaml",
+            llm_timeout_seconds=30.0,
+            max_output_tokens=2048.0,
+        ),
+        argparse.ArgumentParser(prog="test"),
+    )
+
+    assert result["timeout_seconds"] == 30
+    assert result["max_output_tokens"] == "2048"
 
 
 def test_none_cli_values_still_fall_back_to_role_configuration(
