@@ -1,4 +1,4 @@
-"""Descriptor-relative filesystem operations that never follow symlink swaps."""
+"""Descriptor-relative filesystem operations that reject path-alias races."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Callable, Iterator
 
 
 class SafePathError(OSError):
-    """Raised when a canonical path cannot be accessed without symlink traversal."""
+    """Raised when a path cannot be attributed to one safe regular-file entry."""
 
 
 @contextmanager
@@ -65,12 +65,34 @@ def _open_parent_nofollow(
         os.close(parent_fd)
 
 
+def _validate_unique_regular_file(
+    metadata: os.stat_result,
+    target: Path,
+) -> None:
+    """Reject special files and hard-link aliases before reading content.
+
+    Canonical path resolution and ``O_NOFOLLOW`` can prove that a directory
+    entry is not a symlink, but a regular file with multiple hard links can have
+    an allowed-looking name while sharing the same inode as hidden verifier or
+    host-memory content. The filesystem does not provide a race-free way to
+    enumerate and authorize every other name for that inode. Content reads
+    therefore fail closed unless the opened inode has exactly one link.
+    """
+
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SafePathError(f"Path is not a regular file: {target}")
+    if metadata.st_nlink != 1:
+        raise SafePathError(
+            f"Refusing multiply linked regular file: {target}"
+        )
+
+
 def read_text_nofollow(
     path: str | os.PathLike[str],
     *,
     errors: str = "replace",
 ) -> tuple[str, os.stat_result]:
-    """Read one regular file from a stable descriptor without following symlinks."""
+    """Read one uniquely linked regular file through stable descriptors."""
 
     with _open_parent_nofollow(path, create_parents=False) as (parent_fd, name, target):
         descriptor = os.open(
@@ -80,8 +102,7 @@ def read_text_nofollow(
         )
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise SafePathError(f"Path is not a regular file: {target}")
+            _validate_unique_regular_file(metadata, target)
             with os.fdopen(
                 descriptor,
                 "r",
@@ -101,7 +122,15 @@ def atomic_write_text_nofollow(
     *,
     mode: int | None = None,
 ) -> None:
-    """Atomically replace a canonical path through a stable parent descriptor."""
+    """Atomically replace a canonical path through a stable parent descriptor.
+
+    A pure overwrite does not consume existing file content. Replacing a
+    hard-linked directory entry is therefore safe and intentionally de-aliases
+    it: the other inode names remain unchanged and the published target becomes
+    a new uniquely linked regular file. Append/edit operations read first and
+    are rejected by :func:`read_text_nofollow` when the existing inode is
+    multiply linked.
+    """
 
     payload = content.encode("utf-8")
     with _open_parent_nofollow(path, create_parents=True) as (parent_fd, name, target):
@@ -134,9 +163,6 @@ def atomic_write_text_nofollow(
             os.close(descriptor)
 
         try:
-            # Recheck immediately before publication. os.replace acts relative
-            # to the already-open parent and replaces a path entry; it never
-            # follows a newly introduced final symlink.
             try:
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if stat.S_ISLNK(current.st_mode):
@@ -161,7 +187,7 @@ def edit_text_nofollow(
     path: str | os.PathLike[str],
     transform: Callable[[str], str],
 ) -> tuple[str, str]:
-    """Read a stable regular file and atomically publish transformed content."""
+    """Read a stable unique file and atomically publish transformed content."""
 
     original, metadata = read_text_nofollow(path, errors="strict")
     updated = transform(original)
