@@ -5,10 +5,12 @@ from __future__ import annotations
 from bench._harbor_adapter_issue4_base import *  # noqa: F401,F403
 from bench import _harbor_adapter_issue4_base as _base
 from bench._canonical_harbor_glob import HarborGlobTool
-from bench._canonical_harbor_grep import HarborGrepTool
-from bench._canonical_harbor_paths_v2 import HarborFileEditTool
-from bench._canonical_harbor_paths_v4 import HarborFileReadTool
-from bench._canonical_harbor_write_v3 import HarborFileWriteTool
+from bench._canonical_harbor_grep_hardlink import HarborGrepTool
+from bench._canonical_harbor_hardlink import (
+    HarborFileEditTool,
+    HarborFileReadTool,
+    HarborFileWriteTool,
+)
 
 
 class HLWorkerHarborAgent(_base.HLWorkerHarborAgent):
