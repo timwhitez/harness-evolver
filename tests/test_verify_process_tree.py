@@ -22,6 +22,13 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
+def _wait_for_pid_exit(pid: int, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while _pid_exists(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _pid_exists(pid)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group assertion")
 def test_verify_timeout_terminates_descendant_process(tmp_path: Path) -> None:
     pid_file = tmp_path / "child.pid"
@@ -56,11 +63,43 @@ def test_verify_timeout_terminates_descendant_process(tmp_path: Path) -> None:
     assert "child-ready" in result.output
     assert "diagnostic-before-timeout" in result.output
 
-    child_pid = int(pid_file.read_text(encoding="utf-8"))
-    deadline = time.monotonic() + 3.0
-    while _pid_exists(child_pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert not _pid_exists(child_pid)
+    _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group assertion")
+def test_timeout_kills_descendant_after_group_leader_exits_on_sigterm(tmp_path: Path) -> None:
+    pid_file = tmp_path / "resistant-child.pid"
+    child_code = (
+        "import signal,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)"
+    )
+    script = tmp_path / "spawn_resistant_child.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import pathlib, subprocess, sys, time",
+                f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])",
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')",
+                "print('resistant-child-ready', flush=True)",
+                "time.sleep(60)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    command = " ".join(
+        [
+            shlex.quote(sys.executable),
+            shlex.quote(str(script)),
+            shlex.quote(str(pid_file)),
+        ]
+    )
+
+    result = run_bounded_shell(command, timeout_seconds=0.5)
+
+    assert result.timed_out is True
+    assert "resistant-child-ready" in result.stdout
+    _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
 
 
 def test_process_runner_bounds_stdout_and_stderr() -> None:
