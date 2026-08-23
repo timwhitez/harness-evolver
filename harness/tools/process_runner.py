@@ -1,4 +1,4 @@
-"""Bounded subprocess execution with managed process-group cleanup."""
+"""Bounded subprocess execution with managed descendant cleanup."""
 
 from __future__ import annotations
 
@@ -6,11 +6,12 @@ from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
+import secrets
 import signal
 import subprocess
 import threading
 import time
-from typing import BinaryIO
+from typing import BinaryIO, Mapping
 
 
 _OUTPUT_LIMIT_BYTES = 1_000_000
@@ -18,6 +19,7 @@ _TERMINATION_GRACE_SECONDS = 1.0
 _TERMINATION_POLL_SECONDS = 0.02
 _STREAM_JOIN_SECONDS = 1.0
 _READ_CHUNK_BYTES = 65_536
+_PROCESS_TOKEN_ENV = "HL_PROCESS_TREE_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,12 @@ class ProcessOutcome:
     timed_out: bool
     elapsed_ms: float
     managed_process_group_terminated: bool = False
+
+
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    pid: int
+    start_time: int
 
 
 @dataclass
@@ -88,20 +96,28 @@ def run_bounded_shell(
     timeout_seconds: float,
     cwd: str | Path | None = None,
     output_limit_bytes: int = _OUTPUT_LIMIT_BYTES,
+    env: Mapping[str, str] | None = None,
 ) -> ProcessOutcome:
-    """Run a shell command and clean up its managed process group on timeout.
+    """Run a shell command and clean up all discoverable managed descendants.
 
-    Stdout and stderr are drained concurrently into bounded in-memory head/tail
-    buffers. This avoids pipe backpressure deadlocks without an unbounded disk
-    spool. POSIX descendants that remain in the session's process group are
-    terminated with TERM then KILL. Windows uses ``taskkill /T /F`` for the
-    process tree rooted at the shell PID.
+    Stdout/stderr are drained concurrently into bounded in-memory head/tail
+    buffers. On Linux, every spawned process inherits a unique token; cleanup
+    combines process-group signals, `/proc` parent traversal, and token-based
+    discovery. This catches descendants that call ``setsid()`` or double-fork
+    out of the original process group. Other POSIX systems retain process-group
+    cleanup, while Windows uses ``taskkill /T /F``.
     """
 
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be finite and > 0")
     if output_limit_bytes < 1:
         raise ValueError("output_limit_bytes must be >= 1")
+
+    process_token = secrets.token_hex(24)
+    child_env = dict(os.environ)
+    if env is not None:
+        child_env.update({str(key): str(value) for key, value in env.items()})
+    child_env[_PROCESS_TOKEN_ENV] = process_token
 
     popen_kwargs: dict[str, object] = {}
     if os.name == "posix":
@@ -116,6 +132,7 @@ def run_bounded_shell(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=cwd,
+        env=child_env,
         **popen_kwargs,
     )
     assert process.stdout is not None
@@ -127,20 +144,33 @@ def run_bounded_shell(
     stderr_thread = _start_drain_thread(process.stderr, stderr_capture, "stderr")
 
     timed_out = False
-    group_terminated = False
+    managed_tree_terminated = False
     try:
         try:
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            group_terminated = _terminate_process_tree(process)
+            managed_tree_terminated = _terminate_process_tree(
+                process,
+                process_token=process_token,
+            )
 
-        # A shell may exit while a background descendant still owns the pipes.
-        # Verification commands must not leave that unaccounted work running.
+        # A root shell may exit while background or daemonized descendants keep
+        # running and retain the output pipes. Give normal commands a chance to
+        # finish draining, then clean up any remaining managed process tree.
         _join_stream_threads(stdout_thread, stderr_thread, timeout=_STREAM_JOIN_SECONDS)
         if stdout_thread.is_alive() or stderr_thread.is_alive():
-            group_terminated = _terminate_process_tree(process) or group_terminated
+            managed_tree_terminated = (
+                _terminate_process_tree(process, process_token=process_token)
+                or managed_tree_terminated
+            )
             _join_stream_threads(stdout_thread, stderr_thread, timeout=_STREAM_JOIN_SECONDS)
+        elif _managed_descendants_exist(process.pid, process_token):
+            managed_tree_terminated = (
+                _terminate_process_tree(process, process_token=process_token)
+                or managed_tree_terminated
+            )
+
         if stdout_thread.is_alive() or stderr_thread.is_alive():
             _close_stream(process.stdout)
             _close_stream(process.stderr)
@@ -157,7 +187,7 @@ def run_bounded_shell(
         stderr=stderr_capture.text(),
         timed_out=timed_out,
         elapsed_ms=elapsed_ms,
-        managed_process_group_terminated=group_terminated,
+        managed_process_group_terminated=managed_tree_terminated,
     )
 
 
@@ -192,29 +222,17 @@ def _join_stream_threads(*threads: threading.Thread, timeout: float) -> None:
         thread.join(remaining)
 
 
-def _terminate_process_tree(process: subprocess.Popen[bytes]) -> bool:
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    process_token: str | None = None,
+) -> bool:
     """Terminate and reap the process group/tree managed for one command."""
 
     if os.name == "posix":
-        process_group = process.pid
-        if not _posix_group_exists(process_group):
-            _reap_process(process)
-            return False
-        _signal_posix_group(process_group, signal.SIGTERM)
-        terminated = True
-        if not _wait_for_posix_group_exit(
-            process,
-            process_group,
-            _TERMINATION_GRACE_SECONDS,
-        ):
-            _signal_posix_group(process_group, signal.SIGKILL)
-            _wait_for_posix_group_exit(
-                process,
-                process_group,
-                _TERMINATION_GRACE_SECONDS,
-            )
-        _reap_process(process)
-        return terminated
+        if process_token and _linux_proc_available():
+            return _terminate_linux_process_tree(process, process_token)
+        return _terminate_posix_process_group(process)
 
     if os.name == "nt":
         terminated = False
@@ -254,6 +272,164 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> bool:
     return terminated
 
 
+def _managed_descendants_exist(root_pid: int, process_token: str) -> bool:
+    if not _linux_proc_available():
+        return _posix_group_exists(root_pid) if os.name == "posix" else False
+    return bool(_linux_managed_processes(root_pid, process_token, {}))
+
+
+def _linux_proc_available() -> bool:
+    return os.name == "posix" and Path("/proc/self/stat").is_file()
+
+
+def _terminate_linux_process_tree(
+    process: subprocess.Popen[bytes],
+    process_token: str,
+) -> bool:
+    root_pid = process.pid
+    known: dict[int, _ProcessIdentity] = {}
+
+    def refresh() -> dict[int, _ProcessIdentity]:
+        known.update(_linux_managed_processes(root_pid, process_token, known))
+        return {
+            pid: identity
+            for pid, identity in known.items()
+            if _identity_is_alive(identity)
+        }
+
+    alive = refresh()
+    _signal_posix_group(root_pid, signal.SIGTERM)
+    _signal_identities(alive.values(), signal.SIGTERM)
+
+    deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        process.poll()
+        alive = refresh()
+        if not alive and not _posix_group_exists(root_pid):
+            break
+        time.sleep(_TERMINATION_POLL_SECONDS)
+
+    alive = refresh()
+    if alive or _posix_group_exists(root_pid):
+        _signal_posix_group(root_pid, signal.SIGKILL)
+        _signal_identities(alive.values(), signal.SIGKILL)
+        deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            process.poll()
+            alive = refresh()
+            if not alive and not _posix_group_exists(root_pid):
+                break
+            _signal_identities(alive.values(), signal.SIGKILL)
+            time.sleep(_TERMINATION_POLL_SECONDS)
+
+    _reap_process(process)
+    _reap_known_children(known.values())
+    return not refresh() and not _posix_group_exists(root_pid)
+
+
+def _linux_managed_processes(
+    root_pid: int,
+    process_token: str,
+    known: Mapping[int, _ProcessIdentity],
+) -> dict[int, _ProcessIdentity]:
+    table = _linux_process_table()
+    roots = {root_pid, *known.keys(), *_linux_token_pids(process_token)}
+    selected = set(roots)
+
+    changed = True
+    while changed:
+        changed = False
+        for pid, (_, parent_pid) in table.items():
+            if parent_pid in selected and pid not in selected:
+                selected.add(pid)
+                changed = True
+
+    return {
+        pid: _ProcessIdentity(pid=pid, start_time=table[pid][0])
+        for pid in selected
+        if pid in table and pid != os.getpid()
+    }
+
+
+def _linux_process_table() -> dict[int, tuple[int, int]]:
+    table: dict[int, tuple[int, int]] = {}
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return table
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="strict")
+            _, remainder = stat_text.rsplit(") ", 1)
+            fields = remainder.split()
+            table[int(entry.name)] = (int(fields[19]), int(fields[1]))
+        except (OSError, ValueError, IndexError):
+            continue
+    return table
+
+
+def _linux_token_pids(process_token: str) -> set[int]:
+    marker = f"{_PROCESS_TOKEN_ENV}={process_token}".encode() + b"\0"
+    matches: set[int] = set()
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return matches
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            environ = (entry / "environ").read_bytes()
+        except OSError:
+            continue
+        if marker in environ:
+            matches.add(int(entry.name))
+    return matches
+
+
+def _identity_is_alive(identity: _ProcessIdentity) -> bool:
+    current = _linux_process_table().get(identity.pid)
+    return current is not None and current[0] == identity.start_time
+
+
+def _signal_identities(
+    identities: object,
+    sig: signal.Signals,
+) -> None:
+    for identity in list(identities):
+        if not isinstance(identity, _ProcessIdentity) or not _identity_is_alive(identity):
+            continue
+        try:
+            os.kill(identity.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
+def _reap_known_children(identities: object) -> None:
+    for identity in list(identities):
+        if not isinstance(identity, _ProcessIdentity):
+            continue
+        try:
+            os.waitpid(identity.pid, os.WNOHANG)
+        except (ChildProcessError, ProcessLookupError, OSError):
+            continue
+
+
+def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> bool:
+    process_group = process.pid
+    if not _posix_group_exists(process_group):
+        _reap_process(process)
+        return process.poll() is not None
+    _signal_posix_group(process_group, signal.SIGTERM)
+    if not _wait_for_posix_group_exit(process, process_group, _TERMINATION_GRACE_SECONDS):
+        _signal_posix_group(process_group, signal.SIGKILL)
+        _wait_for_posix_group_exit(process, process_group, _TERMINATION_GRACE_SECONDS)
+    _reap_process(process)
+    return not _posix_group_exists(process_group)
+
+
 def _signal_posix_group(process_group: int, sig: signal.Signals) -> None:
     try:
         os.killpg(process_group, sig)
@@ -278,8 +454,6 @@ def _wait_for_posix_group_exit(
 ) -> bool:
     deadline = time.monotonic() + timeout
     while True:
-        # poll() reaps the direct child when it has exited. Without this, the
-        # zombie group leader keeps killpg(..., 0) true for the full grace time.
         process.poll()
         if not _posix_group_exists(process_group):
             return True
