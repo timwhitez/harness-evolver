@@ -18,14 +18,7 @@ _DECIMAL_SATURATION_PRECISION = 100
 
 
 def _delay_for_attempt(self: Any, retry_attempt: int) -> float:
-    """Return finite exponential backoff without overflow or early clamping.
-
-    Ordinary representable powers use Python's direct binary64 arithmetic, so a
-    cap that is merely the next float above the uncapped result does not get
-    selected early because of a rounded logarithmic threshold. Only when the
-    growth factor itself overflows do we switch to bounded high-precision
-    Decimal arithmetic for the saturation comparison.
-    """
+    """Return finite exponential backoff without overflow or early clamping."""
 
     if retry_attempt < 1:
         raise ValueError("retry_attempt must be >= 1")
@@ -51,10 +44,9 @@ def _delay_for_attempt(self: Any, retry_attempt: int) -> float:
 
     exponent = retry_attempt - 1
 
-    # Preserve the exact ordinary binary64 path whenever the growth factor is
-    # representable. This also handles exponent zero without any log-rounding
-    # ambiguity and lets normal min() semantics choose the cap only when the
-    # computed delay actually reaches/exceeds it.
+    # Preserve ordinary binary64 behavior whenever the growth factor is
+    # representable. This prevents logarithmic threshold rounding from
+    # selecting a cap that is merely the next float above the actual result.
     try:
         growth = multiplier**exponent
     except OverflowError:
@@ -63,10 +55,22 @@ def _delay_for_attempt(self: Any, retry_attempt: int) -> float:
         delay = base * growth
         return cap if not math.isfinite(delay) else min(delay, cap)
 
-    # The factor overflowed before multiplication. A very small base can still
-    # make the final product finite (for example the smallest subnormal base
-    # times 2**1999). Compute the comparison in Decimal instead of using a
-    # rounded logarithmic threshold that can clamp one attempt too early.
+    # The factor overflowed before multiplication. First prove obviously
+    # saturated attempts using a conservative logarithmic threshold. The
+    # integer/float comparison does not require converting an arbitrarily large
+    # Python integer to float. A margin measured in threshold ULPs ensures this
+    # fast path can never clamp at the rounded boundary.
+    log_multiplier = math.log(multiplier)
+    threshold = (math.log(cap) - math.log(base)) / log_multiplier
+    threshold_margin = max(2.0, 8.0 * math.ulp(threshold))
+    if exponent > threshold + threshold_margin:
+        return cap
+
+    # Near or below the boundary, the complete product's magnitude is bounded
+    # by cap/base (at most about 10**632 for finite binary64 inputs), even when
+    # the exponent itself is very large because multiplier is close to one.
+    # Decimal exponentiation by an integer is logarithmic in the exponent and
+    # avoids materializing the already-overflowed binary64 growth factor.
     with localcontext() as context:
         context.prec = _DECIMAL_SATURATION_PRECISION
         decimal_delay = Decimal.from_float(base) * (
