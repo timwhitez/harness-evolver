@@ -34,6 +34,16 @@ def test_uncapped_backoff_saturates_at_largest_finite_float() -> None:
     assert math.isfinite(delay)
 
 
+def test_arbitrarily_large_attempt_returns_cap_without_decimal_overflow() -> None:
+    strategy = RetryStrategy(
+        base_delay_seconds=math.nextafter(0.0, 1.0),
+        backoff_multiplier=math.nextafter(1.0, math.inf),
+        max_delay_seconds=60.0,
+    )
+
+    assert strategy.delay_for_attempt(10**1_000) == 60.0
+
+
 def test_zero_base_and_unit_multiplier_keep_exact_semantics() -> None:
     assert RetryStrategy(base_delay_seconds=0.0).delay_for_attempt(100_000) == 0.0
     assert (
