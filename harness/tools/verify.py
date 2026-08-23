@@ -316,13 +316,18 @@ class VerifyTool(ToolDef):
             output += f"\n[stderr]\n{completed.stderr}"
 
         if completed.timed_out:
+            cleanup_state = (
+                "The managed verification process group/tree was terminated."
+                if completed.managed_process_group_terminated
+                else "Managed process-group cleanup was attempted."
+            )
             return ToolResult(
                 success=False,
                 output=output,
                 error=(
-                    f"verification timed out after {effective_timeout}s. The complete "
-                    "verification process tree was terminated. This is an operation "
-                    "timeout, not a Worker, sub-agent, or master loop stop condition."
+                    f"verification timed out after {effective_timeout}s. {cleanup_state} "
+                    "This is an operation timeout, not a Worker, sub-agent, or "
+                    "master loop stop condition."
                 ),
                 duration_ms=completed.elapsed_ms,
                 metadata=operation_timeout_metadata(
@@ -332,7 +337,12 @@ class VerifyTool(ToolDef):
                     stdout=completed.stdout,
                     stderr=completed.stderr,
                     telemetry_source="verify",
-                    process_tree_terminated=True,
+                    managed_process_group_terminated=(
+                        completed.managed_process_group_terminated
+                    ),
+                    process_tree_terminated=(
+                        completed.managed_process_group_terminated
+                    ),
                     output_bounded=True,
                 ),
             )
