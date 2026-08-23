@@ -14,6 +14,7 @@ from typing import IO
 
 _OUTPUT_LIMIT_BYTES = 1_000_000
 _TERMINATION_GRACE_SECONDS = 1.0
+_TERMINATION_POLL_SECONDS = 0.02
 
 
 @dataclass(frozen=True)
@@ -86,15 +87,23 @@ def run_bounded_shell(
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     """Terminate and reap a shell process plus every descendant."""
 
-    if process.poll() is not None:
+    if os.name == "posix":
+        process_group = process.pid
+        if _posix_group_exists(process_group):
+            _signal_posix_group(process_group, signal.SIGTERM)
+            if not _wait_for_posix_group_exit(
+                process_group,
+                _TERMINATION_GRACE_SECONDS,
+            ):
+                _signal_posix_group(process_group, signal.SIGKILL)
+                _wait_for_posix_group_exit(
+                    process_group,
+                    _TERMINATION_GRACE_SECONDS,
+                )
+        _reap_process(process)
         return
 
-    if os.name == "posix":
-        _signal_posix_group(process.pid, signal.SIGTERM)
-        if _wait_for_exit(process, _TERMINATION_GRACE_SECONDS):
-            return
-        _signal_posix_group(process.pid, signal.SIGKILL)
-        _wait_for_exit(process, _TERMINATION_GRACE_SECONDS)
+    if process.poll() is not None:
         return
 
     if os.name == "nt":
@@ -119,11 +128,41 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         _wait_for_exit(process, _TERMINATION_GRACE_SECONDS)
 
 
-def _signal_posix_group(pid: int, sig: signal.Signals) -> None:
+def _signal_posix_group(process_group: int, sig: signal.Signals) -> None:
     try:
-        os.killpg(pid, sig)
+        os.killpg(process_group, sig)
     except ProcessLookupError:
         return
+
+
+def _posix_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_posix_group_exit(process_group: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _posix_group_exists(process_group):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_TERMINATION_POLL_SECONDS)
+    return True
+
+
+def _reap_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait(timeout=_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
 
 
 def _wait_for_exit(process: subprocess.Popen[bytes], timeout: float) -> bool:
