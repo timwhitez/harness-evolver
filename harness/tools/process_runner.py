@@ -40,27 +40,33 @@ class _BoundedCapture:
     total_bytes: int = 0
     head: bytearray = field(default_factory=bytearray)
     tail: bytearray = field(default_factory=bytearray)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def feed(self, payload: bytes) -> None:
         if not payload:
             return
-        self.total_bytes += len(payload)
-        remaining = payload
-        if len(self.head) < self.limit_bytes:
-            take = min(self.limit_bytes - len(self.head), len(remaining))
-            self.head.extend(remaining[:take])
-            remaining = remaining[take:]
-        if remaining:
-            self.tail.extend(remaining)
-            if len(self.tail) > self.limit_bytes:
-                del self.tail[: len(self.tail) - self.limit_bytes]
+        with self._lock:
+            self.total_bytes += len(payload)
+            remaining = payload
+            if len(self.head) < self.limit_bytes:
+                take = min(self.limit_bytes - len(self.head), len(remaining))
+                self.head.extend(remaining[:take])
+                remaining = remaining[take:]
+            if remaining:
+                self.tail.extend(remaining)
+                if len(self.tail) > self.limit_bytes:
+                    del self.tail[: len(self.tail) - self.limit_bytes]
 
     def text(self) -> str:
-        if self.total_bytes <= self.limit_bytes:
-            payload = bytes(self.head[: self.total_bytes])
+        with self._lock:
+            total_bytes = self.total_bytes
+            head = bytes(self.head)
+            tail = bytes(self.tail)
+        if total_bytes <= self.limit_bytes:
+            payload = head[:total_bytes]
         else:
             marker = (
-                f"\n... [{self.total_bytes - self.limit_bytes} output bytes omitted] ...\n"
+                f"\n... [{total_bytes - self.limit_bytes} output bytes omitted] ...\n"
             ).encode("ascii")
             if len(marker) >= self.limit_bytes:
                 payload = marker[: self.limit_bytes]
@@ -69,9 +75,9 @@ class _BoundedCapture:
                 head_size = retained // 2
                 tail_size = retained - head_size
                 payload = (
-                    bytes(self.head[:head_size])
+                    head[:head_size]
                     + marker
-                    + (bytes(self.tail[-tail_size:]) if tail_size else b"")
+                    + (tail[-tail_size:] if tail_size else b"")
                 )
         return payload.decode("utf-8", errors="replace")
 
@@ -313,5 +319,5 @@ def _close_stream(stream: BinaryIO | None) -> None:
         return
     try:
         stream.close()
-    except OSError:
+    except (OSError, ValueError):
         pass
