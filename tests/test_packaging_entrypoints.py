@@ -46,10 +46,18 @@ def test_console_entrypoint_modules_are_in_discovered_packages() -> None:
         assert module_path.is_file()
 
 
-def test_clean_wheel_install_runs_every_console_help_outside_checkout(
+def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
     tmp_path: Path,
 ) -> None:
-    """Exercise the built artifact rather than only setuptools discovery."""
+    """Exercise package placement without relying on source-checkout imports.
+
+    The fresh virtual environment intentionally inherits the test interpreter's
+    already-installed third-party packages as a dependency fixture. The project
+    wheel itself is installed non-editably with ``--no-deps``; assertions below
+    require both project package roots to resolve from that environment's
+    ``purelib`` rather than from the copied checkout or the original repository.
+    This tests the packaging defect without claiming dependency-isolation.
+    """
 
     checkout = tmp_path / "checkout"
     shutil.copytree(
@@ -92,6 +100,8 @@ def test_clean_wheel_install_runs_every_console_help_outside_checkout(
     environment = tmp_path / "venv"
     venv.EnvBuilder(
         with_pip=True,
+        # Third-party dependencies are a fixture; project packages must still
+        # come from the non-editable wheel installed below.
         system_site_packages=True,
         clear=True,
     ).create(environment)
