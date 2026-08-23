@@ -1,7 +1,8 @@
-"""Retry strategy with overflow-safe logarithmic saturation."""
+"""Retry strategy with overflow-safe saturating exponentiation."""
 
 from __future__ import annotations
 
+from decimal import Decimal, localcontext
 import math
 import sys
 from typing import Any
@@ -13,8 +14,18 @@ for _name, _value in vars(_base).items():
         globals()[_name] = _value
 
 
+_DECIMAL_SATURATION_PRECISION = 100
+
+
 def _delay_for_attempt(self: Any, retry_attempt: int) -> float:
-    """Return finite exponential backoff without constructing unsafe intermediates."""
+    """Return finite exponential backoff without overflow or early clamping.
+
+    Ordinary representable powers use Python's direct binary64 arithmetic, so a
+    cap that is merely the next float above the uncapped result does not get
+    selected early because of a rounded logarithmic threshold. Only when the
+    growth factor itself overflows do we switch to bounded high-precision
+    Decimal arithmetic for the saturation comparison.
+    """
 
     if retry_attempt < 1:
         raise ValueError("retry_attempt must be >= 1")
@@ -39,24 +50,32 @@ def _delay_for_attempt(self: Any, retry_attempt: int) -> float:
         return cap
 
     exponent = retry_attempt - 1
-    log_multiplier = math.log(multiplier)
-    log_base = math.log(base)
-    log_cap = math.log(cap)
-    saturation_exponent = (log_cap - log_base) / log_multiplier
-    if exponent >= saturation_exponent:
-        return cap
 
-    # At this point the mathematical result is strictly below the cap. Prefer
-    # direct multiplication when the growth factor itself is representable so
-    # ordinary powers retain their exact floating-point behavior. For a tiny
-    # base with a very large exponent, evaluate in log space instead.
-    log_growth = exponent * log_multiplier
-    if log_growth <= math.log(sys.float_info.max):
-        try:
-            return min(base * (multiplier**exponent), cap)
-        except OverflowError:
-            pass
-    return min(math.exp(log_base + log_growth), cap)
+    # Preserve the exact ordinary binary64 path whenever the growth factor is
+    # representable. This also handles exponent zero without any log-rounding
+    # ambiguity and lets normal min() semantics choose the cap only when the
+    # computed delay actually reaches/exceeds it.
+    try:
+        growth = multiplier**exponent
+    except OverflowError:
+        growth = math.inf
+    if math.isfinite(growth):
+        delay = base * growth
+        return cap if not math.isfinite(delay) else min(delay, cap)
+
+    # The factor overflowed before multiplication. A very small base can still
+    # make the final product finite (for example the smallest subnormal base
+    # times 2**1999). Compute the comparison in Decimal instead of using a
+    # rounded logarithmic threshold that can clamp one attempt too early.
+    with localcontext() as context:
+        context.prec = _DECIMAL_SATURATION_PRECISION
+        decimal_delay = Decimal.from_float(base) * (
+            Decimal.from_float(multiplier) ** exponent
+        )
+        decimal_cap = Decimal.from_float(cap)
+        if decimal_delay >= decimal_cap:
+            return cap
+        return min(float(decimal_delay), cap)
 
 
 _base.RetryStrategy.delay_for_attempt = _delay_for_attempt
