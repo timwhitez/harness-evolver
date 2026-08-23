@@ -46,14 +46,29 @@ def test_local_replace_failure_keeps_original_and_cleans_temp(
     assert list(tmp_path.glob(".target.txt.hl-write-*")) == []
 
 
-def test_local_new_file_is_committed_without_temp_artifacts(tmp_path: Path) -> None:
+def test_local_new_file_uses_normal_umask_creation_mode(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "created.txt"
-
-    result = FileWriteTool().execute(str(target), "created")
+    previous_umask = os.umask(0o027)
+    try:
+        result = FileWriteTool().execute(str(target), "created")
+    finally:
+        os.umask(previous_umask)
 
     assert result.success is True
     assert target.read_text(encoding="utf-8") == "created"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
     assert list(target.parent.glob(".created.txt.hl-write-*")) == []
+
+
+def test_local_overwrite_does_not_recreate_special_mode_bits(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o4755)
+
+    result = FileWriteTool().execute(str(target), "new")
+
+    assert result.success is True
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
 
 
 def _run_harbor_script(
