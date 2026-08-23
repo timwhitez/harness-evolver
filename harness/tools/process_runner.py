@@ -1,25 +1,31 @@
-"""Bounded subprocess execution with managed descendant cleanup."""
+"""Bounded subprocess execution with Linux subreaper containment."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import base64
+import json
 import math
 import os
 from pathlib import Path
-import secrets
 import signal
 import subprocess
+import sys
 import threading
 import time
-from typing import BinaryIO, Mapping
+from typing import BinaryIO, Mapping, Sequence
 
 
 _OUTPUT_LIMIT_BYTES = 1_000_000
-_TERMINATION_GRACE_SECONDS = 1.0
-_TERMINATION_POLL_SECONDS = 0.02
-_STREAM_JOIN_SECONDS = 1.0
 _READ_CHUNK_BYTES = 65_536
-_PROCESS_TOKEN_ENV = "HL_PROCESS_TREE_TOKEN"
+_STREAM_JOIN_SECONDS = 1.0
+_TERMINATION_GRACE_SECONDS = 1.0
+_SUPERVISOR_SHUTDOWN_SECONDS = 3.0
+
+_PROCESS_TOKEN_ENV = "HL_PROCESS_TREE_TOKEN"  # compatibility for stacked PRs
+_SUPERVISOR_TIMEOUT_EXIT = 124
+_SUPERVISOR_CLEANUP_FAILED_EXIT = 125
+_SUPERVISOR_SETUP_FAILED_EXIT = 126
 
 
 @dataclass(frozen=True)
@@ -34,15 +40,9 @@ class ProcessOutcome:
     managed_process_group_terminated: bool = False
 
 
-@dataclass(frozen=True)
-class _ProcessIdentity:
-    pid: int
-    start_time: int
-
-
 @dataclass
 class _BoundedCapture:
-    """Retain a bounded head/tail while continuously draining one pipe."""
+    """Continuously drain a stream while retaining a bounded head/tail."""
 
     limit_bytes: int
     total_bytes: int = 0
@@ -70,6 +70,7 @@ class _BoundedCapture:
             total_bytes = self.total_bytes
             head = bytes(self.head)
             tail = bytes(self.tail)
+
         if total_bytes <= self.limit_bytes:
             payload = head[:total_bytes]
         else:
@@ -90,6 +91,37 @@ class _BoundedCapture:
         return payload.decode("utf-8", errors="replace")
 
 
+def _is_linux_subreaper_available() -> bool:
+    return sys.platform.startswith("linux") and Path("/proc/self/stat").is_file()
+
+
+def _encode_supervisor_argv(argv: Sequence[str]) -> str:
+    raw = json.dumps(
+        list(argv),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def supervised_command_for_argv(argv: Sequence[str]) -> list[str]:
+    """Return an isolated Python command that supervises exactly ``argv``."""
+
+    if not argv or not all(isinstance(item, str) for item in argv):
+        raise ValueError("supervised argv must be a non-empty list of strings")
+    script = Path(__file__).with_name("process_supervisor.py")
+    if not script.is_file():
+        raise RuntimeError(f"process supervisor is missing: {script}")
+    return [
+        sys.executable,
+        "-I",
+        "-S",
+        str(script),
+        "--payload",
+        _encode_supervisor_argv(argv),
+    ]
+
+
 def run_bounded_shell(
     command: str,
     *,
@@ -98,14 +130,12 @@ def run_bounded_shell(
     output_limit_bytes: int = _OUTPUT_LIMIT_BYTES,
     env: Mapping[str, str] | None = None,
 ) -> ProcessOutcome:
-    """Run a shell command and clean up all discoverable managed descendants.
+    """Run one shell command with bounded output and descendant cleanup.
 
-    Stdout/stderr are drained concurrently into bounded in-memory head/tail
-    buffers. On Linux, every spawned process inherits a unique token; cleanup
-    combines process-group signals, `/proc` parent traversal, and token-based
-    discovery. This catches descendants that call ``setsid()`` or double-fork
-    out of the original process group. Other POSIX systems retain process-group
-    cleanup, while Windows uses ``taskkill /T /F``.
+    Linux commands execute below a dedicated ``PR_SET_CHILD_SUBREAPER`` process.
+    That kernel reparenting boundary catches double-fork/``setsid`` descendants
+    even when they clear their environment. Other POSIX systems retain
+    process-group cleanup; Windows uses ``taskkill /T /F``.
     """
 
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
@@ -113,35 +143,47 @@ def run_bounded_shell(
     if output_limit_bytes < 1:
         raise ValueError("output_limit_bytes must be >= 1")
 
-    process_token = secrets.token_hex(24)
     child_env = dict(os.environ)
     if env is not None:
         child_env.update({str(key): str(value) for key, value in env.items()})
-    child_env[_PROCESS_TOKEN_ENV] = process_token
 
-    popen_kwargs: dict[str, object] = {}
-    if os.name == "posix":
-        popen_kwargs["start_new_session"] = True
-    elif os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    supervised = _is_linux_subreaper_available()
+    if supervised:
+        argv: str | list[str] = supervised_command_for_argv(
+            ["/bin/sh", "-c", command]
+        )
+        use_shell = False
+    else:
+        argv = command
+        use_shell = True
 
     started = time.monotonic()
     process = subprocess.Popen(
-        command,
-        shell=True,
+        argv,
+        shell=use_shell,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=cwd,
         env=child_env,
-        **popen_kwargs,
+        start_new_session=(os.name == "posix"),
     )
+    if supervised:
+        setattr(process, "_harness_evolver_supervised", True)
+
     assert process.stdout is not None
     assert process.stderr is not None
-
     stdout_capture = _BoundedCapture(output_limit_bytes)
     stderr_capture = _BoundedCapture(output_limit_bytes)
-    stdout_thread = _start_drain_thread(process.stdout, stdout_capture, "stdout")
-    stderr_thread = _start_drain_thread(process.stderr, stderr_capture, "stderr")
+    stdout_thread = _start_drain_thread(
+        process.stdout,
+        stdout_capture,
+        "stdout",
+    )
+    stderr_thread = _start_drain_thread(
+        process.stderr,
+        stderr_capture,
+        "stderr",
+    )
 
     timed_out = False
     managed_tree_terminated = False
@@ -150,35 +192,31 @@ def run_bounded_shell(
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            managed_tree_terminated = _terminate_process_tree(
-                process,
-                process_token=process_token,
-            )
+            managed_tree_terminated = _terminate_process_tree(process)
 
-        # A root shell may exit while background or daemonized descendants keep
-        # running and retain the output pipes. Give normal commands a chance to
-        # finish draining, then clean up any remaining managed process tree.
-        _join_stream_threads(stdout_thread, stderr_thread, timeout=_STREAM_JOIN_SECONDS)
+        _join_stream_threads(
+            stdout_thread,
+            stderr_thread,
+            timeout=_STREAM_JOIN_SECONDS,
+        )
         if stdout_thread.is_alive() or stderr_thread.is_alive():
             managed_tree_terminated = (
-                _terminate_process_tree(process, process_token=process_token)
-                or managed_tree_terminated
+                _terminate_process_tree(process) or managed_tree_terminated
             )
-            _join_stream_threads(stdout_thread, stderr_thread, timeout=_STREAM_JOIN_SECONDS)
-        elif _managed_descendants_exist(process.pid, process_token):
-            managed_tree_terminated = (
-                _terminate_process_tree(process, process_token=process_token)
-                or managed_tree_terminated
+            _join_stream_threads(
+                stdout_thread,
+                stderr_thread,
+                timeout=_STREAM_JOIN_SECONDS,
             )
-
-        if stdout_thread.is_alive() or stderr_thread.is_alive():
-            _close_stream(process.stdout)
-            _close_stream(process.stderr)
-            _join_stream_threads(stdout_thread, stderr_thread, timeout=_STREAM_JOIN_SECONDS)
     finally:
         _reap_process(process)
         _close_stream(process.stdout)
         _close_stream(process.stderr)
+        _join_stream_threads(
+            stdout_thread,
+            stderr_thread,
+            timeout=_STREAM_JOIN_SECONDS,
+        )
 
     elapsed_ms = (time.monotonic() - started) * 1000
     return ProcessOutcome(
@@ -215,11 +253,13 @@ def _start_drain_thread(
     return thread
 
 
-def _join_stream_threads(*threads: threading.Thread, timeout: float) -> None:
+def _join_stream_threads(
+    *threads: threading.Thread,
+    timeout: float,
+) -> None:
     deadline = time.monotonic() + timeout
     for thread in threads:
-        remaining = max(0.0, deadline - time.monotonic())
-        thread.join(remaining)
+        thread.join(max(0.0, deadline - time.monotonic()))
 
 
 def _terminate_process_tree(
@@ -227,11 +267,17 @@ def _terminate_process_tree(
     *,
     process_token: str | None = None,
 ) -> bool:
-    """Terminate and reap the process group/tree managed for one command."""
+    """Terminate the managed command tree.
+
+    ``process_token`` remains accepted for compatibility with stacked branches;
+    Linux completeness is provided by the dedicated subreaper process instead.
+    """
+
+    del process_token
+    if getattr(process, "_harness_evolver_supervised", False):
+        return _terminate_supervised_process(process)
 
     if os.name == "posix":
-        if process_token and _linux_proc_available():
-            return _terminate_linux_process_tree(process, process_token)
         return _terminate_posix_process_group(process)
 
     if os.name == "nt":
@@ -247,7 +293,10 @@ def _terminate_process_tree(
             terminated = completed.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
-        if process.poll() is None:
+        if process.poll() is None and not _wait_for_exit(
+            process,
+            _TERMINATION_GRACE_SECONDS,
+        ):
             try:
                 process.kill()
                 terminated = True
@@ -258,163 +307,55 @@ def _terminate_process_tree(
 
     if process.poll() is not None:
         return False
-    terminated = True
     try:
         process.terminate()
     except (OSError, ProcessLookupError):
-        terminated = False
+        return False
     if not _wait_for_exit(process, _TERMINATION_GRACE_SECONDS):
         try:
             process.kill()
         except (OSError, ProcessLookupError):
             pass
     _reap_process(process)
-    return terminated
+    return process.poll() is not None
 
 
-def _managed_descendants_exist(root_pid: int, process_token: str) -> bool:
-    if not _linux_proc_available():
-        return _posix_group_exists(root_pid) if os.name == "posix" else False
-    return bool(_linux_managed_processes(root_pid, process_token, {}))
+def _terminate_supervised_process(process: subprocess.Popen[bytes]) -> bool:
+    """Ask the subreaper to clean descendants before killing the supervisor."""
 
-
-def _linux_proc_available() -> bool:
-    return os.name == "posix" and Path("/proc/self/stat").is_file()
-
-
-def _terminate_linux_process_tree(
-    process: subprocess.Popen[bytes],
-    process_token: str,
-) -> bool:
-    root_pid = process.pid
-    known: dict[int, _ProcessIdentity] = {}
-
-    def refresh() -> dict[int, _ProcessIdentity]:
-        known.update(_linux_managed_processes(root_pid, process_token, known))
-        return {
-            pid: identity
-            for pid, identity in known.items()
-            if _identity_is_alive(identity)
+    if process.poll() is not None:
+        return process.returncode not in {
+            _SUPERVISOR_CLEANUP_FAILED_EXIT,
+            _SUPERVISOR_SETUP_FAILED_EXIT,
         }
 
-    alive = refresh()
-    _signal_posix_group(root_pid, signal.SIGTERM)
-    _signal_identities(alive.values(), signal.SIGTERM)
+    try:
+        process.send_signal(signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return False
 
-    deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
-    while time.monotonic() < deadline:
-        process.poll()
-        alive = refresh()
-        if not alive and not _posix_group_exists(root_pid):
-            break
-        time.sleep(_TERMINATION_POLL_SECONDS)
+    try:
+        process.wait(timeout=_SUPERVISOR_SHUTDOWN_SECONDS)
+    except subprocess.TimeoutExpired:
+        # The supervisor failed to complete its kernel-backed cleanup. Kill the
+        # original session as a final best effort, but report cleanup failure.
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        else:
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+        _reap_process(process)
+        return False
 
-    alive = refresh()
-    if alive or _posix_group_exists(root_pid):
-        _signal_posix_group(root_pid, signal.SIGKILL)
-        _signal_identities(alive.values(), signal.SIGKILL)
-        deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            process.poll()
-            alive = refresh()
-            if not alive and not _posix_group_exists(root_pid):
-                break
-            _signal_identities(alive.values(), signal.SIGKILL)
-            time.sleep(_TERMINATION_POLL_SECONDS)
-
-    _reap_process(process)
-    _reap_known_children(known.values())
-    return not refresh() and not _posix_group_exists(root_pid)
-
-
-def _linux_managed_processes(
-    root_pid: int,
-    process_token: str,
-    known: Mapping[int, _ProcessIdentity],
-) -> dict[int, _ProcessIdentity]:
-    table = _linux_process_table()
-    roots = {root_pid, *known.keys(), *_linux_token_pids(process_token)}
-    selected = set(roots)
-
-    changed = True
-    while changed:
-        changed = False
-        for pid, (_, parent_pid) in table.items():
-            if parent_pid in selected and pid not in selected:
-                selected.add(pid)
-                changed = True
-
-    return {
-        pid: _ProcessIdentity(pid=pid, start_time=table[pid][0])
-        for pid in selected
-        if pid in table and pid != os.getpid()
+    return process.returncode not in {
+        _SUPERVISOR_CLEANUP_FAILED_EXIT,
+        _SUPERVISOR_SETUP_FAILED_EXIT,
     }
-
-
-def _linux_process_table() -> dict[int, tuple[int, int]]:
-    table: dict[int, tuple[int, int]] = {}
-    try:
-        entries = list(Path("/proc").iterdir())
-    except OSError:
-        return table
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="strict")
-            _, remainder = stat_text.rsplit(") ", 1)
-            fields = remainder.split()
-            table[int(entry.name)] = (int(fields[19]), int(fields[1]))
-        except (OSError, ValueError, IndexError):
-            continue
-    return table
-
-
-def _linux_token_pids(process_token: str) -> set[int]:
-    marker = f"{_PROCESS_TOKEN_ENV}={process_token}".encode() + b"\0"
-    matches: set[int] = set()
-    try:
-        entries = list(Path("/proc").iterdir())
-    except OSError:
-        return matches
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            environ = (entry / "environ").read_bytes()
-        except OSError:
-            continue
-        if marker in environ:
-            matches.add(int(entry.name))
-    return matches
-
-
-def _identity_is_alive(identity: _ProcessIdentity) -> bool:
-    current = _linux_process_table().get(identity.pid)
-    return current is not None and current[0] == identity.start_time
-
-
-def _signal_identities(
-    identities: object,
-    sig: signal.Signals,
-) -> None:
-    for identity in list(identities):
-        if not isinstance(identity, _ProcessIdentity) or not _identity_is_alive(identity):
-            continue
-        try:
-            os.kill(identity.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            continue
-
-
-def _reap_known_children(identities: object) -> None:
-    for identity in list(identities):
-        if not isinstance(identity, _ProcessIdentity):
-            continue
-        try:
-            os.waitpid(identity.pid, os.WNOHANG)
-        except (ChildProcessError, ProcessLookupError, OSError):
-            continue
 
 
 def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> bool:
@@ -422,15 +363,27 @@ def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> bool:
     if not _posix_group_exists(process_group):
         _reap_process(process)
         return process.poll() is not None
+
     _signal_posix_group(process_group, signal.SIGTERM)
-    if not _wait_for_posix_group_exit(process, process_group, _TERMINATION_GRACE_SECONDS):
+    if not _wait_for_posix_group_exit(
+        process,
+        process_group,
+        _TERMINATION_GRACE_SECONDS,
+    ):
         _signal_posix_group(process_group, signal.SIGKILL)
-        _wait_for_posix_group_exit(process, process_group, _TERMINATION_GRACE_SECONDS)
+        _wait_for_posix_group_exit(
+            process,
+            process_group,
+            _TERMINATION_GRACE_SECONDS,
+        )
     _reap_process(process)
     return not _posix_group_exists(process_group)
 
 
-def _signal_posix_group(process_group: int, sig: signal.Signals) -> None:
+def _signal_posix_group(
+    process_group: int,
+    sig: signal.Signals,
+) -> None:
     try:
         os.killpg(process_group, sig)
     except (ProcessLookupError, PermissionError):
@@ -459,7 +412,7 @@ def _wait_for_posix_group_exit(
             return True
         if time.monotonic() >= deadline:
             return False
-        time.sleep(_TERMINATION_POLL_SECONDS)
+        time.sleep(0.02)
 
 
 def _reap_process(process: subprocess.Popen[bytes]) -> None:
@@ -480,7 +433,10 @@ def _reap_process(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _wait_for_exit(process: subprocess.Popen[bytes], timeout: float) -> bool:
+def _wait_for_exit(
+    process: subprocess.Popen[bytes],
+    timeout: float,
+) -> bool:
     try:
         process.wait(timeout=timeout)
         return True
