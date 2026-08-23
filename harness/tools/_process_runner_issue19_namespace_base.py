@@ -3,8 +3,10 @@
 The subreaper implementation is retained in
 :mod:`harness.tools._process_runner_issue19_base`. On Linux, this facade places
 the standalone supervisor below a verified user/PID namespace boundary when the
-host permits it. A managed same-UID command therefore cannot signal the outer
-runner's supervisor by host PID, and namespace-init exit kills remaining members.
+host permits it. The capability probe requires a private procfs mounted for the
+child PID namespace; a PID namespace with the host's procfs view is rejected
+because namespace-relative PIDs cannot safely be compared with host-relative
+``/proc/*/stat`` records.
 """
 
 from __future__ import annotations
@@ -26,16 +28,29 @@ for _name, _value in vars(_base).items():
 
 _BASE_SUPERVISED_COMMAND = _base.supervised_command_for_argv
 _PID_NAMESPACE_PROBE_SECONDS = 2.0
+_PID_NAMESPACE_PROBE = (
+    "import os; from pathlib import Path; "
+    "self_pid=int(Path('/proc/self/stat').read_text(encoding='utf-8').split(maxsplit=1)[0]); "
+    "init_pid=int(Path('/proc/1/stat').read_text(encoding='utf-8').split(maxsplit=1)[0]); "
+    "raise SystemExit(0 if os.getpid() == self_pid == init_pid == 1 else 1)"
+)
 
 
 @lru_cache(maxsize=1)
 def _pid_namespace_prefix() -> tuple[str, ...] | None:
-    """Return a verified util-linux PID namespace wrapper when available."""
+    """Return a verified user/PID namespace wrapper with a private procfs.
+
+    ``unshare --pid`` alone is insufficient: unless procfs is remounted inside
+    the namespace, ``os.getpid()`` is namespace-relative while ``/proc`` may
+    still expose host-relative identifiers. The supervisor relies on procfs for
+    PPID closure and PID start-time validation, so strong containment is enabled
+    only when an executable probe proves that the command is PID 1 and
+    ``/proc/self`` plus ``/proc/1`` describe that same namespace PID.
+    """
 
     if not sys.platform.startswith("linux"):
         return None
     unshare = shutil.which("unshare")
-    true_executable = shutil.which("true") or "/bin/true"
     if unshare is None:
         return None
 
@@ -44,12 +59,20 @@ def _pid_namespace_prefix() -> tuple[str, ...] | None:
         "--map-current-user",
         "--pid",
         "--fork",
+        "--mount-proc",
         "--kill-child=KILL",
         "--",
     )
     try:
         probe = subprocess.run(
-            [*prefix, true_executable],
+            [
+                *prefix,
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                _PID_NAMESPACE_PROBE,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -62,7 +85,7 @@ def _pid_namespace_prefix() -> tuple[str, ...] | None:
 
 
 def supervised_command_for_argv(argv: Sequence[str]) -> list[str]:
-    """Build the supervisor argv, optionally isolated in a child PID namespace."""
+    """Build the supervisor argv, optionally isolated in a verified namespace."""
 
     supervisor = _BASE_SUPERVISED_COMMAND(argv)
     prefix = _pid_namespace_prefix()
@@ -72,11 +95,12 @@ def supervised_command_for_argv(argv: Sequence[str]) -> list[str]:
 
 
 def _supervisor_exit_confirms_cleanup(returncode: int | None) -> bool:
-    """Accept only an orderly supervisor exit as evidence of tree cleanup.
+    """Accept only an orderly supervisor/wrapper exit as cleanup evidence.
 
-    A negative return code means the supervisor itself died from a signal and
-    its cleanup handler did not run. The old implementation treated ``-SIGKILL``
-    as success because it excluded only two positive sentinel exit codes.
+    A negative return code means the outer supervisor or namespace wrapper died
+    from a signal. Its cleanup path cannot be assumed to have run, so the result
+    must never advertise successful tree termination merely because the code is
+    different from the two positive sentinel values.
     """
 
     return (
