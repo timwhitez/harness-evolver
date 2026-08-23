@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import time
 
 import pytest
 
+import harness.tools.process_runner as process_runner
 from harness.tools.process_runner import run_bounded_shell
 from harness.tools.verify import VerifyTool
 
@@ -100,6 +102,32 @@ def test_timeout_kills_descendant_after_group_leader_exits_on_sigterm(tmp_path: 
     assert result.timed_out is True
     assert "resistant-child-ready" in result.stdout
     _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+
+
+def test_windows_timeout_always_invokes_taskkill_for_the_tree(monkeypatch) -> None:
+    class FakeProcess:
+        pid = 4242
+        returncode = None
+
+        def wait(self, timeout=None):
+            self.returncode = 1
+            return 1
+
+        def kill(self):
+            raise AssertionError("root-only kill should not be needed")
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(process_runner.os, "name", "nt")
+    monkeypatch.setattr(process_runner.subprocess, "run", fake_run)
+
+    process_runner._terminate_process_tree(FakeProcess())  # type: ignore[arg-type]
+
+    assert calls == [["taskkill", "/PID", "4242", "/T", "/F"]]
 
 
 def test_process_runner_bounds_stdout_and_stderr() -> None:
