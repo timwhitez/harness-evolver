@@ -7,6 +7,7 @@ command/helper while validating the values produced by the precedence merge.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from scripts import _run_trial_issue12_base as _base
@@ -24,11 +25,16 @@ def _integer_value(
     field: str,
     parser: Any,
 ) -> int:
+    """Parse one effective integer without accepting bool or non-finite floats."""
+
+    if isinstance(value, bool):
+        parser.error(f"{field} must be an integer, not a boolean")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            parser.error(f"{field} must be a finite integer")
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
-        parser.error(f"{field} must be an integer")
-    if isinstance(value, float) and not value.is_integer():
+    except (TypeError, ValueError, OverflowError):
         parser.error(f"{field} must be an integer")
     return parsed
 
