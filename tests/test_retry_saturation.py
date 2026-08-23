@@ -47,6 +47,33 @@ def test_zero_base_and_unit_multiplier_keep_exact_semantics() -> None:
 
 
 @pytest.mark.parametrize(
+    ("base", "multiplier", "exponent"),
+    [
+        (0.1, 2.0, 0),
+        (0.3, 1.2, 10),
+        (0.3, 2.0, 8),
+        (1.0, 2.0, 8),
+        (2.0, 3.0, 2),
+    ],
+)
+def test_cap_one_ulp_above_direct_result_never_clamps_early(
+    base: float,
+    multiplier: float,
+    exponent: int,
+) -> None:
+    uncapped = base * (multiplier**exponent)
+    cap = math.nextafter(uncapped, math.inf)
+    strategy = RetryStrategy(
+        base_delay_seconds=base,
+        backoff_multiplier=multiplier,
+        max_delay_seconds=cap,
+    )
+
+    assert uncapped < cap
+    assert strategy.delay_for_attempt(exponent + 1) == uncapped
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("base_delay_seconds", float("nan")),
