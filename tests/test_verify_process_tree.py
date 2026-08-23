@@ -195,7 +195,8 @@ def test_process_runner_bounds_stdout_and_stderr() -> None:
 
 
 def test_tiny_output_limit_never_returns_an_oversized_marker() -> None:
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote("print('abcdef')")}"
+    program = "print('abcdef')"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}"
 
     result = run_bounded_shell(command, timeout_seconds=5.0, output_limit_bytes=1)
 
