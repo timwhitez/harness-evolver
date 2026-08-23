@@ -108,6 +108,53 @@ def test_timeout_kills_descendant_after_group_leader_exits_on_sigterm(tmp_path: 
     _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
 
 
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/proc/self/stat").is_file(),
+    reason="Linux /proc descendant discovery assertion",
+)
+def test_timeout_kills_descendant_that_escapes_with_setsid(tmp_path: Path) -> None:
+    pid_file = tmp_path / "setsid-child.pid"
+    child_code = "\n".join(
+        [
+            "import os, pathlib, signal, sys, time",
+            "os.setsid()",
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')",
+            "print('setsid-child-ready', flush=True)",
+            "time.sleep(60)",
+        ]
+    )
+    script = tmp_path / "spawn_setsid_child.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import pathlib, subprocess, sys, time",
+                f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]])",
+                "deadline = time.monotonic() + 5",
+                "while not pathlib.Path(sys.argv[1]).exists() and time.monotonic() < deadline: time.sleep(0.01)",
+                "print('parent-observed-setsid-child', flush=True)",
+                "time.sleep(60)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    command = " ".join(
+        [
+            shlex.quote(sys.executable),
+            shlex.quote(str(script)),
+            shlex.quote(str(pid_file)),
+        ]
+    )
+
+    result = run_bounded_shell(command, timeout_seconds=0.75)
+
+    assert result.timed_out is True
+    assert result.managed_process_group_terminated is True
+    assert "parent-observed-setsid-child" in result.stdout
+    escaped_pid = int(pid_file.read_text(encoding="utf-8"))
+    _wait_for_pid_exit(escaped_pid)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group assertion")
 def test_normal_parent_exit_does_not_leave_pipe_holding_background_child(
     tmp_path: Path,
