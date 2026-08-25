@@ -94,6 +94,54 @@ def test_valid_explicit_zero_values_override_positive_role_values(
     assert result["timeout_seconds"] == 300
 
 
+def test_explicit_empty_optional_strings_clear_role_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models_config = tmp_path / "models.yaml"
+    _write_models_config(models_config)
+    monkeypatch.chdir(tmp_path)
+
+    result = resolve_agent_config(
+        _args(
+            models_config,
+            tmp_path / "missing-trials.yaml",
+            base_url="",
+            api_key_env="",
+        ),
+        argparse.ArgumentParser(prog="test"),
+    )
+
+    assert result["base_url"] == ""
+    assert result["api_key_env"] == ""
+    assert result["model"] == "configured-model"
+    assert result["provider"] == "anthropic"
+
+
+@pytest.mark.parametrize("field", ["model", "provider", "reasoning_effort"])
+def test_explicit_empty_required_request_string_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+) -> None:
+    models_config = tmp_path / "models.yaml"
+    _write_models_config(models_config)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit):
+        resolve_agent_config(
+            _args(
+                models_config,
+                tmp_path / "missing-trials.yaml",
+                **{field: ""},
+            ),
+            argparse.ArgumentParser(prog="test"),
+        )
+
+    assert f"{field} must not be empty" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -108,6 +156,8 @@ def test_valid_explicit_zero_values_override_positive_role_values(
         ),
         ({"llm_timeout_seconds": math.inf}, "timeout_seconds must be a finite integer"),
         ({"max_output_tokens": math.nan}, "max_output_tokens must be a finite integer"),
+        ({"base_url": False}, "base_url must be a string"),
+        ({"api_key_env": 0}, "api_key_env must be a string"),
     ],
 )
 def test_invalid_falsy_negative_or_non_integer_values_fail_instead_of_falling_back(
