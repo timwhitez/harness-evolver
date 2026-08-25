@@ -1,4 +1,4 @@
-"""Harbor whole-file writer that rejects existing non-regular targets."""
+"""Race-safe Harbor whole-file publication for regular or missing targets."""
 
 from __future__ import annotations
 
@@ -18,17 +18,100 @@ _SPECIAL_TARGET_REPLACEMENT = '''        if stat.S_ISLNK(current.st_mode):
             raise RuntimeError("target is not a regular file")
         if expected_missing:
 '''
-if _SPECIAL_TARGET_NEEDLE not in _base._v3._SECURE_ATOMIC_WRITE:
-    raise RuntimeError("canonical Harbor target-type contract changed unexpectedly")
-_SECURE_ATOMIC_WRITE = _base._v3._SECURE_ATOMIC_WRITE.replace(
-    _SPECIAL_TARGET_NEEDLE,
-    _SPECIAL_TARGET_REPLACEMENT,
-    1,
-)
+_CURRENT_TARGET_NEEDLE = '''    current = read_current(name)
+    if mode is None and current is not None:
+        mode = current.st_mode
+'''
+_CURRENT_TARGET_REPLACEMENT = '''    def validate_displaced_unconditional(current_name, expected):
+        current = os.stat(
+            current_name,
+            dir_fd=parent,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(current.st_mode):
+            raise RuntimeError("target is not a regular file")
+        identity = (int(current.st_dev), int(current.st_ino))
+        if identity != tuple(expected):
+            raise RuntimeError("overwrite target changed identity before publication")
+
+    current = read_current(name)
+    unconditional_identity = (
+        (int(current.st_dev), int(current.st_ino))
+        if current is not None and not conditional_existing
+        else None
+    )
+    if mode is None and current is not None:
+        mode = current.st_mode
+'''
+_PUBLICATION_NEEDLE = '''        elif expected_missing:
+            renameat2(parent, temporary, name, 1)
+            temporary_exists = False
+            published = True
+        else:
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            temporary_exists = False
+            published = True
+'''
+_PUBLICATION_REPLACEMENT = '''        elif expected_missing or current is None:
+            renameat2(parent, temporary, name, 1)
+            temporary_exists = False
+            published = True
+        else:
+            renameat2(parent, temporary, name, 2)
+            exchanged = True
+            try:
+                validate_displaced_unconditional(
+                    temporary,
+                    unconditional_identity,
+                )
+            except Exception as validation_error:
+                try:
+                    assert_name_identity(name, new_identity)
+                    renameat2(parent, temporary, name, 2)
+                    exchanged = False
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        "unconditional overwrite validation failed and rollback "
+                        "could not complete; displaced target retained at " + temporary
+                    ) from rollback_error
+                raise validation_error
+            os.unlink(temporary, dir_fd=parent)
+            temporary_exists = False
+            exchanged = False
+            published = True
+'''
+
+_SECURE_ATOMIC_WRITE = _base._v3._SECURE_ATOMIC_WRITE
+for needle, replacement, contract in (
+    (
+        _SPECIAL_TARGET_NEEDLE,
+        _SPECIAL_TARGET_REPLACEMENT,
+        "target-type",
+    ),
+    (
+        _CURRENT_TARGET_NEEDLE,
+        _CURRENT_TARGET_REPLACEMENT,
+        "target-identity",
+    ),
+    (
+        _PUBLICATION_NEEDLE,
+        _PUBLICATION_REPLACEMENT,
+        "conditional-publication",
+    ),
+):
+    if needle not in _SECURE_ATOMIC_WRITE:
+        raise RuntimeError(
+            f"canonical Harbor {contract} contract changed unexpectedly"
+        )
+    _SECURE_ATOMIC_WRITE = _SECURE_ATOMIC_WRITE.replace(
+        needle,
+        replacement,
+        1,
+    )
 
 
 class HarborFileWriteTool(_base.HarborFileWriteTool):
-    """Reject a special existing entry before unconditional publication."""
+    """Publish a pure overwrite only against the observed regular entry."""
 
     def execute(
         self,
@@ -37,9 +120,8 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
         append: bool = False,
         **kwargs: Any,
     ) -> _base._v2.ToolResult:
-        # Append already uses the inherited secure snapshot and conditional
-        # publication path, whose regular-file opener is stricter than this
-        # unconditional whole-file target check.
+        # Append already uses the inherited snapshot plus exact-inode
+        # conditional publication path.
         if append:
             return super().execute(
                 file_path,
@@ -95,6 +177,7 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
         )
         if result.success:
             result.metadata["atomic_append"] = False
+            result.metadata["conditional_overwrite_publication"] = True
         return result
 
 
