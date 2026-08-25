@@ -23,7 +23,17 @@ for _name, _value in vars(_base).items():
 _DEFAULT_MAX_INPUT_LINE_CHARS = 1_000_000
 _MAX_FAILURE_SAMPLES = 5
 _MAX_FAILURE_SAMPLE_CHARS = 2_000
-_BASE_GET_SCHEMA = _base.GrepTool.get_schema
+_ORIGINAL_GET_SCHEMA_ATTRIBUTE = "_harness_evolver_uncapped_get_schema"
+_BASE_GET_SCHEMA = getattr(
+    _base.GrepTool,
+    _ORIGINAL_GET_SCHEMA_ATTRIBUTE,
+    _base.GrepTool.get_schema,
+)
+setattr(
+    _base.GrepTool,
+    _ORIGINAL_GET_SCHEMA_ATTRIBUTE,
+    _BASE_GET_SCHEMA,
+)
 
 
 class _InputLineLimitExceeded(Exception):
