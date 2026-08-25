@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 from bench import _canonical_harbor_paths_v2 as _v2
 
 
@@ -97,6 +99,59 @@ _v3._SECURE_ATOMIC_WRITE = _harden_content_read_script(
 _v4._SECURE_READ_STRICT = _harden_v2_script(
     _v4._SECURE_READ_STRICT
 )
+
+
+def _secure_raw_read_strict(
+    self: _v2._SecureHarborMixin,
+    path: str,
+) -> tuple[str | None, _v2.ToolResult | None]:
+    """Read append/edit source text without lossy replacement decoding.
+
+    Harbor append is implemented as secure read plus complete atomic
+    replacement so policy checks can inspect the final text. Replacement
+    decoding would silently alter pre-existing invalid UTF-8 bytes before the
+    atomic publish. A text operation must instead fail before the write phase.
+    """
+
+    result = self._run_secure_python(
+        _v2._SECURE_RAW_READ,
+        env={"HL_FILE_PATH": path},
+    )
+    if result.success:
+        try:
+            payload = base64.b64decode(result.output.strip(), validate=True)
+        except Exception:
+            return None, _v2.ToolResult(
+                success=False,
+                output="",
+                error="Secure read returned invalid encoded content",
+                metadata={
+                    "canonical_path_checked": True,
+                    "nofollow_io": True,
+                    "secure_read_protocol_error": True,
+                },
+            )
+        try:
+            return payload.decode("utf-8", errors="strict"), None
+        except UnicodeDecodeError as exc:
+            return None, _v2.ToolResult(
+                success=False,
+                output="",
+                error=f"Cannot append or edit non-UTF-8 text safely: {exc}",
+                metadata={
+                    "text_decode_error": True,
+                    "encoding": "utf-8",
+                    "canonical_path_checked": True,
+                    "nofollow_io": True,
+                    "atomic_replace": False,
+                },
+            )
+    if result.metadata.get("exit_code") == 44:
+        return "", None
+    return None, result
+
+
+_v2._SecureHarborMixin._secure_raw_read = _secure_raw_read_strict
 
 HarborFileReadTool = _v4.HarborFileReadTool
 HarborFileEditTool = _v2.HarborFileEditTool
