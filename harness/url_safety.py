@@ -38,14 +38,27 @@ def _contains_unsafe_endpoint_text(value: str) -> bool:
 
 
 def _authority_has_empty_port(parsed: SplitResult) -> bool:
-    """Detect an explicit colon for which ``urlsplit`` reports no port."""
+    """Detect an explicit colon for which ``urlsplit`` reports no port.
+
+    ``SplitResult.port`` correctly raises for non-numeric and out-of-range ports,
+    but an authority ending in ``:`` (including ``[::1]:``) is normalized to
+    ``port=None``. Treat that spelling as malformed instead of silently making it
+    indistinguishable from an endpoint that never supplied a port.
+    """
 
     authority = parsed.netloc.rsplit("@", 1)[-1]
     return authority.endswith(":")
 
 
 def _normalise_hostname(hostname: str) -> str | None:
-    """Return a log-safe DNS/IDNA or IPv6 hostname, otherwise fail closed."""
+    """Return a log-safe DNS/IDNA or IPv6 hostname, otherwise fail closed.
+
+    RFC 3986 permits many ``reg-name`` characters that are not hostnames. Python
+    consequently accepts authorities such as ``example.com;token=abc`` and
+    exposes the complete string through ``SplitResult.hostname``. Persisting that
+    value as host metadata would retain credential-like material. This helper
+    deliberately supports only DNS/IDNA labels and canonical IPv6 literals.
+    """
 
     raw = hostname.lower()
     if ":" in raw:
@@ -79,8 +92,18 @@ def _normalise_hostname(hostname: str) -> str | None:
 
 
 def safe_endpoint(value: str | None) -> SafeEndpoint:
-    """Parse an endpoint without retaining userinfo, path, query, or fragment."""
+    """Parse an endpoint without retaining userinfo, path, query, or fragment.
 
+    The parser is intentionally fail-closed for literal whitespace, control
+    characters, backslashes, empty/malformed ports, and unsafe host delimiters.
+    ``urlsplit`` otherwise normalizes some of those inputs into plausible
+    hostnames, which would make a malformed endpoint look valid in persisted
+    metadata.
+    """
+
+    # Inspect the exact caller-provided text before any trimming. Stripping first
+    # would silently accept leading/trailing whitespace even though this parser's
+    # contract is to fail closed on every literal whitespace/control character.
     text = str(value or "")
     if not text:
         return _invalid_endpoint()

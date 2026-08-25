@@ -1,90 +1,98 @@
-"""Harbor runner with exact, cross-record task identity matching.
-
-The complete Issue #7 implementation is retained in
-:mod:`bench._harbor_issue7_identity_base`.  This final facade closes the last
-ambiguity boundary: a simple requested task name must not select the first of
-multiple result records whose structured paths have the same basename but
-identify different tasks.
-"""
+"""Aggregate-aware facade for provenance-based infrastructure attribution."""
 
 from __future__ import annotations
 
+import subprocess
 from typing import Any
 
-from bench import _harbor_issue7_identity_base as _base
+from bench import _harbor_issue5_logic as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
         globals()[_name] = _value
 
 
-def _canonical_result_identity(
-    result: dict[str, Any],
-) -> tuple[str, str] | None:
-    """Return one unambiguous typed identity for a raw Harbor result."""
-
-    identity = _base._task_identity(result)
-    if identity.paths:
-        if len(identity.paths) != 1:
-            return None
-        return ("path", next(iter(identity.paths)))
-    if len(identity.names) != 1:
-        return None
-    return ("name", next(iter(identity.names)))
-
-
-def _matching_trial_results(
-    trial_results: list[dict[str, Any]],
-    task_id: str,
-) -> list[dict[str, Any]]:
-    """Return all attempts only when their shared task identity is unique.
-
-    Multiple records are expected when Harbor runs more than one attempt. They
-    are accepted only when every matching record carries the same canonical
-    identity. Structured path evidence is authoritative and may not be mixed
-    with name-only evidence. Thus two datasets containing ``shared-task`` can
-    never become order-dependent merely because the caller requested the
-    basename.
-    """
-
-    candidates: list[dict[str, Any]] = []
-    identities: list[tuple[str, str]] = []
-    for result in trial_results:
-        if not isinstance(result, dict):
-            continue
-        identity = _base._task_identity(result)
-        if not _base._identity_matches_requested(identity, task_id):
-            continue
-        canonical = _canonical_result_identity(result)
-        if canonical is None:
-            continue
-        candidates.append(result)
-        identities.append(canonical)
-
-    if not candidates:
-        return []
-
-    kinds = {kind for kind, _ in identities}
-    values = {value for _, value in identities}
-    if len(kinds) != 1 or len(values) != 1:
-        return []
-    return candidates
-
-
 class HarborRunner(_base.HarborRunner):
-    """Require one canonical task identity across every selected attempt."""
+    """Require independently structured provenance for infrastructure exclusion."""
 
-    def _matching_trial_results(
+    def _trusted_early_process_failure(
         self,
-        trial_results: list[dict[str, Any]],
-        task_id: str,
-    ) -> list[dict[str, Any]]:
-        return _matching_trial_results(trial_results, task_id)
+        command: _base.HarborCommand,
+        completed: subprocess.CompletedProcess[str],
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Never promote an untyped completed-process stream to provenance.
 
-    def _select_trial_result(
-        self,
-        trial_results: list[dict[str, Any]],
-        task_id: str,
-    ) -> dict[str, Any] | None:
-        matches = self._matching_trial_results(trial_results, task_id)
-        return matches[0] if matches else None
+        A missing/non-executable Harbor binary is already captured at its typed
+        exception source by ``_run_task_once``. Ordinary nonzero stdout/stderr
+        can contain Worker-controlled Docker, DNS, or timeout-looking text and is
+        therefore retained only as diagnostics.
+        """
+
+        return None
+
+    def is_infra_error(self, trial: _base.TrialResult) -> bool:
+        if bool(getattr(trial, "verified", False)):
+            return False
+
+        metadata = trial.metadata or {}
+        attempt_results = metadata.get("attempt_results")
+        if isinstance(attempt_results, list) and attempt_results:
+            decisions = [
+                self._attempt_snapshot_is_infrastructure(attempt)
+                for attempt in attempt_results
+                if isinstance(attempt, dict)
+            ]
+            # A malformed/partial aggregate cannot safely be excluded. Every
+            # configured attempt must have its own trusted provenance.
+            if len(decisions) != len(attempt_results):
+                return False
+            return all(decisions)
+
+        return self._metadata_is_infrastructure(metadata)
+
+    def _attempt_snapshot_is_infrastructure(self, attempt: dict[str, Any]) -> bool:
+        if bool(attempt.get("verified")):
+            return False
+        metadata = attempt.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        return self._metadata_is_infrastructure(metadata)
+
+    def _metadata_is_infrastructure(self, metadata: dict[str, Any]) -> bool:
+        """Accept typed launch evidence or phase-owned textual evidence only."""
+
+        phase = str(metadata.get("infrastructure_phase") or "")
+        launch_evidence = metadata.get("harbor_launch_evidence")
+        if (
+            phase == "harbor_launch"
+            and isinstance(launch_evidence, dict)
+            and str(launch_evidence.get("kind") or "")
+            in _base._DETERMINISTIC_LAUNCH_KINDS
+        ):
+            return True
+
+        # ``timeout_phase`` and booleans such as
+        # ``verifier_runtime_prepare_timeout`` are summaries, not provenance.
+        # Only evidence fields written by the owning runner/parser phase may
+        # carry the text needed for classification. Untyped Harbor/Worker/
+        # verifier streams never enter this helper.
+        return self._structured_text_is_infrastructure(
+            self._structured_environment_evidence(metadata)
+        )
+
+    def _mark_retry_policy_finite(self, trial: _base.TrialResult) -> None:
+        """Persist one final, versioned attribution decision for score consumers."""
+
+        # The inherited implementation calls ``self.is_infra_error()``, so the
+        # value below is already computed through the strict evidence rules in
+        # this public facade rather than the compatibility base's old heuristics.
+        super()._mark_retry_policy_finite(trial)
+        metadata = trial.metadata
+        current_infra = metadata.get("infra_error_detected") is True
+        metadata["infra_attribution_finalized"] = True
+        metadata["infra_attribution_policy"] = "phase_owned_evidence_v2"
+
+        if current_infra:
+            metadata["score_exclusion_reason"] = "infrastructure_error"
+        elif metadata.get("score_exclusion_reason") == "infrastructure_error":
+            metadata.pop("score_exclusion_reason", None)
