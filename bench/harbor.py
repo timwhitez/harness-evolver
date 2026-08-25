@@ -1,90 +1,98 @@
-"""Harbor runner with exact, cross-record task identity matching.
+"""Multi-attempt aggregation constrained by one canonical task identity.
 
-The complete Issue #7 implementation is retained in
-:mod:`bench._harbor_issue7_identity_base`.  This final facade closes the last
-ambiguity boundary: a simple requested task name must not select the first of
-multiple result records whose structured paths have the same basename but
-identify different tasks.
+The aggregation and incomplete-job recovery implementations are retained in
+:mod:`bench._harbor_issue6_recovery_base`. This facade computes the globally
+allowed attempt set once and makes every inherited selection path use it.
 """
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+import json
+from pathlib import Path
 from typing import Any
 
-from bench import _harbor_issue7_identity_base as _base
+from bench import _harbor_issue6_recovery_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
         globals()[_name] = _value
 
 
-def _canonical_result_identity(
-    result: dict[str, Any],
-) -> tuple[str, str] | None:
-    """Return one unambiguous typed identity for a raw Harbor result."""
-
-    identity = _base._task_identity(result)
-    if identity.paths:
-        if len(identity.paths) != 1:
-            return None
-        return ("path", next(iter(identity.paths)))
-    if len(identity.names) != 1:
-        return None
-    return ("name", next(iter(identity.names)))
+_ALLOWED_ATTEMPT_KEYS: ContextVar[frozenset[str] | None] = ContextVar(
+    "harness_evolver_allowed_harbor_attempt_keys",
+    default=None,
+)
 
 
-def _matching_trial_results(
-    trial_results: list[dict[str, Any]],
-    task_id: str,
-) -> list[dict[str, Any]]:
-    """Return all attempts only when their shared task identity is unique.
-
-    Multiple records are expected when Harbor runs more than one attempt. They
-    are accepted only when every matching record carries the same canonical
-    identity. Structured path evidence is authoritative and may not be mixed
-    with name-only evidence. Thus two datasets containing ``shared-task`` can
-    never become order-dependent merely because the caller requested the
-    basename.
-    """
-
-    candidates: list[dict[str, Any]] = []
-    identities: list[tuple[str, str]] = []
-    for result in trial_results:
-        if not isinstance(result, dict):
-            continue
-        identity = _base._task_identity(result)
-        if not _base._identity_matches_requested(identity, task_id):
-            continue
-        canonical = _canonical_result_identity(result)
-        if canonical is None:
-            continue
-        candidates.append(result)
-        identities.append(canonical)
-
-    if not candidates:
-        return []
-
-    kinds = {kind for kind, _ in identities}
-    values = {value for _, value in identities}
-    if len(kinds) != 1 or len(values) != 1:
-        return []
-    return candidates
+def _stable_attempt_key(result: dict[str, Any]) -> str:
+    return json.dumps(result, sort_keys=True, separators=(",", ":"), default=str)
 
 
 class HarborRunner(_base.HarborRunner):
-    """Require one canonical task identity across every selected attempt."""
+    """Aggregate attempts only after exact cross-record identity validation."""
 
-    def _matching_trial_results(
+    def parse_job_dir(
         self,
-        trial_results: list[dict[str, Any]],
+        job_dir: str | Path,
+        *,
         task_id: str,
-    ) -> list[dict[str, Any]]:
-        return _matching_trial_results(trial_results, task_id)
+        returncode: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+        wall_time: float = 0.0,
+        agent_config: dict[str, Any] | None = None,
+    ) -> _base.TrialResult:
+        job_path = Path(job_dir)
+        candidates: list[dict[str, Any]] = []
+        result_path = job_path / "result.json"
+        if result_path.exists():
+            try:
+                top_level = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                top_level = None
+            if isinstance(top_level, dict):
+                raw_results = top_level.get("trial_results") or []
+                if isinstance(raw_results, list):
+                    candidates = [
+                        item for item in raw_results if isinstance(item, dict)
+                    ]
+        if not candidates:
+            candidates = [
+                item
+                for item in self._load_trial_results_from_subdirs(job_path)
+                if isinstance(item, dict)
+            ]
 
-    def _select_trial_result(
+        allowed: frozenset[str] | None
+        if candidates:
+            allowed = frozenset(
+                _stable_attempt_key(item)
+                for item in self._matching_trial_results(candidates, task_id)
+            )
+        else:
+            allowed = None
+
+        token = _ALLOWED_ATTEMPT_KEYS.set(allowed)
+        try:
+            return super().parse_job_dir(
+                job_path,
+                task_id=task_id,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                wall_time=wall_time,
+                agent_config=agent_config,
+            )
+        finally:
+            _ALLOWED_ATTEMPT_KEYS.reset(token)
+
+    def _trial_result_matches_task(
         self,
-        trial_results: list[dict[str, Any]],
+        result: dict[str, Any],
         task_id: str,
-    ) -> dict[str, Any] | None:
-        matches = self._matching_trial_results(trial_results, task_id)
-        return matches[0] if matches else None
+    ) -> bool:
+        allowed = _ALLOWED_ATTEMPT_KEYS.get()
+        if allowed is not None:
+            return _stable_attempt_key(result) in allowed
+        return super()._trial_result_matches_task(result, task_id)
