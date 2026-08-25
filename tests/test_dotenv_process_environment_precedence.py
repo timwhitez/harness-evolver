@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ def test_existing_process_key_is_never_overwritten(
 
     _load_dotenv_without_overriding_process_environment(_selected_env(tmp_path))
 
-    assert __import__("os").environ[_ENV_KEY] == process_value
+    assert os.environ[_ENV_KEY] == process_value
 
 
 def test_missing_process_key_is_loaded_from_selected_dotenv(
@@ -37,4 +38,4 @@ def test_missing_process_key_is_loaded_from_selected_dotenv(
 
     _load_dotenv_without_overriding_process_environment(_selected_env(tmp_path))
 
-    assert __import__("os").environ[_ENV_KEY] == "from-dotenv"
+    assert os.environ[_ENV_KEY] == "from-dotenv"
