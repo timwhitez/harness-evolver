@@ -30,6 +30,7 @@ KILL_GRACE_SECONDS = 1.0
 TIMEOUT_EXIT_CODE = 124
 CLEANUP_FAILED_EXIT_CODE = 125
 SETUP_FAILED_EXIT_CODE = 126
+_CLEANUP_TOKEN_BYTES = 32
 
 _stop_signal: int | None = None
 
@@ -89,6 +90,43 @@ def _set_child_subreaper() -> None:
 def _record_stop_signal(signum: int, _frame: object) -> None:
     global _stop_signal
     _stop_signal = signum
+
+
+def _read_exact(fd: int, size: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < size:
+        chunk = os.read(fd, size - len(payload))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) != size:
+        raise ValueError("cleanup challenge has an invalid length")
+    return bytes(payload)
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while publishing cleanup proof")
+        view = view[written:]
+
+
+def _close_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _read_cleanup_challenge(fd: int) -> bytes:
+    try:
+        return _read_exact(fd, _CLEANUP_TOKEN_BYTES)
+    finally:
+        _close_fd(fd)
 
 
 def _linux_process_table() -> dict[int, _ProcessIdentity]:
@@ -199,8 +237,6 @@ def _terminate_descendants(root: subprocess.Popen[bytes]) -> bool:
         live = refresh()
         if not live:
             break
-        # A terminating process may fork or reparent another descendant. Repeat
-        # TERM over the refreshed set instead of relying on one snapshot.
         _signal_identities(live.values(), signal.SIGTERM)
         time.sleep(POLL_SECONDS)
 
@@ -229,8 +265,6 @@ def _terminate_descendants(root: subprocess.Popen[bytes]) -> bool:
         except subprocess.TimeoutExpired:
             pass
 
-    # Reap newly orphaned zombies and repeat one final KILL sweep. PID start
-    # times prevent signaling a recycled process identifier.
     for _ in range(5):
         _reap_orphaned_children(root.pid)
         live = refresh()
@@ -250,18 +284,34 @@ def _normalized_exit_code(returncode: int) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     global _stop_signal
+    _stop_signal = None
     parser = argparse.ArgumentParser()
     parser.add_argument("--payload", required=True)
+    parser.add_argument("--cleanup-challenge-fd", type=int)
+    parser.add_argument("--cleanup-proof-fd", type=int)
     arguments = parser.parse_args(argv)
+
+    proof_fd = arguments.cleanup_proof_fd
+    challenge_fd = arguments.cleanup_challenge_fd
+    cleanup_token: bytes | None = None
 
     if not sys.platform.startswith("linux") or not Path("/proc/self/stat").is_file():
         print("process supervisor requires Linux /proc", file=sys.stderr)
+        _close_fd(challenge_fd)
+        _close_fd(proof_fd)
         return SETUP_FAILED_EXIT_CODE
 
     try:
+        if (challenge_fd is None) != (proof_fd is None):
+            raise ValueError("cleanup challenge and proof descriptors must be paired")
         _set_child_subreaper()
         child_argv = decode_argv(arguments.payload)
+        if challenge_fd is not None:
+            cleanup_token = _read_cleanup_challenge(challenge_fd)
+            challenge_fd = None
     except Exception as exc:
+        _close_fd(challenge_fd)
+        _close_fd(proof_fd)
         print(f"process supervisor setup failed: {exc}", file=sys.stderr)
         return SETUP_FAILED_EXIT_CODE
 
@@ -269,30 +319,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _record_stop_signal)
 
     try:
-        root = subprocess.Popen(child_argv)
+        # close_fds prevents the managed command from inheriting the proof
+        # channel. It can observe descriptor numbers in argv, but never receives
+        # the random challenge token read and closed before this launch.
+        root = subprocess.Popen(child_argv, close_fds=True)
     except Exception as exc:
+        _close_fd(proof_fd)
         print(f"process supervisor child launch failed: {exc}", file=sys.stderr)
         return SETUP_FAILED_EXIT_CODE
 
-    while True:
-        if _stop_signal is not None:
-            return (
-                TIMEOUT_EXIT_CODE
-                if _terminate_descendants(root)
-                else CLEANUP_FAILED_EXIT_CODE
-            )
+    try:
+        while True:
+            if _stop_signal is not None:
+                cleaned = _terminate_descendants(root)
+                if not cleaned:
+                    return CLEANUP_FAILED_EXIT_CODE
+                if cleanup_token is not None and proof_fd is not None:
+                    try:
+                        _write_all(proof_fd, cleanup_token)
+                    except OSError as exc:
+                        print(
+                            f"process supervisor cleanup proof failed: {exc}",
+                            file=sys.stderr,
+                        )
+                        return CLEANUP_FAILED_EXIT_CODE
+                return TIMEOUT_EXIT_CODE
 
-        root_returncode = root.poll()
-        if root_returncode is not None:
-            # A shell may return after launching a background or daemonized
-            # descendant. Keep the subreaper alive until those processes are
-            # terminated and reaped so inherited output descriptors also close.
-            if _descendants(os.getpid()) and not _terminate_descendants(root):
-                return CLEANUP_FAILED_EXIT_CODE
-            return _normalized_exit_code(root_returncode)
+            root_returncode = root.poll()
+            if root_returncode is not None:
+                if _descendants(os.getpid()) and not _terminate_descendants(root):
+                    return CLEANUP_FAILED_EXIT_CODE
+                return _normalized_exit_code(root_returncode)
 
-        _reap_orphaned_children(root.pid)
-        time.sleep(POLL_SECONDS)
+            _reap_orphaned_children(root.pid)
+            time.sleep(POLL_SECONDS)
+    finally:
+        _close_fd(proof_fd)
 
 
 if __name__ == "__main__":
