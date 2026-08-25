@@ -14,7 +14,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 
 OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
@@ -175,11 +183,37 @@ class RoleModelConfig(BaseModel):
         )
 
 
+class ProviderRequestDefaults(BaseModel):
+    """Validated defaults that have a complete path into provider requests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timeout_seconds: StrictInt | None = Field(
+        default=None,
+        validation_alias=AliasChoices("timeout_seconds", "timeout"),
+    )
+    max_retries: StrictInt | None = None
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def validate_timeout_seconds(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("defaults.timeout must be positive")
+        return value
+
+    @field_validator("max_retries")
+    @classmethod
+    def validate_max_retries(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("defaults.max_retries must be non-negative")
+        return value
+
+
 class ModelsConfig(BaseModel):
     """Role-indexed provider configuration loaded from ``config/models.yaml``."""
 
     roles: dict[str, RoleModelConfig] = Field(default_factory=dict)
-    defaults: dict[str, Any] = Field(default_factory=dict)
+    defaults: ProviderRequestDefaults = Field(default_factory=ProviderRequestDefaults)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "ModelsConfig":
@@ -200,12 +234,19 @@ class ModelsConfig(BaseModel):
     def get_role(self, role: str) -> RoleModelConfig:
         if role not in self.roles:
             raise KeyError(f"Model role {role!r} is not configured")
-        return self.roles[role]
+
+        configured = self.roles[role]
+        updates: dict[str, Any] = {}
+        if configured.timeout_seconds is None and self.defaults.timeout_seconds is not None:
+            updates["timeout_seconds"] = self.defaults.timeout_seconds
+        if configured.max_retries is None and self.defaults.max_retries is not None:
+            updates["max_retries"] = self.defaults.max_retries
+        return configured.model_copy(update=updates) if updates else configured
 
     def redacted(self) -> dict[str, Any]:
         return {
-            "roles": {name: role.redacted() for name, role in self.roles.items()},
-            "defaults": self.defaults,
+            "roles": {name: self.get_role(name).redacted() for name in self.roles},
+            "defaults": self.defaults.model_dump(mode="json"),
         }
 
 

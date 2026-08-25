@@ -74,7 +74,7 @@ roles:
     max_retries: 3
 
 defaults:
-  temperature: 0.0
-  # Provider-request default only; not a loop stop condition.
+  # Provider-request defaults only; not loop stop conditions. Defaults apply
+  # only when the selected role omits the corresponding field.
   timeout: 300
   max_retries: 3
