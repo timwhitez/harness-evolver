@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import pytest
@@ -16,6 +16,9 @@ from harness.tools import process_runner
         [],
         ["echo", 1],
         None,
+        {"echo": "ok"},
+        {"echo", "ok"},
+        (item for item in ("echo", "ok")),
     ],
 )
 def test_invalid_argv_is_rejected_before_popen(
@@ -50,17 +53,23 @@ def test_validated_argv_is_a_detached_snapshot() -> None:
     assert process_runner._validated_argv(("echo", "tuple")) == ["echo", "tuple"]
 
 
-def test_validated_argv_consumes_the_source_only_once() -> None:
-    class SingleIterationArgv:
+def test_validated_argv_consumes_a_sequence_only_once() -> None:
+    class SingleIterationArgv(Sequence[str]):
         def __init__(self) -> None:
             self.iterations = 0
+            self.items = ("echo", "ok")
+
+        def __len__(self) -> int:
+            return len(self.items)
+
+        def __getitem__(self, index: int | slice) -> str | tuple[str, ...]:
+            return self.items[index]
 
         def __iter__(self) -> Iterator[str]:
             self.iterations += 1
             if self.iterations > 1:
                 raise AssertionError("argv source was iterated more than once")
-            yield "echo"
-            yield "ok"
+            yield from self.items
 
     source = SingleIterationArgv()
 
