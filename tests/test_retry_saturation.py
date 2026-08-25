@@ -106,10 +106,14 @@ def test_validation_rejects_non_finite_parameters(field: str, value: float) -> N
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("base_delay_seconds", 10**100_000),
-        ("backoff_multiplier", Decimal("1e100000")),
-        ("max_delay_seconds", object()),
-        ("base_delay_seconds", True),
+        pytest.param("base_delay_seconds", 10**100_000, id="huge-integer"),
+        pytest.param(
+            "backoff_multiplier",
+            Decimal("1e100000"),
+            id="huge-decimal",
+        ),
+        pytest.param("max_delay_seconds", object(), id="non-numeric-object"),
+        pytest.param("base_delay_seconds", True, id="boolean"),
     ],
 )
 def test_numeric_conversion_failures_are_reported_not_leaked(
