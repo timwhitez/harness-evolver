@@ -171,6 +171,13 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
             completed.stderr,
         )
 
+    # Windows still validates wheel membership, installed imports, runtime
+    # resources, and every console entry point above. A bare .py executable is
+    # not a portable CreateProcess target for HL_WORKER_RUST_BIN, so the direct
+    # executable-override protocol fixture below is intentionally POSIX-only.
+    if os.name == "nt":
+        return
+
     # Complete the installed Python bridge's real JSONL handshake without
     # requiring a networked Cargo build. The explicit override is part of the
     # supported runtime contract; package-resource assertions above independently
@@ -192,16 +199,16 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
             },
         }
     )
-    worker = tmp_path / ("protocol-worker.py")
+    worker = tmp_path / "protocol-worker.py"
     worker.write_text(
         f"#!{python}\n"
-        "import sys\n"
-        "assert sys.stdin.readline().strip()\n"
+        "import json, sys\n"
+        "request = json.loads(sys.stdin.readline())\n"
+        "assert request.get('type') == 'start'\n"
         f"print({final_event!r}, flush=True)\n",
         encoding="utf-8",
     )
-    if os.name != "nt":
-        worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
+    worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
 
     runtime_cache = tmp_path / "runtime-cache"
     handshake_probe = (
