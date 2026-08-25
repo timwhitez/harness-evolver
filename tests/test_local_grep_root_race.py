@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_execute_uses_nofollow_reader_instead_of_external_search(
+def test_execute_uses_stable_nofollow_reader_instead_of_external_search(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -31,11 +31,12 @@ def test_execute_uses_nofollow_reader_instead_of_external_search(
 
     assert result.success is True
     assert "needle" in result.output
-    assert result.metadata["engine"] == "python-nofollow"
+    assert result.metadata["engine"] == "python-stable-nofollow"
+    assert result.metadata["stable_root_descriptor"] is True
     assert result.metadata["external_search_disabled_for_path_safety"] is True
 
 
-def test_execute_blocks_root_replaced_after_authorization(
+def test_execute_blocks_root_replaced_by_symlink_after_authorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -74,3 +75,35 @@ def test_execute_blocks_root_replaced_after_authorization(
     }
     assert "classified" not in result.error
     assert secret.read_text(encoding="utf-8") == "classified\n"
+
+
+def test_execute_blocks_root_replaced_by_ordinary_sibling_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "public.txt").write_text("public\n", encoding="utf-8")
+
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    secret = replacement / "secret.txt"
+    secret.write_text("ordinary-secret\n", encoding="utf-8")
+    parked = tmp_path / "workspace-original"
+
+    def swap_after_authorization(root: Path, *, action: str):
+        workspace.rename(parked)
+        replacement.rename(workspace)
+        return None
+
+    monkeypatch.setattr(search_tools._base, "_preflight_symlink_tree", swap_after_authorization)
+
+    result = GrepTool().execute("ordinary-secret", path=str(workspace))
+
+    assert result.success is False
+    assert result.output == ""
+    assert result.metadata["blocked_by"] == "canonical_path_guard"
+    assert result.metadata["stable_root_descriptor"] is True
+    assert "ordinary-secret" not in result.error
+    assert secret.exists() is False
+    assert (workspace / "secret.txt").read_text(encoding="utf-8") == "ordinary-secret\n"
