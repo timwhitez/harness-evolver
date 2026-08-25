@@ -87,12 +87,9 @@ def _validated_output_limit(value: object) -> int:
 def _validated_argv(value: object) -> list[str]:
     """Return one immutable-by-convention argv snapshot before launch setup."""
 
-    if isinstance(value, (str, bytes)):
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise ValueError("argv must be a non-empty sequence of strings")
-    try:
-        argv = list(value)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise ValueError("argv must be a non-empty sequence of strings") from exc
+    argv = list(value)
     if not argv or not all(isinstance(item, str) for item in argv):
         raise ValueError("argv must be a non-empty sequence of strings")
     return argv
