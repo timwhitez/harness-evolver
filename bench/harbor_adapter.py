@@ -6,7 +6,7 @@ from bench._harbor_adapter_issue4_base import *  # noqa: F401,F403
 from bench import _harbor_adapter_issue4_base as _base
 from bench._canonical_harbor_glob import HarborGlobTool
 from bench._canonical_harbor_grep_hardlink import HarborGrepTool
-from bench._canonical_harbor_hardlink import (
+from bench._canonical_harbor_identity_guard import (
     HarborFileEditTool,
     HarborFileReadTool,
     HarborFileWriteTool,
