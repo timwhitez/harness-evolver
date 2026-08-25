@@ -82,9 +82,7 @@ def _validate_unique_regular_file(
     if not stat.S_ISREG(metadata.st_mode):
         raise SafePathError(f"Path is not a regular file: {target}")
     if metadata.st_nlink != 1:
-        raise SafePathError(
-            f"Refusing multiply linked regular file: {target}"
-        )
+        raise SafePathError(f"Refusing multiply linked regular file: {target}")
 
 
 def read_text_nofollow(
@@ -130,6 +128,11 @@ def atomic_write_text_nofollow(
     a new uniquely linked regular file. Append/edit operations read first and
     are rejected by :func:`read_text_nofollow` when the existing inode is
     multiply linked.
+
+    The temporary file uses normal ``0666 & ~umask`` creation semantics for a
+    new target and inherits the existing target's ordinary permission bits for
+    replacement. Every failure before ``os.replace`` removes the temporary file
+    and leaves the previous target bytes unchanged.
     """
 
     payload = content.encode("utf-8")
@@ -146,29 +149,36 @@ def atomic_write_text_nofollow(
 
         temporary_name = f".{name}.tmp-{secrets.token_hex(8)}"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-        descriptor = os.open(
-            temporary_name,
-            flags,
-            0o600,
-            dir_fd=parent_fd,
-        )
+        descriptor = -1
         try:
+            # Match ordinary file-creation semantics from PR #37. ``os.open``
+            # applies the process umask to 0666; existing targets are fchmod'd
+            # to their retained ordinary mode before publication.
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o666,
+                dir_fd=parent_fd,
+            )
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(payload)
                 stream.flush()
+                if existing_mode is not None:
+                    os.fchmod(descriptor, stat.S_IMODE(existing_mode))
                 os.fsync(descriptor)
-            if existing_mode is not None:
-                os.fchmod(descriptor, stat.S_IMODE(existing_mode))
-        finally:
             os.close(descriptor)
+            descriptor = -1
 
-        try:
+            # Recheck the final entry immediately before publication so a
+            # concurrent symlink swap cannot turn replacement into an unsafe
+            # follow operation. ``os.replace`` itself remains descriptor-bound.
             try:
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if stat.S_ISLNK(current.st_mode):
                     raise SafePathError(f"Refusing symlink target: {target}")
             except FileNotFoundError:
                 pass
+
             os.replace(
                 temporary_name,
                 name,
@@ -177,6 +187,8 @@ def atomic_write_text_nofollow(
             )
             os.fsync(parent_fd)
         finally:
+            if descriptor >= 0:
+                os.close(descriptor)
             try:
                 os.unlink(temporary_name, dir_fd=parent_fd)
             except FileNotFoundError:
