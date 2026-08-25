@@ -1,4 +1,4 @@
-"""Canonical-path search tools with stable descriptor-relative traversal."""
+"""Stable no-follow grep with exact result/error accounting."""
 
 from __future__ import annotations
 
@@ -9,16 +9,66 @@ import io
 import os
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Iterator, TextIO
 
 from harness.tools.canonical_path_guard import guard_canonical_path_strings
 from harness.tools.stable_tree import StableTreeError, iter_stable_regular_files
 
-_base = importlib.import_module("harness.tools._search_issue4_fixed_base")
+_base = importlib.import_module("harness.tools._search_issue13_base")
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
         globals()[_name] = _value
+
+_DEFAULT_MAX_INPUT_LINE_CHARS = 1_000_000
+_MAX_FAILURE_SAMPLES = 5
+_MAX_FAILURE_SAMPLE_CHARS = 2_000
+
+
+class _InputLineLimitExceeded(Exception):
+    def __init__(self, line_number: int, limit: int) -> None:
+        self.line_number = line_number
+        self.limit = limit
+        super().__init__(
+            f"physical line {line_number} exceeds grep input limit of {limit} characters"
+        )
+
+
+def _bounded_physical_lines(
+    stream: TextIO,
+    *,
+    max_chars: int,
+) -> Iterator[tuple[int, str]]:
+    """Yield complete lines without allocating an unbounded physical record."""
+
+    line_number = 0
+    while True:
+        line = stream.readline(max_chars + 1)
+        if line == "":
+            return
+        line_number += 1
+        # Exactly ``max_chars`` content characters followed by a newline are
+        # valid. A read that fills max_chars + 1 without seeing the newline
+        # proves that the physical record exceeds the configured semantic cap.
+        if len(line) > max_chars and not line.endswith("\n"):
+            raise _InputLineLimitExceeded(line_number, max_chars)
+        yield line_number, line
+
+
+def _parameter_failure(name: str) -> ToolResult:
+    return ToolResult(
+        success=False,
+        output="",
+        error=f"{name} must be an integer >= 1",
+        metadata={
+            "engine": "python-stable-nofollow",
+            "search_failed": True,
+            "parameter_validation_failed": True,
+            "canonical_paths": True,
+            "nofollow_io": True,
+            "stable_root_descriptor": True,
+        },
+    )
 
 
 def _python_grep(
@@ -30,16 +80,62 @@ def _python_grep(
     *,
     expected_root: os.stat_result | None = None,
 ):
-    """Search only files reachable from the exact directory inode authorized."""
+    """Scan every authorized target; retain only bounded results and diagnostics.
+
+    Invalid UTF-8 is a read failure, never replacement-decoded negative evidence.
+    The full stable traversal is consumed so match/omission and failure counts
+    are exact, while retained records, physical input lines, and diagnostics are
+    independently bounded.
+    """
 
     try:
         regex = re.compile(pattern)
     except re.error as exc:
-        return ToolResult(success=False, output="", error=f"Invalid regex: {exc}")
+        return ToolResult(
+            success=False,
+            output="",
+            error=f"Invalid regex: {exc}",
+            metadata={
+                "engine": "python-stable-nofollow",
+                "search_failed": True,
+                "canonical_paths": True,
+                "nofollow_io": True,
+                "stable_root_descriptor": True,
+            },
+        )
 
-    results: list[str] = []
+    if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
+        return _parameter_failure("max_results")
+    max_input_line_chars = getattr(
+        self,
+        "max_input_line_chars",
+        _DEFAULT_MAX_INPUT_LINE_CHARS,
+    )
+    if (
+        isinstance(max_input_line_chars, bool)
+        or not isinstance(max_input_line_chars, int)
+        or max_input_line_chars < 1
+    ):
+        return _parameter_failure("max_input_line_chars")
+
     search_path = Path(path)
     root_text = str(search_path)
+    returned: list[str] = []
+    failure_samples: list[str] = []
+    failure_count = 0
+    total_matches = 0
+    input_line_limit_exceeded = False
+    text_decode_error = False
+
+    def record_failure(message: object) -> None:
+        nonlocal failure_count
+        failure_count += 1
+        if len(failure_samples) >= _MAX_FAILURE_SAMPLES:
+            return
+        # Exceptions and paths are external data. Flatten and truncate each
+        # sample so even a maliciously verbose error cannot defeat the bound.
+        rendered = " ".join(str(message).splitlines())
+        failure_samples.append(rendered[:_MAX_FAILURE_SAMPLE_CHARS])
 
     try:
         with closing(
@@ -51,6 +147,7 @@ def _python_grep(
             for relative, binary_stream, _metadata in targets:
                 candidate = search_path if not relative.parts else search_path / relative
                 if include and not fnmatch.fnmatch(candidate.name, include):
+                    binary_stream.close()
                     continue
 
                 decision = guard_canonical_path_strings(
@@ -60,46 +157,93 @@ def _python_grep(
                     allowed_root=root_text,
                 )
                 if not decision.allowed:
+                    binary_stream.close()
                     return guarded_path_failure("grep result", decision)
 
-                with io.TextIOWrapper(
-                    binary_stream,
-                    encoding="utf-8",
-                    errors="replace",
-                    newline=None,
-                ) as content:
-                    for line_number, line in enumerate(content, 1):
-                        if regex.search(line):
-                            results.append(
-                                f"{candidate}:{line_number}: {line.rstrip()}"
-                            )
-                            if len(results) >= max_results:
-                                break
-                if len(results) >= max_results:
-                    break
+                try:
+                    with io.TextIOWrapper(
+                        binary_stream,
+                        encoding="utf-8",
+                        errors="strict",
+                        newline=None,
+                    ) as text_stream:
+                        for line_number, line in _bounded_physical_lines(
+                            text_stream,
+                            max_chars=max_input_line_chars,
+                        ):
+                            if not regex.search(line):
+                                continue
+                            total_matches += 1
+                            if len(returned) < max_results:
+                                rendered = line.rstrip()[:4000]
+                                returned.append(
+                                    f"{candidate}:{line_number}: {rendered}"
+                                )
+                except _InputLineLimitExceeded as exc:
+                    input_line_limit_exceeded = True
+                    record_failure(f"{candidate}: {exc}")
+                except UnicodeError as exc:
+                    text_decode_error = True
+                    record_failure(f"{candidate}: invalid UTF-8 text: {exc}")
+                except OSError as exc:
+                    record_failure(f"{candidate}: {exc}")
     except (OSError, StableTreeError) as exc:
+        record_failure(f"{search_path}: {exc}")
+
+    omitted_count = max(0, total_matches - len(returned))
+    output_lines = list(returned)
+    if omitted_count:
+        output_lines.append(f"... ({omitted_count} more results truncated)")
+    partial_output = "\n".join(output_lines)
+
+    metadata = {
+        "engine": "python-stable-nofollow",
+        "match_count": total_matches,
+        "returned_count": len(returned),
+        "omitted_count": omitted_count,
+        "truncated": omitted_count > 0,
+        "read_error_count": failure_count,
+        "diagnostic_sample_count": len(failure_samples),
+        "diagnostic_sample_limit": _MAX_FAILURE_SAMPLES,
+        "canonical_paths": True,
+        "nofollow_io": True,
+        "stable_root_descriptor": True,
+        "host_output_bounded": True,
+        "failure_diagnostics_bounded": True,
+        "physical_input_line_bounded": True,
+        "max_input_line_chars": max_input_line_chars,
+        "text_encoding": "utf-8",
+        "strict_text_decoding": True,
+    }
+    if input_line_limit_exceeded:
+        metadata["input_line_limit_exceeded"] = True
+    if text_decode_error:
+        metadata["text_decode_error"] = True
+    if failure_count:
+        metadata["search_failed"] = True
+        metadata["partial_results_available"] = bool(returned)
+        metadata["diagnostics_omitted_count"] = max(
+            0,
+            failure_count - len(failure_samples),
+        )
+        diagnostic = "; ".join(failure_samples)
+        omitted_failures = failure_count - len(failure_samples)
+        if omitted_failures:
+            diagnostic += f"; ... ({omitted_failures} additional failures omitted)"
         return ToolResult(
             success=False,
-            output="",
-            error=f"Cannot traverse grep root safely: {exc}",
-            metadata=policy_guard_metadata(
-                "canonical_path_guard",
-                canonical_path_checked=True,
-                nofollow_io=True,
-                stable_root_descriptor=True,
+            output=partial_output,
+            error=(
+                "Python grep could not read every authorized target"
+                + (f": {diagnostic}" if diagnostic else "")
             ),
+            metadata=metadata,
         )
 
     return ToolResult(
         success=True,
-        output="\n".join(results) if results else "(no matches)",
-        metadata={
-            "match_count": len(results),
-            "engine": "python-stable-nofollow",
-            "canonical_paths": True,
-            "nofollow_io": True,
-            "stable_root_descriptor": True,
-        },
+        output=partial_output or "(no matches)",
+        metadata=metadata,
     )
 
 
@@ -114,8 +258,19 @@ def _execute_secure_grep(
     """Authorize once, then keep traversal bound to that exact root inode."""
 
     limit = self.max_results if max_results is None else max_results
-    if limit < 1:
-        return ToolResult(success=False, output="", error="max_results must be >= 1")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return _parameter_failure("max_results")
+    max_input_line_chars = getattr(
+        self,
+        "max_input_line_chars",
+        _DEFAULT_MAX_INPUT_LINE_CHARS,
+    )
+    if (
+        isinstance(max_input_line_chars, bool)
+        or not isinstance(max_input_line_chars, int)
+        or max_input_line_chars < 1
+    ):
+        return _parameter_failure("max_input_line_chars")
 
     decision = resolve_guarded_path(
         path,
@@ -188,5 +343,6 @@ def _execute_secure_grep(
 
 _base.GrepTool._python_grep = _python_grep
 _base.GrepTool.execute = _execute_secure_grep
+_base.GrepTool.max_input_line_chars = _DEFAULT_MAX_INPUT_LINE_CHARS
 GrepTool = _base.GrepTool
 GlobTool = _base.GlobTool
