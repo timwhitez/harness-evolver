@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from ipaddress import AddressValueError, IPv6Address
+import re
 from urllib.parse import SplitResult, urlsplit
+
+
+_DNS_LABEL = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
+    flags=re.ASCII,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,47 @@ def _authority_has_empty_port(parsed: SplitResult) -> bool:
     return authority.endswith(":")
 
 
+def _normalise_hostname(hostname: str) -> str | None:
+    """Return a log-safe DNS/IDNA or IPv6 hostname, otherwise fail closed.
+
+    RFC 3986 permits many ``reg-name`` characters that are not hostnames. Python
+    consequently accepts authorities such as ``example.com;token=abc`` and
+    exposes the complete string through ``SplitResult.hostname``. Persisting that
+    value as host metadata would retain credential-like material. This helper
+    deliberately supports only DNS/IDNA labels and canonical IPv6 literals.
+    """
+
+    raw = hostname.lower()
+    if ":" in raw:
+        try:
+            return IPv6Address(raw).compressed.lower()
+        except AddressValueError:
+            return None
+
+    if raw.startswith(".") or ".." in raw:
+        return None
+    raw = raw.rstrip(".")
+    if not raw:
+        return None
+
+    try:
+        ascii_hostname = raw.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    if len(ascii_hostname) > 253:
+        return None
+
+    labels = ascii_hostname.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or _DNS_LABEL.fullmatch(label) is None
+        for label in labels
+    ):
+        return None
+    return ascii_hostname
+
+
 def safe_endpoint(value: str | None) -> SafeEndpoint:
     """Parse an endpoint without retaining userinfo, path, query, or fragment.
 
@@ -77,13 +126,8 @@ def safe_endpoint(value: str | None) -> SafeEndpoint:
     ):
         return _invalid_endpoint()
 
-    raw_hostname = hostname.lower()
-    # A single trailing dot is a valid absolute DNS spelling and is removed from
-    # log metadata. Leading roots and any doubled empty label remain malformed.
-    if raw_hostname.startswith(".") or ".." in raw_hostname:
-        return _invalid_endpoint()
-    normalized_hostname = raw_hostname.rstrip(".")
-    if not normalized_hostname:
+    normalized_hostname = _normalise_hostname(hostname)
+    if normalized_hostname is None:
         return _invalid_endpoint()
 
     return SafeEndpoint(
