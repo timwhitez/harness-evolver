@@ -77,6 +77,62 @@ def test_staged_rename_plus_edit_restores_original_bytes(tmp_path: Path) -> None
     _assert_clean(tmp_path)
 
 
+def test_rollback_preserves_unrelated_staged_baseline(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    target = tmp_path / "harness/target.py"
+    baseline = tmp_path / "harness/baseline.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("target = 1\n", encoding="utf-8")
+    baseline.write_text("baseline = 1\n", encoding="utf-8")
+    _commit_all(tmp_path)
+
+    # Existing staged work belongs to the caller, not the rejected delta.
+    baseline.write_text("baseline = 2\n", encoding="utf-8")
+    _git(tmp_path, "add", "harness/baseline.py")
+    target.write_text("target = 2\n", encoding="utf-8")
+
+    patch_text = _git(
+        tmp_path,
+        "diff",
+        "--binary",
+        "HEAD",
+        "--",
+        "harness/target.py",
+    ).stdout
+    patch = tmp_path / "target.patch"
+    patch.write_text(patch_text, encoding="utf-8")
+
+    assert PatchReviewer(tmp_path).rollback(patch) is True
+    assert target.read_text(encoding="utf-8") == "target = 1\n"
+    assert baseline.read_text(encoding="utf-8") == "baseline = 2\n"
+    staged = _git(tmp_path, "diff", "--cached", "--name-only").stdout.splitlines()
+    assert staged == ["harness/baseline.py"]
+
+
+def test_historical_reverse_patch_direction_is_detected(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    target = tmp_path / "harness/module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("value = 1\n", encoding="utf-8")
+    _commit_all(tmp_path)
+
+    target.write_text("value = 2\n", encoding="utf-8")
+    reverse_patch = _git(
+        tmp_path,
+        "diff",
+        "--binary",
+        "-R",
+        "HEAD",
+        "--",
+        "harness/module.py",
+    ).stdout
+    patch = tmp_path / "historical-reverse.patch"
+    patch.write_text(reverse_patch, encoding="utf-8")
+
+    assert PatchReviewer(tmp_path).rollback(patch) is True
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="uses /dev/null no-index binary patch")
 def test_untracked_binary_file_is_part_of_reversible_delta(tmp_path: Path) -> None:
     _init_repo(tmp_path)
