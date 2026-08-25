@@ -7,8 +7,9 @@ from typing import Any
 
 from harness.tools._file_read_issue18_base import FileReadTool as _BaseFileReadTool
 from harness.tools.base import ToolResult
+from harness.tools.bounded_path_io import read_bounded_bytes_nofollow
 from harness.tools.canonical_path_guard import guarded_path_failure, resolve_guarded_path
-from harness.tools.safe_path_io import SafePathError, read_bounded_bytes_nofollow
+from harness.tools.safe_path_io import SafePathError
 
 
 _BINARY_SIGNATURES: tuple[tuple[bytes, str], ...] = (
