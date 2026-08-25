@@ -33,8 +33,10 @@ def _directory_flags() -> int:
 
 
 @contextmanager
-def _open_stable_directory(path: Path) -> Iterator[int]:
-    expected = os.stat(path, follow_symlinks=False)
+def _open_stable_directory(
+    path: Path,
+    expected: os.stat_result,
+) -> Iterator[int]:
     if not stat.S_ISDIR(expected.st_mode):
         raise StableTreeError(f"Search root is not a directory: {path}")
 
@@ -132,11 +134,21 @@ def _walk_directory(
 
 def iter_stable_regular_files(
     root: str | os.PathLike[str],
+    *,
+    expected_root: os.stat_result | None = None,
 ) -> Iterator[tuple[Path, BinaryIO, os.stat_result]]:
-    """Yield regular files anchored to the directory inode first authorized."""
+    """Yield files anchored to the exact root inode authorized by the caller."""
 
     root_path = Path(root)
-    observed = os.stat(root_path, follow_symlinks=False)
+    observed = expected_root or os.stat(root_path, follow_symlinks=False)
+    current = os.stat(root_path, follow_symlinks=False)
+    if not _same_inode(observed, current) or stat.S_IFMT(observed.st_mode) != stat.S_IFMT(
+        current.st_mode
+    ):
+        raise StableTreeError(
+            f"Search root changed identity after authorization: {root_path}"
+        )
+
     if stat.S_ISREG(observed.st_mode):
         with _open_parent_nofollow(root_path, create_parents=False) as (
             parent_fd,
@@ -164,5 +176,5 @@ def iter_stable_regular_files(
     if not stat.S_ISDIR(observed.st_mode):
         raise StableTreeError(f"Search root is not a regular file or directory: {root_path}")
 
-    with _open_stable_directory(root_path) as root_fd:
+    with _open_stable_directory(root_path, observed) as root_fd:
         yield from _walk_directory(root_fd, Path())
