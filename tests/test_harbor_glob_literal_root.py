@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -130,10 +131,10 @@ def test_public_missing_python_path_uses_literal_root_script(
 
     result = tool.execute("*.py", path=str(root))
 
+    old_command = f"bash -c {shlex.quote(historical._GLOB_FALLBACK_SCRIPT)}"
     assert len(commands) == 2
-    assert commands[1] != historical._OLD_FALLBACK_COMMAND if hasattr(
-        historical, "_OLD_FALLBACK_COMMAND"
-    ) else True
+    assert commands[1] != old_command
+    assert "escape_glob_literal" in commands[1]
     assert result.success is True
     assert result.output.splitlines() == _primary(root, "*.py")
     assert result.metadata["engine"] == "bash-compgen"
