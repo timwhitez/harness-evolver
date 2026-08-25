@@ -24,8 +24,13 @@ def test_signal_killed_supervisor_never_claims_successful_cleanup() -> None:
     assert process_runner._supervisor_exit_confirms_cleanup(
         process_runner._SUPERVISOR_SETUP_FAILED_EXIT
     ) is False
-    assert process_runner._supervisor_exit_confirms_cleanup(0) is True
-    assert process_runner._supervisor_exit_confirms_cleanup(7) is True
+    assert process_runner._supervisor_exit_confirms_cleanup(0) is False
+    assert process_runner._supervisor_exit_confirms_cleanup(7) is False
+    assert process_runner._supervisor_exit_confirms_cleanup(137) is False
+    assert process_runner._supervisor_exit_confirms_cleanup(143) is False
+    assert process_runner._supervisor_exit_confirms_cleanup(
+        process_runner._SUPERVISOR_TIMEOUT_EXIT
+    ) is True
 
 
 def test_namespace_capability_probe_requires_a_private_procfs() -> None:
