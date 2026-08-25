@@ -39,16 +39,42 @@ def _integer_value(
     return parsed
 
 
+def _validate_optional_string(
+    config: dict[str, object],
+    *,
+    field: str,
+    parser: Any,
+    allow_empty: bool,
+) -> None:
+    value = config.get(field)
+    if value is None:
+        return
+    if not isinstance(value, str):
+        parser.error(f"{field} must be a string")
+    if not allow_empty and not value.strip():
+        parser.error(f"{field} must not be empty when explicitly supplied")
+
+
 def _validate_effective_model_request_values(
     config: dict[str, object],
     parser: Any,
 ) -> None:
-    """Reject invalid falsy values instead of silently replacing them.
+    """Reject invalid falsy values instead of silently replacing them."""
 
-    ``None`` means absent. Zero remains a valid explicit value only for fields
-    whose existing schema permits zero: retry count and reasoning-token budget.
-    Provider timeout and maximum output length must be strictly positive.
-    """
+    for field in ("model", "provider", "reasoning_effort"):
+        _validate_optional_string(
+            config,
+            field=field,
+            parser=parser,
+            allow_empty=False,
+        )
+    for field in ("base_url", "api_key_env"):
+        _validate_optional_string(
+            config,
+            field=field,
+            parser=parser,
+            allow_empty=True,
+        )
 
     reasoning_tokens = config.get("reasoning_max_tokens")
     if reasoning_tokens is not None:
@@ -88,8 +114,6 @@ def _validate_effective_model_request_values(
         )
         if parsed <= 0:
             parser.error("max_output_tokens must be positive")
-        # Harbor transports this optional agent kwarg as text; retain that
-        # established representation after validating the numeric contract.
         config["max_output_tokens"] = str(parsed)
 
 
