@@ -1,17 +1,49 @@
-"""Thin console-script wrappers around repository scripts."""
+"""Thin console-script wrappers with packaged runtime defaults."""
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
+from typing import Sequence
+
+from bench.runtime_resources import bundled_config_path
+
+
+def _has_option(argv: Sequence[str], option: str) -> bool:
+    return any(argument == option or argument.startswith(option + "=") for argument in argv)
+
+
+def _trial_argv_with_runtime_defaults(argv: Sequence[str]) -> list[str]:
+    """Add packaged model/trial config only when no explicit or local default exists."""
+
+    updated = list(argv)
+    if any(argument in {"-h", "--help"} for argument in updated[1:]):
+        return updated
+
+    if not _has_option(updated, "--trials-config") and not Path(
+        "config/trials.yaml"
+    ).is_file():
+        updated.extend(["--trials-config", str(bundled_config_path("trials.yaml"))])
+
+    local_models = (Path("config/local.yaml"), Path("config/models.yaml"))
+    if not _has_option(updated, "--models-config") and not any(
+        candidate.is_file() for candidate in local_models
+    ):
+        updated.extend(["--models-config", str(bundled_config_path("models.yaml"))])
+    return updated
 
 
 def trial() -> int:
+    sys.argv = _trial_argv_with_runtime_defaults(sys.argv)
     from scripts.run_trial import main
 
     return main()
 
 
 def regression() -> int:
+    # Regression resolves the same Worker model/trial configuration as a single
+    # trial and must therefore receive the installed defaults outside a checkout.
+    sys.argv = _trial_argv_with_runtime_defaults(sys.argv)
     from scripts.regression_check import main
 
     return main()

@@ -1,0 +1,319 @@
+# Trial tracking configuration
+# Controls how HL trials are run and tracked
+
+# Task selection
+tasks:
+  dataset: "terminal-bench-2.0"
+  selection:
+    # Default standard campaign behavior: use the full filtered task catalog in
+    # a reproducible shuffled order and rotate 10-task slices. When the pool is
+    # exhausted, start another deterministic epoch instead of stopping the
+    # master loop. Use explicit selectors for fixed reproduction subsets.
+    # Null seed means the campaign id is used, so --resume keeps the same order.
+    mode: random  # random | full | ids
+    # Per-round batch size for random rotation. This is a scheduling control,
+    # not a campaign task-pool cap or master-loop round/time limit.
+    random_count: 10
+    random_seed: null
+    rotate_each_iteration: true
+    balance_by_duration: true
+    ids: []
+    indices: []
+  domains: []  # Empty = all domains
+  difficulties: ["easy", "medium", "hard"]
+  # Legacy audit/reference value only. It must not truncate the campaign task
+  # pool or stop master/sub-agent/Worker loops; use explicit task selectors for
+  # fixed subsets.
+  max_tasks_per_trial: 5
+
+# Trial execution
+execution:
+  serial: true  # Serial-first policy (Missions pattern)
+  # Host-side parallel Harbor jobs inside one HL round. Default to one task so
+  # Docker build/pull/extract pressure cannot stack with other agents. Raising
+  # this above 1 requires the runtime 60% MemAvailable proof enforced by
+  # scripts/run_campaign.py.
+  round_task_concurrency: 1
+  # Rate-limit concurrency fields are audit references only. They record what
+  # an older adaptive-throughput policy would have done, but they must not
+  # stop, delay, truncate, throttle, or otherwise alter master/sub-agent/Worker
+  # loops.
+  rate_limit_concurrency:
+    enabled: true
+    first_fallback: 3
+    min: 1
+    # After a rate-limit backoff, keep the reduced concurrency for one full
+    # clean HL iteration, then restore to the configured round concurrency.
+    # This wait is a throughput recovery signal, not a loop stop condition.
+    restore_after_clean_iterations: 1
+  # Balance/billing/quota failures are provider account state, not Worker
+  # capability evidence. Keep this detector for audit and attribution only;
+  # it must not stop master, Codex update sub-agent, or Worker loops.
+  provider_fail_fast:
+    enabled: true
+    billing_quota: true
+  # Harbor-internal --n-concurrent for attempts inside one Harbor job. This is
+  # not the same as host-side per-round task concurrency.
+  max_parallel: 1
+  # Outer host-side Harbor wait reference for audit/reporting only. This is not
+  # forwarded to Harbor as a task timeout/resource override and does not kill
+  # the Harbor process; official Harbor/TerminalBench task limits own runtime.
+  timeout_per_task: 3600
+  # Compatibility/progress reference only. Null means Worker loops have no
+  # turn-count reference and never stop on turn count. Legacy
+  # max_turns_per_task is still accepted as an alias, but new configs should
+  # use the explicit audit field.
+  max_turns_audit: null
+  # Internal Worker per-tool cap for commands executed inside the task
+  # environment. This is not a Harbor/Terminal-Bench task timeout override.
+  tool_timeout_seconds: 120
+  # Learning campaigns use Docker's cache by default; strict submit/final
+  # evidence can still pass --force-build for a clean rebuild.
+  force_build: false
+  # Terminal-Bench 2.0 leaderboard rules do not allow modifying task
+  # timeouts/resources. Do not set Harbor timeout/resource multipliers here;
+  # timeout failures must be addressed by Worker strategy within official limits.
+  # Local learning/smoke runs default to one attempt. Before leaderboard upload,
+  # run candidate evidence with n_attempts: 5 or --n-attempts 5.
+  n_attempts: 1
+
+# Network reliability guards for Harbor environment builds and verifier dependency installs.
+# These settings keep Docker/apt/pip/uv infrastructure failures out of Worker scores.
+network:
+  preflight_mode: quick
+  preflight_timeout_seconds: 180
+  hardened_environment: true
+  # Audit/reference value only; infrastructure recovery attempts are not capped
+  # by this field.
+  infra_retries: 1
+  # Empty defaults preserve the upstream image name and local Docker settings.
+  # Add private registry mirrors only in config/local.yaml.
+  docker_mirror: ""
+  docker_hub_mirror: ""
+  prebuilt_docker_hub_mirror: ""
+  # Large prebuilt image pulls/extracts cannot be constrained with container
+  # memory caps. Keep cache warmup opt-in; pass --prebuilt-docker-pull-image to
+  # scripts/network_preflight.py for a deliberate warmup run.
+  prebuilt_docker_pull_images: []
+  # Cache warmup is best-effort once the image manifest is reachable. Keep this
+  # bounded so multi-GB pulls cannot block the whole campaign for an hour.
+  prebuilt_docker_pull_timeout_seconds: 600
+  docker_image_overrides: {}
+  # Optional literal Dockerfile download rewrites. Keep empty in the public
+  # template so copied task contexts use upstream URLs by default.
+  download_url_rewrites: {}
+  debian_mirror: "https://deb.debian.org/debian"
+  debian_security_mirror: "https://security.debian.org/debian-security"
+  ubuntu_mirror: "https://archive.ubuntu.com/ubuntu"
+  pypi_index_url: "https://pypi.org/simple/"
+  pypi_trusted_host: ""
+  apt_retries: 5
+  apt_timeout_seconds: 30
+  pip_retries: 5
+  pip_timeout_seconds: 30
+  # Reuse verifier-side pip/uv downloads across Harbor jobs. This does not
+  # change official task timeouts/resources; it only supplies a local package
+  # cache to tests/test.sh commands that install verifier dependencies.
+  verifier_dependency_cache: true
+  verifier_cache_host_dir: "trials/cache/verifier"
+  verifier_cache_container_dir: "/tmp/hl-verifier-cache"
+  bootstrap_ca_certificates: true
+  # Build-time direct downloads can fail transiently even after URL rewrites.
+  # Install a small wget shim in the copied Harbor build context that retries
+  # network/TLS/server failures without changing official benchmark resources.
+  download_retry_wrapper: true
+  # Do not expose host trust material to task containers in the public default.
+  # A private environment may opt in through config/local.yaml.
+  mount_host_ca_certificates: false
+  host_ca_cert_bundle: "/etc/ssl/certs/ca-certificates.crt"
+  # Keep host trust material out of copied build contexts by default. A private
+  # environment can opt in through config/local.yaml when it owns the CA bundle.
+  inject_host_ca_into_build: false
+  # Do not mount over /etc/ssl/certs/ca-certificates.crt; verifier apt installs
+  # may legitimately update that file during ca-certificates postinst.
+  host_ca_cert_container_path: "/tmp/hl-host-ca/ca-certificates.crt"
+
+# Local Docker safety policy for benchmark/test containers. These caps are
+# forwarded to Harbor where supported and injected into the custom compose
+# environment for pids/swap/labels/log rotation. They are local resource safety
+# policy, not a TerminalBench task-timeout relaxation.
+docker_resources:
+  enabled: true
+  memory: "4g"
+  memory_swap: "4g"
+  cpus: 2
+  pids_limit: 1024
+  labels:
+    com.harness-evolver.managed: "true"
+    com.harness-evolver.cleanup: "task"
+    com.harness-evolver.role: "benchmark"
+  log_max_size: "20m"
+  log_max_file: "3"
+
+# HL loop control
+hl_loop:
+  # Compatibility/reporting only. Master/sub-agent loops are not stopped by
+  # iteration counts, elapsed time, round counts, attempt counts, or budgets;
+  # they continue until explicit completion, submit terminal action, hard
+  # non-limit error, or user stop. Provider fail-fast is audit/account-state
+  # evidence only. Leaving max_iterations null records no requested-round audit
+  # value rather than implying a one-round default. Task-pool exhaustion is
+  # progress bookkeeping only and must roll into another evaluation epoch.
+  max_iterations: null
+  # Compatibility/reporting only. High TerminalBench scores can naturally
+  # plateau, so no-improvement patience must not stop the HL loop.
+  patience: null
+  min_improvement: 0.01
+  coupling_threshold: 5  # Trigger compression at this patch/component ratio
+
+codex_update:
+  # Compatibility/audit fields only. Codex update sub-agent execution is not
+  # stopped or skipped by round intervals, rollback cooldowns, or minimum
+  # failure counts; those values are retained in reports as evidence-strength
+  # and historical policy context.
+  interval: 2
+  min_failures: 2
+  cooldown_after_rollback: 2
+  # Audit/reporting target for tasks with both historical pass and fail
+  # evidence. This does not control diagnostic sub-agent attempt count and is
+  # not a master, sub-agent, or Worker loop stop condition.
+  partial_pass_diagnostic_k: 2
+
+# Regression
+regression:
+  enabled: true
+  default_lane: smoke
+  check_before_edit: true
+  check_after_edit: true
+  auto_rollback: true
+  selection_policy: adaptive
+  task_concurrency: 1
+  # Startup/baseline pre-regression failures are already fully attributed by
+  # the completed gate. Do not spend another long Harbor run retrying the same
+  # stale/flaky snapshot before quarantine; post-update gates still remain hard.
+  retry_baseline_failures: false
+  transient_cooldown_seconds: 21600
+  # Self-Harness held-out (D_out) acceptance gate. A fraction of solved-task
+  # snapshots is hidden from the Codex proposer's regression contracts and run as
+  # a separate held-out gate after the held-in gate; an accepted diff is rolled
+  # back if it regresses the held-out split, catching overfitting to the tasks the
+  # proposer was shown. 0 disables the held-out gate (held-in only). The partition
+  # is deterministic under holdout_seed and target-agnostic (stable per task_id).
+  holdout_fraction: 0.2
+  holdout_seed: 0
+  min_solved_for_regression: 3  # Need at least N solved tasks before regression checks
+  # Lane max_tasks is audit/documentation metadata only. Regression gates run
+  # every same-model solved snapshot. scripts/regression_check.py --cap is
+  # accepted as an audit/reference field only and does not shrink the run set.
+  # Lane names, explicit caps, snapshot counts, retry counts, transient
+  # cooldowns, validation timeout references, project-test duration, and
+  # task-concurrency values are validation/regression sub-agent metadata; they
+  # must not become time, round, attempt, snapshot-count, or timeout stops.
+  lanes:
+    smoke:
+      max_tasks: null
+    standard:
+      max_tasks: null
+    full:
+      max_tasks: null
+
+# Guard-reduction convergence safety net. Use
+# `python scripts/run_campaign.py --guard-convergence-eval ...` for guard
+# deletion/folding work; random rotating pools are not comparable enough for
+# accepting guard removals. Each guard-reduction patch must keep this fixed set
+# at or above minimum_accept_score before it can be accepted.
+guard_convergence:
+  fixed_eval:
+    name: "guard-reduction-fixed-20260623"
+    source_campaign_id: "standard-random10-deepseek-flash-codex-update-3-20260616-181800"
+    source_summary_id: "same-model-frontier-20260617"
+    baseline_score: 0.5
+    minimum_accept_score: 0.5
+    tasks:
+      - task_id: fix-git
+        domain: software-engineering
+        baseline_score: 1.0
+        evidence_trial_id: fix-git__Axfv6VS
+      - task_id: vulnerable-secret
+        domain: security
+        baseline_score: 1.0
+        evidence_trial_id: vulnerable-secret__64R5uM3
+      - task_id: log-summary-date-ranges
+        domain: data-processing
+        baseline_score: 1.0
+        evidence_trial_id: log-summary-date-ranges__cU9NhoD
+      - task_id: sqlite-db-truncate
+        domain: debugging
+        baseline_score: 1.0
+        evidence_trial_id: sqlite-db-truncate__X6r9B8a
+      - task_id: git-multibranch
+        domain: system-administration
+        baseline_score: 1.0
+        evidence_trial_id: git-multibranch__HYG3Rht
+      - task_id: regex-log
+        domain: data-processing
+        baseline_score: 0.0
+        evidence_trial_id: regex-log__wThWfez
+      - task_id: sparql-university
+        domain: data-querying
+        baseline_score: 0.0
+        evidence_trial_id: sparql-university__f325dLP
+      - task_id: sam-cell-seg
+        domain: data-science
+        baseline_score: 0.0
+        evidence_trial_id: sam-cell-seg__Ho5umq2
+      - task_id: git-leak-recovery
+        domain: software-engineering
+        baseline_score: 0.0
+        evidence_trial_id: git-leak-recovery__FjmdnGx
+      - task_id: sqlite-with-gcov
+        domain: system-administration
+        baseline_score: 0.0
+        evidence_trial_id: sqlite-with-gcov__qyFq7uK
+  guard_budget:
+    baseline_counts:
+      rust_guard_functions: 56
+      rust_blocked_repeated_timeout_path_functions: 17
+      rust_command_looks_like_functions: 76
+      python_command_looks_like_functions: 35
+      python_timeout_phase_keys: 29
+      total_guard_surface: 167
+    target_reduction_fraction: 0.30
+    target_total_guard_surface: 116
+  convergence:
+    plateau_rounds: 3
+    min_score_delta: 0.02
+
+goal:
+  objective: "Reduce handwritten Worker guard surface without regressing the fixed TerminalBench safety set"
+  status: active
+  score_target: 0.65
+  # Token budget is a per-HL-iteration window by default. Cumulative token
+  # usage is still recorded for audit, but one expensive iteration must not
+  # prevent the next requested improvement round from starting.
+  token_budget: 10000000
+  token_budget_scope: iteration  # iteration | campaign
+  # Reporting only. Goal wall-time budgets are recorded for audit but do not
+  # stop master/sub-agent loops.
+  wall_time_budget_seconds: null
+  submit_when_reached: false
+
+submit:
+  enabled: false
+  trigger_score: 0.80
+  min_tasks_evaluated: 89
+  min_attempts_per_task: 5
+  require_full_regression: true
+  require_clean_git: true
+  require_no_uncommitted_harness_diff: true
+  require_integrity_scan: true
+  require_atif_trajectory: true
+  harbor_upload: true
+  visibility: private
+  share_orgs:
+    - TimWhite-AGI
+  share_users:
+    - timwhitez
+  share_yes: true
+  stop_after_submit_attempt: true
+  once_per_campaign: true

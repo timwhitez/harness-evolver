@@ -1,0 +1,27 @@
+# TerminalBench-specific configuration
+
+benchmark:
+  dataset_version: "2.0"
+  harbor_version: ">=0.1.0"
+
+# Historical per-domain timeout references only. TerminalBench/Harbor official
+# task limits own runtime; these values must not become master, sub-agent,
+# Codex update, diagnostic/context, or Worker loop stop conditions.
+domain_timeouts:
+  software_engineering: 1800
+  scientific_computing: 2400
+  security: 1200
+  system_administration: 1800
+  ml_engineering: 3600
+  data_engineering: 2400
+  web_development: 1800
+  devops: 1800
+  networking: 1200
+  database: 1800
+
+# Agent adapter config
+agent:
+  # Harbor task-solving must stay on this repo's self-owned Worker. External
+  # coding agents are only allowed as master-orchestrator research/update tools.
+  type: hl-worker
+  adapter_class: bench.agent.HLAgent

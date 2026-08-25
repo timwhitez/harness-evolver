@@ -48,6 +48,14 @@ include = [
     "scripts*",
 ]
 
+[tool.setuptools.package-data]
+"bench.resources" = [
+    "config/*.yaml",
+    "hl-worker-core/Cargo.toml",
+    "hl-worker-core/Cargo.lock",
+    "hl-worker-core/src/*.rs",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
