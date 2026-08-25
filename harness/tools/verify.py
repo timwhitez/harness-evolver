@@ -2,20 +2,12 @@
 
 from __future__ import annotations
 
-import subprocess
-import time
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from harness.tools.base import (
-    ToolDef,
-    ToolResult,
-    ToolSchema,
-    operation_timeout_metadata,
-    policy_guard_metadata,
-)
-from harness.tools.shell import external_agent_command_reason, shell_semantic_failure_kind
+from harness.tools.base import ToolDef, ToolResult, ToolSchema
+from harness.tools.shell import ShellTool, shell_semantic_failure_kind
 
 
 _ONLY_ACHIEVED_THRESHOLD = re.compile(
@@ -262,6 +254,7 @@ class VerifyTool(ToolDef):
         "for Harbor verification. This does not decide benchmark pass/fail."
     )
     timeout_seconds: float = 120.0
+    max_output_chars: int = 50000
 
     def get_schema(self) -> ToolSchema:
         return ToolSchema(
@@ -282,62 +275,33 @@ class VerifyTool(ToolDef):
         timeout: float | None = None,
         **kwargs: Any,
     ) -> ToolResult:
-        external_agent_reason = external_agent_command_reason(command)
-        if external_agent_reason:
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    "Verification policy blocked command: "
-                    f"{external_agent_reason}. Keep agent creation in the master "
-                    "campaign orchestrator and solve the task with this Worker loop."
-                ),
-                metadata=policy_guard_metadata(
-                    "nested_sub_agent_creation_guard",
-                    sub_agent_creation_guard=True,
-                    nested_sub_agent_creation_allowed=False,
-                    only_master_loop_may_create_sub_agents=True,
-                    sub_agent_creation_loop_stop_condition=False,
-                    nested_sub_agent_creation_stop_condition=False,
-                ),
-            )
-        timeout = timeout or self.timeout_seconds
-        start = time.time()
-        try:
-            completed = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=kwargs.get("cwd"),
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    f"verification timed out after {timeout}s. This is an "
-                    "operation timeout, not a Worker, sub-agent, or master "
-                    "loop stop condition."
-                ),
-                duration_ms=(time.time() - start) * 1000,
-                metadata=operation_timeout_metadata(
-                    timeout_seconds=timeout,
-                    requested_timeout_seconds=timeout,
-                    elapsed_ms=(time.time() - start) * 1000,
-                    telemetry_source="verify",
-                ),
-            )
-        output = completed.stdout
-        if completed.stderr:
-            output += f"\n[stderr]\n{completed.stderr}"
-        semantic_failure = verify_semantic_failure_kind(
-            output,
+        """Authorize and execute through the same path as the local shell tool."""
+
+        shell_result = ShellTool(
+            timeout_seconds=self.timeout_seconds,
+            max_output_chars=self.max_output_chars,
+        ).execute(
             command=command,
-            returncode=completed.returncode,
+            timeout=timeout,
+            **kwargs,
         )
-        metadata = {"exit_code": completed.returncode}
+
+        # Policy blocks and operation timeouts are already complete, structured
+        # ShellTool results. Returning them unchanged guarantees guard parity.
+        if shell_result.metadata.get("blocked_by") or shell_result.metadata.get("timed_out"):
+            return shell_result
+
+        try:
+            returncode = int(shell_result.metadata.get("exit_code", 0 if shell_result.success else 1))
+        except (TypeError, ValueError):
+            returncode = 0 if shell_result.success else 1
+
+        semantic_failure = verify_semantic_failure_kind(
+            shell_result.output,
+            command=command,
+            returncode=returncode,
+        )
+        metadata = dict(shell_result.metadata)
         if semantic_failure:
             metadata.update(
                 {
@@ -347,15 +311,15 @@ class VerifyTool(ToolDef):
                     "loop_stop_condition": False,
                 }
             )
-        success = completed.returncode == 0 and semantic_failure is None
+
         return ToolResult(
-            success=success,
-            output=output,
+            success=shell_result.success and semantic_failure is None,
+            output=shell_result.output,
             error=(
-                verify_semantic_failure_error(semantic_failure, completed.returncode)
+                verify_semantic_failure_error(semantic_failure, returncode)
                 if semantic_failure
-                else "" if completed.returncode == 0 else f"exit code: {completed.returncode}"
+                else shell_result.error
             ),
-            duration_ms=(time.time() - start) * 1000,
+            duration_ms=shell_result.duration_ms,
             metadata=metadata,
         )
