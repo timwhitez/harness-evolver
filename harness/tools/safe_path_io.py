@@ -208,6 +208,8 @@ def _stat_unconditional_target(
         return None
     if stat.S_ISLNK(metadata.st_mode):
         raise SafePathError(f"Refusing symlink target: {target}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SafePathError(f"Refusing non-regular overwrite target: {target}")
     return metadata
 
 
