@@ -9,8 +9,9 @@ from typing import Any, BinaryIO, TextIO
 
 from harness.tools import _file_read_issue17_base as _base
 from harness.tools.base import ToolResult
+from harness.tools.bounded_path_io import open_binary_nofollow
 from harness.tools.canonical_path_guard import guarded_path_failure, resolve_guarded_path
-from harness.tools.safe_path_io import SafePathError, open_binary_nofollow
+from harness.tools.safe_path_io import SafePathError
 
 
 _BINARY_SAMPLE_BYTES = 8192
