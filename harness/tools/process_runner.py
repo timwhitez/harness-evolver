@@ -84,6 +84,17 @@ def _validated_output_limit(value: object) -> int:
     return limit
 
 
+def _validated_argv(value: object) -> list[str]:
+    """Return one immutable-by-convention argv snapshot before launch setup."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("argv must be a non-empty sequence of strings")
+    argv = list(value)
+    if not argv or not all(isinstance(item, str) for item in argv):
+        raise ValueError("argv must be a non-empty sequence of strings")
+    return argv
+
+
 def _close_fd(fd: int | None) -> None:
     if fd is None:
         return
@@ -217,8 +228,7 @@ def _run_bounded_argv(
     env: Mapping[str, str] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> ProcessOutcome:
-    if not argv or not all(isinstance(item, str) for item in argv):
-        raise ValueError("argv must be a non-empty sequence of strings")
+    normalized_argv = _validated_argv(argv)
     timeout = _validated_timeout(timeout_seconds)
     output_limit = _validated_output_limit(output_limit_bytes)
 
@@ -245,9 +255,9 @@ def _run_bounded_argv(
             challenge_write,
             proof_read,
             cleanup_token,
-        ) = _prepare_supervised_launch(argv)
+        ) = _prepare_supervised_launch(normalized_argv)
     else:
-        launched_argv = list(argv)
+        launched_argv = normalized_argv
 
     started = time.monotonic()
     try:
