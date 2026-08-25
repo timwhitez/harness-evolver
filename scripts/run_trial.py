@@ -1,10 +1,13 @@
 """Trial CLI with role-aware model-config discovery.
 
-This branch is intentionally stacked on the issue-12 precedence fix. The
-precedence/validation implementation is retained in
-:mod:`scripts._run_trial_issue11_base`; this facade resolves the effective role
-after loading the selected environment file and validates that exact role in
-every model configuration that is explicitly selected or automatically found.
+This branch is stacked on the issue-12 precedence fix. It resolves the effective
+Worker role only after reading the selected dotenv, while preserving the
+explicit precedence contract:
+
+    CLI > pre-existing process environment > selected dotenv > default
+
+The exact role is then used for every explicit or automatic model-config
+selection and recorded in effective metadata with its source.
 """
 
 from __future__ import annotations
@@ -30,6 +33,39 @@ _SELECTED_MODELS_PATH: ContextVar[Path | None] = ContextVar(
     "harness_evolver_selected_models_path",
     default=None,
 )
+
+
+def _dotenv_values(path: Path) -> dict[str, str]:
+    """Parse the repository's deliberately small KEY=VALUE dotenv subset."""
+
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _load_dotenv_without_overriding_process_environment(path: Path) -> None:
+    """Load selected dotenv values only where the process has no value.
+
+    An explicitly selected dotenv is a fallback source, not permission to
+    overwrite an already supplied process environment. Empty process values are
+    treated as absent so a selected dotenv can fill them, matching the existing
+    CLI tests and common dotenv behavior for unset credentials/roles.
+    """
+
+    for key, value in _dotenv_values(path).items():
+        if not os.environ.get(key):
+            os.environ[key] = value
 
 
 def _select_models_config_for_effective_role(
@@ -80,29 +116,46 @@ def _select_models_config_for_effective_role(
             f"config. Checked roles: {checked}"
         )
 
-    # Preserve the audit-baseline CLI-only path. The parser exposes explicit
-    # model/provider/base-url/key arguments, so absence of every config file is
-    # not itself a role typo. The issue concerns selecting the wrong discovered
-    # file or silently accepting a role missing from a selected file. Effective
-    # request-value validation remains owned by the stacked issue-12 resolver.
+    # Keep the supported complete CLI-only request path when no role registry
+    # exists. Effective request validation remains owned by the issue-12 layer.
     _SELECTED_MODELS_PATH.set(None)
     return None
 
 
 def resolve_agent_config(args: Any, parser: Any) -> dict[str, object]:
-    """Load env, resolve role source, select exact-role config, then merge."""
+    """Load dotenv fallback, resolve role provenance, discover exact config."""
 
-    # Role selection must happen after the selected env file is loaded. The
-    # underlying implementation loads it again; dotenv loading is idempotent.
     env_file = _core._resolve_env_file(getattr(args, "env_file", None), parser)
+    process_role = str(os.environ.get("HL_WORKER_ROLE") or "").strip()
+    dotenv_role = ""
     if env_file:
-        _core._load_dotenv(env_file)
+        dotenv_role = str(_dotenv_values(env_file).get("HL_WORKER_ROLE") or "").strip()
+        _load_dotenv_without_overriding_process_environment(env_file)
 
-    cli_role = getattr(args, "worker_role", None)
-    env_role = os.environ.get("HL_WORKER_ROLE")
-    worker_role = cli_role or env_role or "worker"
-    role_source = "cli" if cli_role else "environment" if env_role else "default"
+    raw_cli_role = getattr(args, "worker_role", None)
+    if raw_cli_role is not None and not str(raw_cli_role).strip():
+        parser.error("--worker-role must not be empty")
+    cli_role = str(raw_cli_role).strip() if raw_cli_role is not None else ""
 
+    if cli_role:
+        worker_role = cli_role
+        role_source = "cli"
+    elif process_role:
+        worker_role = process_role
+        role_source = "process_environment"
+    elif dotenv_role:
+        worker_role = dotenv_role
+        role_source = "selected_dotenv"
+    else:
+        worker_role = "worker"
+        role_source = "default"
+
+    # The inherited resolver reads HL_WORKER_ROLE before its own dotenv call.
+    # Ensure it observes the already resolved value, and replace its loader with
+    # the same non-overriding contract so a second idempotent load cannot change
+    # process-environment precedence.
+    previous_role = os.environ.get("HL_WORKER_ROLE")
+    os.environ["HL_WORKER_ROLE"] = worker_role
     role_token = _EFFECTIVE_WORKER_ROLE.set(worker_role)
     path_token = _SELECTED_MODELS_PATH.set(None)
     try:
@@ -111,6 +164,10 @@ def resolve_agent_config(args: Any, parser: Any) -> dict[str, object]:
     finally:
         _SELECTED_MODELS_PATH.reset(path_token)
         _EFFECTIVE_WORKER_ROLE.reset(role_token)
+        if previous_role is None:
+            os.environ.pop("HL_WORKER_ROLE", None)
+        else:
+            os.environ["HL_WORKER_ROLE"] = previous_role
 
     if selected_path is None and not str(config.get("model") or "").strip():
         parser.error(
@@ -121,14 +178,19 @@ def resolve_agent_config(args: Any, parser: Any) -> dict[str, object]:
 
     config["worker_role"] = worker_role
     config["worker_role_source"] = role_source
-    config["models_config_path"] = str(selected_path) if selected_path is not None else None
+    config["models_config_path"] = (
+        str(selected_path) if selected_path is not None else None
+    )
     return config
 
 
-# The retained issue-12 resolver delegates into the original module, whose
-# global config selector and main() lookup must both see these replacements.
+# The retained resolver delegates into the original module. Patch only the two
+# extension points it intentionally exposes; dotenv loading remains idempotent
+# and process-safe under the explicit precedence contract above.
+_core._load_dotenv = _load_dotenv_without_overriding_process_environment
 _core._select_models_config = _select_models_config_for_effective_role
 _core.resolve_agent_config = resolve_agent_config
+_base._load_dotenv = _load_dotenv_without_overriding_process_environment
 _base.resolve_agent_config = resolve_agent_config
 main = _base.main
 
