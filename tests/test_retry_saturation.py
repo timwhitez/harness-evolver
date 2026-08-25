@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import math
 import sys
 
@@ -100,6 +101,35 @@ def test_validation_rejects_non_finite_parameters(field: str, value: float) -> N
     assert strategy.validate()
     with pytest.raises(ValueError):
         strategy.delay_for_attempt(1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_delay_seconds", 10**100_000),
+        ("backoff_multiplier", Decimal("1e100000")),
+        ("max_delay_seconds", object()),
+        ("base_delay_seconds", True),
+    ],
+)
+def test_numeric_conversion_failures_are_reported_not_leaked(
+    field: str,
+    value: object,
+) -> None:
+    strategy = RetryStrategy(**{field: value})
+
+    errors = strategy.validate()
+
+    assert errors
+    assert any(field in error for error in errors)
+    with pytest.raises(ValueError, match=field):
+        strategy.delay_for_attempt(1)
+
+
+@pytest.mark.parametrize("attempt", [True, 1.0, Decimal("1")])
+def test_retry_attempt_requires_a_non_boolean_integer(attempt: object) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        RetryStrategy().delay_for_attempt(attempt)  # type: ignore[arg-type]
 
 
 def test_retry_attempt_must_be_positive() -> None:
