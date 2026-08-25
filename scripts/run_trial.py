@@ -54,7 +54,7 @@ def _dotenv_values(path: Path) -> dict[str, str]:
 
 def _load_dotenv_without_overriding_process_environment(path: Path) -> None:
     for key, value in _dotenv_values(path).items():
-        if not os.environ.get(key):
+        if key not in os.environ:
             os.environ[key] = value
 
 
