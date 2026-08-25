@@ -8,8 +8,11 @@ from bench._canonical_harbor_glob import HarborGlobTool
 from bench._canonical_harbor_grep_hardlink import HarborGrepTool
 from bench._canonical_harbor_identity_guard import (
     HarborFileEditTool,
-    HarborFileReadTool,
     HarborFileWriteTool,
+)
+from bench._streaming_harbor_read import (
+    HarborFileReadTool,
+    _STREAMING_READ_PYTHON,
 )
 
 
@@ -39,3 +42,14 @@ class HLWorkerHarborAgent(_base.HLWorkerHarborAgent):
         ]:
             registry.register(tool)
         return registry
+
+
+__all__ = [
+    "HLWorkerHarborAgent",
+    "HarborFileReadTool",
+    "HarborFileEditTool",
+    "HarborFileWriteTool",
+    "HarborGrepTool",
+    "HarborGlobTool",
+    "_STREAMING_READ_PYTHON",
+]
