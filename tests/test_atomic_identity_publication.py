@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import stat
+import sys
 
 import pytest
 
@@ -20,8 +21,8 @@ from harness.tools.safe_path_io import (
 
 
 pytestmark = pytest.mark.skipif(
-    os.name != "posix" or not hasattr(os, "O_NOFOLLOW"),
-    reason="descriptor-relative identity checks are POSIX-only",
+    not sys.platform.startswith("linux") or not hasattr(os, "O_NOFOLLOW"),
+    reason="race-safe conditional publication requires Linux renameat2",
 )
 
 
@@ -74,6 +75,47 @@ def test_transform_publication_rejects_same_inode_content_change(
     assert _temps(target) == []
 
 
+def test_atomic_exchange_rolls_back_a_swap_at_the_publication_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("old\n", encoding="utf-8")
+    original, metadata = read_text_nofollow(target, errors="strict")
+    moved = tmp_path / "original.txt"
+    real_renameat2 = safe_path_io._renameat2
+    swapped = False
+
+    def racing_renameat2(
+        parent_fd: int,
+        source: str,
+        destination: str,
+        flags: int,
+    ) -> None:
+        nonlocal swapped
+        if flags == safe_path_io._RENAME_EXCHANGE and not swapped:
+            target.replace(moved)
+            target.write_text("concurrent\n", encoding="utf-8")
+            swapped = True
+        real_renameat2(parent_fd, source, destination, flags)
+
+    monkeypatch.setattr(safe_path_io, "_renameat2", racing_renameat2)
+
+    with pytest.raises(SafePathError, match="changed identity"):
+        atomic_write_text_nofollow(
+            target,
+            "updated\n",
+            mode=metadata.st_mode,
+            expected_identity=file_identity(metadata),
+            expected_sha256=hashlib.sha256(original.encode()).hexdigest(),
+        )
+
+    assert swapped is True
+    assert moved.read_text(encoding="utf-8") == "old\n"
+    assert target.read_text(encoding="utf-8") == "concurrent\n"
+    assert _temps(target) == []
+
+
 def test_file_edit_passes_identity_and_digest_to_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -100,6 +142,17 @@ def test_file_edit_passes_identity_and_digest_to_publication(
     assert result.metadata["target_identity_verified"] is True
     assert target.read_text(encoding="utf-8") == "concurrent value\n"
     assert moved.read_text(encoding="utf-8") == "old value\n"
+
+
+def test_crlf_edit_uses_the_exact_raw_byte_digest(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"old value\r\nsecond line\r\n")
+
+    result = FileEditTool().execute(str(target), "old", "new")
+
+    assert result.success is True
+    assert target.read_bytes() == b"new value\r\nsecond line\r\n"
+    assert result.metadata["target_identity_verified"] is True
 
 
 def test_directory_fsync_failure_is_post_publication_warning(
