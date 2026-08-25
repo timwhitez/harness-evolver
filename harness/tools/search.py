@@ -23,6 +23,7 @@ for _name, _value in vars(_base).items():
 _DEFAULT_MAX_INPUT_LINE_CHARS = 1_000_000
 _MAX_FAILURE_SAMPLES = 5
 _MAX_FAILURE_SAMPLE_CHARS = 2_000
+_BASE_GET_SCHEMA = _base.GrepTool.get_schema
 
 
 class _InputLineLimitExceeded(Exception):
@@ -71,6 +72,60 @@ def _parameter_failure(name: str) -> ToolResult:
     )
 
 
+def _configured_result_cap(self: Any) -> int | None:
+    value = getattr(self, "max_results", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _result_cap_failure(configured_cap: int) -> ToolResult:
+    return ToolResult(
+        success=False,
+        output="",
+        error=(
+            "max_results cannot exceed the configured GrepTool cap "
+            f"of {configured_cap}"
+        ),
+        metadata={
+            "engine": "python-stable-nofollow",
+            "search_failed": True,
+            "parameter_validation_failed": True,
+            "configured_max_results": configured_cap,
+            "canonical_paths": True,
+            "nofollow_io": True,
+            "stable_root_descriptor": True,
+        },
+    )
+
+
+def _bounded_grep_schema(self: Any):
+    schema = _BASE_GET_SCHEMA(self)
+    configured_cap = _configured_result_cap(self)
+    properties = schema.parameters.get("properties", {})
+    result_property = properties.get("max_results")
+    if isinstance(result_property, dict):
+        result_property["minimum"] = 1
+        if configured_cap is not None:
+            result_property["maximum"] = configured_cap
+    return schema
+
+
+def _validate_result_window(
+    self: Any,
+    requested: object,
+) -> tuple[int | None, ToolResult | None]:
+    configured_cap = _configured_result_cap(self)
+    if configured_cap is None:
+        return None, _parameter_failure("configured max_results")
+    effective = configured_cap if requested is None else requested
+    if isinstance(effective, bool) or not isinstance(effective, int) or effective < 1:
+        return None, _parameter_failure("max_results")
+    if effective > configured_cap:
+        return None, _result_cap_failure(configured_cap)
+    return effective, None
+
+
 def _python_grep(
     self: Any,
     pattern: str,
@@ -104,8 +159,11 @@ def _python_grep(
             },
         )
 
-    if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
-        return _parameter_failure("max_results")
+    validated_results, result_failure = _validate_result_window(self, max_results)
+    if result_failure is not None:
+        return result_failure
+    assert validated_results is not None
+    max_results = validated_results
     max_input_line_chars = getattr(
         self,
         "max_input_line_chars",
@@ -257,9 +315,10 @@ def _execute_secure_grep(
 ):
     """Authorize once, then keep traversal bound to that exact root inode."""
 
-    limit = self.max_results if max_results is None else max_results
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        return _parameter_failure("max_results")
+    limit, result_failure = _validate_result_window(self, max_results)
+    if result_failure is not None:
+        return result_failure
+    assert limit is not None
     max_input_line_chars = getattr(
         self,
         "max_input_line_chars",
@@ -343,6 +402,7 @@ def _execute_secure_grep(
 
 _base.GrepTool._python_grep = _python_grep
 _base.GrepTool.execute = _execute_secure_grep
+_base.GrepTool.get_schema = _bounded_grep_schema
 _base.GrepTool.max_input_line_chars = _DEFAULT_MAX_INPUT_LINE_CHARS
 GrepTool = _base.GrepTool
 GlobTool = _base.GlobTool
