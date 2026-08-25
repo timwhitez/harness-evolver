@@ -39,6 +39,30 @@ def _integer_value(
     return parsed
 
 
+def _validate_optional_string(
+    config: dict[str, object],
+    *,
+    field: str,
+    parser: Any,
+    allow_empty: bool,
+) -> None:
+    """Validate explicit string overrides without treating them as absent.
+
+    ``None`` is the only missing-value sentinel. Empty endpoint/key strings are
+    retained deliberately so callers can clear role-level optional values.
+    Required request identity fields reject an explicit empty string rather than
+    silently falling back to the role configuration.
+    """
+
+    value = config.get(field)
+    if value is None:
+        return
+    if not isinstance(value, str):
+        parser.error(f"{field} must be a string")
+    if not allow_empty and not value.strip():
+        parser.error(f"{field} must not be empty when explicitly supplied")
+
+
 def _validate_effective_model_request_values(
     config: dict[str, object],
     parser: Any,
@@ -48,7 +72,24 @@ def _validate_effective_model_request_values(
     ``None`` means absent. Zero remains a valid explicit value only for fields
     whose existing schema permits zero: retry count and reasoning-token budget.
     Provider timeout and maximum output length must be strictly positive.
+    Optional endpoint/key strings may be explicitly cleared with ``""``; model,
+    provider, and reasoning-effort identities may not.
     """
+
+    for field in ("model", "provider", "reasoning_effort"):
+        _validate_optional_string(
+            config,
+            field=field,
+            parser=parser,
+            allow_empty=False,
+        )
+    for field in ("base_url", "api_key_env"):
+        _validate_optional_string(
+            config,
+            field=field,
+            parser=parser,
+            allow_empty=True,
+        )
 
     reasoning_tokens = config.get("reasoning_max_tokens")
     if reasoning_tokens is not None:
