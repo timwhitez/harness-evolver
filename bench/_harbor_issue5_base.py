@@ -59,6 +59,28 @@ def _identity_mentions_requested(result: dict[str, Any], task_id: str) -> bool:
     )
 
 
+def _top_level_has_rejected_requested_evidence(
+    candidates: list[dict[str, Any]],
+    accepted: list[dict[str, Any]],
+    task_id: str,
+) -> bool:
+    """Reject a convenient valid subset when a sibling contradicts the task.
+
+    A top-level object is one authoritative Harbor snapshot. If any record in
+    that snapshot mentions the requested identity but is excluded by the exact
+    singleton matcher, the object is internally inconsistent. Selecting only
+    the accepted records would make attribution depend on filtering order and
+    could hide a stale or cross-dataset result.
+    """
+
+    accepted_keys = {_stable_attempt_key(item) for item in accepted}
+    return any(
+        _identity_mentions_requested(item, task_id)
+        and _stable_attempt_key(item) not in accepted_keys
+        for item in candidates
+    )
+
+
 class HarborRunner(_base.HarborRunner):
     """Aggregate attempts only after exact cross-record identity validation."""
 
@@ -98,15 +120,20 @@ class HarborRunner(_base.HarborRunner):
                 top_level_candidates,
                 task_id,
             )
-            if accepted_top_level:
+            if accepted_top_level and not _top_level_has_rejected_requested_evidence(
+                top_level_candidates,
+                accepted_top_level,
+                task_id,
+            ):
                 candidates = top_level_candidates
-            elif any(
+            elif accepted_top_level or any(
                 _identity_mentions_requested(item, task_id)
                 for item in top_level_candidates
             ):
                 # The top-level result refers to the requested identity but is
                 # contradictory across fields or attempts. Never hide that
-                # evidence by selecting a more convenient subdirectory subset.
+                # evidence by selecting a convenient top-level/subdirectory
+                # subset.
                 candidates = top_level_candidates
                 force_no_match = True
             else:
