@@ -39,7 +39,14 @@ harness-evolver-mission-debug = "harness_evolver.cli:mission_debug"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["hl*", "harness*", "bench*", "meta*"]
+include = [
+    "hl*",
+    "harness*",
+    "harness_evolver*",
+    "bench*",
+    "meta*",
+    "scripts*",
+]
 
 [tool.ruff]
 line-length = 100
