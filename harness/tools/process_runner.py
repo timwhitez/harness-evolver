@@ -222,9 +222,16 @@ def _run_bounded_argv(
     timeout = _validated_timeout(timeout_seconds)
     output_limit = _validated_output_limit(output_limit_bytes)
 
-    child_env = dict(os.environ)
-    if env is not None:
-        child_env.update({str(key): str(value) for key, value in env.items()})
+    # Match subprocess.Popen's established environment contract exactly:
+    # ``None`` inherits the parent environment, while an explicit mapping is a
+    # complete replacement. Overlaying it onto ``os.environ`` can reintroduce
+    # credentials, proxy settings, or loader variables the caller deliberately
+    # removed from a verification command.
+    child_env = (
+        None
+        if env is None
+        else {str(key): str(value) for key, value in env.items()}
+    )
 
     supervised = _runtime._is_linux_subreaper_available()
     child_fds: tuple[int, int] = ()
