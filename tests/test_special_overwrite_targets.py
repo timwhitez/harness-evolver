@@ -103,7 +103,7 @@ def test_harbor_whole_file_write_rejects_fifo_before_temp_creation(
     completed = _run_harbor_write(target, "replacement")
 
     assert completed.returncode != 0
-    assert "target is not a regular file" in completed.stderr
+    assert "secure nofollow write failed" in completed.stderr
     assert _identity(target) == before
     assert stat.S_ISFIFO(target.lstat().st_mode)
     assert _temporary_paths(target) == []
@@ -125,7 +125,7 @@ def test_harbor_whole_file_write_rejects_unix_socket_before_temp_creation(
         completed = _run_harbor_write(target, "replacement")
 
         assert completed.returncode != 0
-        assert "target is not a regular file" in completed.stderr
+        assert "secure nofollow write failed" in completed.stderr
         assert _identity(target) == before
         assert stat.S_ISSOCK(target.lstat().st_mode)
         assert _temporary_paths(target) == []
