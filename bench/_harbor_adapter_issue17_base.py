@@ -1,0 +1,41 @@
+"""Harbor adapter with canonical path authorization at every file boundary."""
+
+from __future__ import annotations
+
+from bench._harbor_adapter_issue4_base import *  # noqa: F401,F403
+from bench import _harbor_adapter_issue4_base as _base
+from bench._canonical_harbor_glob import HarborGlobTool
+from bench._canonical_harbor_grep_hardlink import HarborGrepTool
+from bench._canonical_harbor_hardlink import (
+    HarborFileEditTool,
+    HarborFileReadTool,
+    HarborFileWriteTool,
+)
+
+
+class HLWorkerHarborAgent(_base.HLWorkerHarborAgent):
+    """Build a registry containing the canonical-path protected tool classes."""
+
+    def _build_environment_registry(self, environment, loop):
+        registry = _base.ToolRegistry()
+        kwargs = {
+            "environment": environment,
+            "loop": loop,
+            "timeout_seconds": float(self.tool_timeout_seconds),
+        }
+        todo_store = _base.TodoStore()
+        for tool in [
+            _base.HarborShellTool(**kwargs),
+            HarborFileReadTool(**kwargs),
+            HarborFileEditTool(**kwargs),
+            HarborFileWriteTool(**kwargs),
+            HarborGrepTool(**kwargs),
+            HarborGlobTool(**kwargs),
+            _base.TodoReadTool(store=todo_store),
+            _base.TodoWriteTool(store=todo_store),
+            _base.GoalReadTool(goal_path=self._goal_path()),
+            _base.HarborVerifyTool(**kwargs),
+            _base.DoneTool(),
+        ]:
+            registry.register(tool)
+        return registry
