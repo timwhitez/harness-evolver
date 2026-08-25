@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
@@ -19,6 +21,15 @@ EXPECTED_MODULES = {
     "scripts.regression_check",
     "scripts.compare_trials",
     "scripts.mission_debug",
+}
+EXPECTED_RUNTIME_RESOURCES = {
+    "bench/resources/config/benchmark.yaml",
+    "bench/resources/config/default.yaml",
+    "bench/resources/config/models.yaml",
+    "bench/resources/config/trials.yaml",
+    "bench/resources/hl-worker-core/Cargo.toml",
+    "bench/resources/hl-worker-core/Cargo.lock",
+    "bench/resources/hl-worker-core/src/main.rs",
 }
 
 
@@ -49,14 +60,13 @@ def test_console_entrypoint_modules_are_in_discovered_packages() -> None:
 def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
     tmp_path: Path,
 ) -> None:
-    """Exercise package placement without relying on source-checkout imports.
+    """Exercise package placement and the installed Worker protocol boundary.
 
     The fresh virtual environment intentionally inherits the test interpreter's
     already-installed third-party packages as a dependency fixture. The project
     wheel itself is installed non-editably with ``--no-deps``; assertions below
-    require both project package roots to resolve from that environment's
-    ``purelib`` rather than from the copied checkout or the original repository.
-    This tests the packaging defect without claiming dependency-isolation.
+    require project packages and runtime resources to resolve from that wheel,
+    never the copied checkout or original repository.
     """
 
     checkout = tmp_path / "checkout"
@@ -96,6 +106,7 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
         names = set(archive.namelist())
     for module_name in EXPECTED_MODULES:
         assert f"{module_name.replace('.', '/')}.py" in names
+    assert EXPECTED_RUNTIME_RESOURCES <= names
 
     environment = tmp_path / "venv"
     venv.EnvBuilder(
@@ -117,16 +128,22 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
     )
     assert installed.returncode == 0, installed.stderr
 
+    isolated_environment = {
+        **os.environ,
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": "",
+    }
     probe = (
-        "import pathlib,sysconfig,harness_evolver,scripts; "
+        "import pathlib,sysconfig,bench,harness_evolver,scripts; "
         "site=pathlib.Path(sysconfig.get_paths()['purelib']).resolve(); "
+        "assert pathlib.Path(bench.__file__).resolve().is_relative_to(site); "
         "assert pathlib.Path(harness_evolver.__file__).resolve().is_relative_to(site); "
         "assert pathlib.Path(scripts.__file__).resolve().is_relative_to(site)"
     )
     probed = subprocess.run(
         [str(python), "-c", probe],
         cwd=tmp_path,
-        env={**os.environ, "PYTHONNOUSERSITE": "1", "PYTHONPATH": ""},
+        env=isolated_environment,
         capture_output=True,
         text=True,
         check=False,
@@ -143,7 +160,7 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
         completed = subprocess.run(
             [str(executable), "--help"],
             cwd=tmp_path,
-            env={**os.environ, "PYTHONNOUSERSITE": "1", "PYTHONPATH": ""},
+            env=isolated_environment,
             capture_output=True,
             text=True,
             check=False,
@@ -153,3 +170,70 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
             completed.stdout,
             completed.stderr,
         )
+
+    # Complete the installed Python bridge's real JSONL handshake without
+    # requiring a networked Cargo build. The explicit override is part of the
+    # supported runtime contract; package-resource assertions above independently
+    # prove that the install also contains the manifest/source build resource.
+    final_event = json.dumps(
+        {
+            "type": "final",
+            "result": {
+                "trial_id": "wheel-protocol",
+                "task_id": "wheel-protocol",
+                "status": "failed",
+                "score": 0.0,
+                "verified": False,
+                "tool_calls": [],
+                "trajectory": [],
+                "token_usage": {},
+                "error_log": [],
+                "metadata": {"protocol_handshake": True},
+            },
+        }
+    )
+    worker = tmp_path / ("protocol-worker.py")
+    worker.write_text(
+        f"#!{python}\n"
+        "import sys\n"
+        "assert sys.stdin.readline().strip()\n"
+        f"print({final_event!r}, flush=True)\n",
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
+
+    runtime_cache = tmp_path / "runtime-cache"
+    handshake_probe = (
+        "import pathlib,sysconfig,bench; "
+        "from bench.agent import HLAgent; "
+        "from bench.runtime_resources import bundled_config_path,worker_crate_root; "
+        "site=pathlib.Path(sysconfig.get_paths()['purelib']).resolve(); "
+        "assert pathlib.Path(bench.__file__).resolve().is_relative_to(site); "
+        "crate=worker_crate_root(); "
+        "assert (crate/'Cargo.toml').is_file(); "
+        "assert (crate/'Cargo.lock').is_file(); "
+        "assert (crate/'src/main.rs').is_file(); "
+        "assert bundled_config_path('models.yaml').is_file(); "
+        "assert bundled_config_path('trials.yaml').is_file(); "
+        "result=HLAgent().run('wheel smoke', {'task_id':'wheel-protocol'}); "
+        "assert result.task_id == 'wheel-protocol'; "
+        "assert result.metadata.get('protocol_handshake') is True; "
+        "assert result.metadata.get('rust_worker_core_error') is not True"
+    )
+    handshaken = subprocess.run(
+        [str(python), "-c", handshake_probe],
+        cwd=tmp_path,
+        env={
+            **isolated_environment,
+            "HL_RUNTIME_CACHE_DIR": str(runtime_cache),
+            "HL_WORKER_RUST_BIN": str(worker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert handshaken.returncode == 0, (
+        handshaken.stdout,
+        handshaken.stderr,
+    )
