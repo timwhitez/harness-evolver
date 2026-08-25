@@ -103,6 +103,9 @@ def test_thread_start_failure_terminates_worker_and_closes_all_pipe_fds(
         terminated.append(candidate)
         candidate.returncode = -9
 
+    def worker_command(self: HLAgent) -> list[str]:
+        return ["fake-worker"]
+
     monkeypatch.setattr(agent_module.os, "pipe", tracked_pipe)
     monkeypatch.setattr(agent_module.os, "dup", tracked_dup)
     monkeypatch.setattr(agent_module.subprocess, "Popen", lambda *args, **kwargs: process)
@@ -111,6 +114,7 @@ def test_thread_start_failure_terminates_worker_and_closes_all_pipe_fds(
         "start",
         lambda self: (_ for _ in ()).throw(RuntimeError("injected thread start failure")),
     )
+    agent._rust_worker_command = MethodType(worker_command, agent)  # type: ignore[method-assign]
     agent._terminate_process = MethodType(terminate, agent)  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="injected thread start failure"):
