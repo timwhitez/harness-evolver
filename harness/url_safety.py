@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from ipaddress import AddressValueError, IPv6Address
+import re
 from urllib.parse import SplitResult, urlsplit
+
+
+_DNS_LABEL = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
+    flags=re.ASCII,
+)
 
 
 @dataclass(frozen=True)
@@ -30,31 +38,49 @@ def _contains_unsafe_endpoint_text(value: str) -> bool:
 
 
 def _authority_has_empty_port(parsed: SplitResult) -> bool:
-    """Detect an explicit colon for which ``urlsplit`` reports no port.
-
-    ``SplitResult.port`` correctly raises for non-numeric and out-of-range ports,
-    but an authority ending in ``:`` (including ``[::1]:``) is normalized to
-    ``port=None``. Treat that spelling as malformed instead of silently making it
-    indistinguishable from an endpoint that never supplied a port.
-    """
+    """Detect an explicit colon for which ``urlsplit`` reports no port."""
 
     authority = parsed.netloc.rsplit("@", 1)[-1]
     return authority.endswith(":")
 
 
+def _normalise_hostname(hostname: str) -> str | None:
+    """Return a log-safe DNS/IDNA or IPv6 hostname, otherwise fail closed."""
+
+    raw = hostname.lower()
+    if ":" in raw:
+        try:
+            return IPv6Address(raw).compressed.lower()
+        except AddressValueError:
+            return None
+
+    if raw.startswith(".") or ".." in raw:
+        return None
+    raw = raw.rstrip(".")
+    if not raw:
+        return None
+
+    try:
+        ascii_hostname = raw.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    if len(ascii_hostname) > 253:
+        return None
+
+    labels = ascii_hostname.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or _DNS_LABEL.fullmatch(label) is None
+        for label in labels
+    ):
+        return None
+    return ascii_hostname
+
+
 def safe_endpoint(value: str | None) -> SafeEndpoint:
-    """Parse an endpoint without retaining userinfo, path, query, or fragment.
+    """Parse an endpoint without retaining userinfo, path, query, or fragment."""
 
-    The parser is intentionally fail-closed for literal whitespace, control
-    characters, backslashes, empty/malformed ports, and unsafe host delimiters.
-    ``urlsplit`` otherwise normalizes some of those inputs into plausible
-    hostnames, which would make a malformed endpoint look valid in persisted
-    metadata.
-    """
-
-    # Inspect the exact caller-provided text before any trimming. Stripping first
-    # would silently accept leading/trailing whitespace even though this parser's
-    # contract is to fail closed on every literal whitespace/control character.
     text = str(value or "")
     if not text:
         return _invalid_endpoint()
@@ -77,13 +103,8 @@ def safe_endpoint(value: str | None) -> SafeEndpoint:
     ):
         return _invalid_endpoint()
 
-    raw_hostname = hostname.lower()
-    # A single trailing dot is a valid absolute DNS spelling and is removed from
-    # log metadata. Leading roots and any doubled empty label remain malformed.
-    if raw_hostname.startswith(".") or ".." in raw_hostname:
-        return _invalid_endpoint()
-    normalized_hostname = raw_hostname.rstrip(".")
-    if not normalized_hostname:
+    normalized_hostname = _normalise_hostname(hostname)
+    if normalized_hostname is None:
         return _invalid_endpoint()
 
     return SafeEndpoint(
