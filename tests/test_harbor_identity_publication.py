@@ -17,8 +17,8 @@ from harness.tools.base import ToolResult
 
 
 pytestmark = pytest.mark.skipif(
-    os.name != "posix" or not hasattr(os, "O_NOFOLLOW"),
-    reason="descriptor-relative Harbor identity checks are POSIX-only",
+    not sys.platform.startswith("linux") or not hasattr(os, "O_NOFOLLOW"),
+    reason="race-safe Harbor conditional publication requires Linux renameat2",
 )
 
 
@@ -41,17 +41,11 @@ def _run_script(
     )
 
 
-def test_public_append_forwards_snapshot_identity_and_digest() -> None:
+def _capturing_append_tool(
+    snapshot: identity_guard._Snapshot,
+    captured: dict[str, object],
+) -> HarborFileWriteTool:
     tool = object.__new__(HarborFileWriteTool)
-    captured: dict[str, object] = {}
-    snapshot = identity_guard._Snapshot(
-        present=True,
-        text="existing\n",
-        dev=12,
-        ino=34,
-        sha256=hashlib.sha256(b"existing\n").hexdigest(),
-    )
-
     tool._guard_environment_path = MethodType(  # type: ignore[method-assign]
         lambda self, path, *, operation, must_exist: (path, None),
         tool,
@@ -76,6 +70,19 @@ def test_public_append_forwards_snapshot_identity_and_digest() -> None:
         )
 
     tool._run_secure_python = MethodType(capture, tool)  # type: ignore[method-assign]
+    return tool
+
+
+def test_public_append_forwards_existing_snapshot_identity_and_digest() -> None:
+    captured: dict[str, object] = {}
+    snapshot = identity_guard._Snapshot(
+        present=True,
+        text="existing\n",
+        dev=12,
+        ino=34,
+        sha256=hashlib.sha256(b"existing\n").hexdigest(),
+    )
+    tool = _capturing_append_tool(snapshot, captured)
 
     result = tool.execute("/workspace/target.txt", "tail\n", append=True)
 
@@ -90,6 +97,29 @@ def test_public_append_forwards_snapshot_identity_and_digest() -> None:
     assert result.metadata["target_identity_verified"] is True
     assert result.metadata["directory_fsync"] is True
     assert result.metadata["atomic_append"] is True
+
+
+def test_public_append_keeps_missing_snapshot_expectation_disjoint() -> None:
+    captured: dict[str, object] = {}
+    snapshot = identity_guard._Snapshot(
+        present=False,
+        text="",
+        dev=None,
+        ino=None,
+        sha256=hashlib.sha256(b"").hexdigest(),
+    )
+    tool = _capturing_append_tool(snapshot, captured)
+
+    result = tool.execute("/workspace/target.txt", "tail\n", append=True)
+
+    assert result.success is True
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["HL_EXPECTED_PRESENT"] == "0"
+    assert "HL_EXPECTED_DEV" not in environment
+    assert "HL_EXPECTED_INO" not in environment
+    assert "HL_EXPECTED_SHA256" not in environment
+    assert base64.b64decode(environment["HL_FILE_CONTENT"]) == b"tail\n"
 
 
 def test_append_script_rejects_replaced_inode(tmp_path: Path) -> None:
@@ -131,13 +161,31 @@ def test_append_script_rejects_target_appearing_after_missing_snapshot(
             "HL_FILE_PATH": str(target),
             "HL_FILE_CONTENT": base64.b64encode(b"tail\n").decode("ascii"),
             "HL_EXPECTED_PRESENT": "0",
-            "HL_EXPECTED_SHA256": hashlib.sha256(b"").hexdigest(),
         },
     )
 
     assert completed.returncode != 0
     assert target.read_text(encoding="utf-8") == "concurrent\n"
     assert list(tmp_path.glob(".target.txt.tmp-*")) == []
+
+
+def test_append_script_creates_target_when_missing_snapshot_remains_missing(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.txt"
+
+    completed = _run_script(
+        identity_guard._v3._SECURE_ATOMIC_WRITE,
+        env={
+            "HL_FILE_PATH": str(target),
+            "HL_FILE_CONTENT": base64.b64encode(b"tail\n").decode("ascii"),
+            "HL_EXPECTED_PRESENT": "0",
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_bytes() == b"tail\n"
+    assert "directory_synced=1" in completed.stdout
 
 
 def test_harbor_directory_fsync_failure_is_success_with_warning(
