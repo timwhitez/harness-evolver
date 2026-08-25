@@ -1,14 +1,17 @@
-"""Patch reviewer with complete HEAD-to-worktree delta and rollback support.
+"""Patch reviewer with complete and isolated Git delta rollback support.
 
 The NUL-delimited status parser and deterministic policy gates are retained in
 :mod:`meta._reviewer_issue15_base`. This facade makes staged changes, renames,
-copies, and untracked binary files part of the same reversible delta.
+copies, and untracked binary files part of one reversible delta while preserving
+unrelated index state.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 from meta import _reviewer_issue15_base as _base
 
@@ -18,7 +21,7 @@ for _name, _value in vars(_base).items():
 
 
 class PatchReviewer(_base.PatchReviewer):
-    """Review and roll back the complete index+worktree delta from HEAD."""
+    """Review and roll back the complete index+worktree delta."""
 
     def diff_text(self, paths: list[str] | None = None) -> str:
         if paths is not None and not paths:
@@ -71,17 +74,16 @@ class PatchReviewer(_base.PatchReviewer):
                 capture_output=True,
                 text=True,
             )
-            # `git diff --no-index` returns 1 when it successfully found a diff.
+            # `git diff --no-index` returns 1 after successfully producing a diff.
             if completed.returncode in {0, 1} and completed.stdout:
                 diffs.append(completed.stdout)
         return diffs
 
     def save_reverse_patch(self, path: str | Path) -> Path:
-        """Persist the forward HEAD delta consumed by :meth:`rollback`.
+        """Persist the canonical forward delta used by :meth:`rollback`.
 
-        The historical method name is retained for API compatibility. Keeping
-        the canonical forward patch lets `git apply -R` restore both staged and
-        unstaged rename endpoints as well as untracked binary files.
+        The historical method name is retained. `rollback()` auto-detects old
+        reverse patches as well as the current forward representation.
         """
 
         patch_path = Path(path)
@@ -94,17 +96,30 @@ class PatchReviewer(_base.PatchReviewer):
         if not patch_text.strip():
             return False
 
-        checked = subprocess.run(
-            ["git", "apply", "--check", "--binary", "-R"],
-            input=patch_text,
-            cwd=self.repo_root,
-            capture_output=True,
-            text=True,
-        )
-        if checked.returncode != 0:
+        # Current patches describe baseline -> dirty state, so rollback applies
+        # them in reverse. Historical callers may supply an already-reversed
+        # patch; detect that direction without mutating the repository.
+        if self._patch_applies(patch_text, reverse=True):
+            reverse_worktree = True
+        elif self._patch_applies(patch_text, reverse=False):
+            reverse_worktree = False
+        else:
             return False
+
+        # Prove whether the forward form is exactly HEAD-relative in a private
+        # temporary index. If so, derive both rename endpoints with --no-renames
+        # and later reset only those paths in the real index. A dirty-baseline
+        # patch that is not HEAD-relative leaves the existing index untouched.
+        head_paths = self._head_relative_patch_paths(
+            patch_text,
+            patch_is_forward=reverse_worktree,
+        )
+
+        command = ["git", "apply", "--binary", "--whitespace=nowarn"]
+        if reverse_worktree:
+            command.append("-R")
         applied = subprocess.run(
-            ["git", "apply", "--binary", "--whitespace=nowarn", "-R"],
+            command,
             input=patch_text,
             cwd=self.repo_root,
             capture_output=True,
@@ -113,12 +128,89 @@ class PatchReviewer(_base.PatchReviewer):
         if applied.returncode != 0:
             return False
 
-        # `git apply` restores bytes in the worktree. Reset the index separately
-        # so a staged `git mv` or copy cannot remain hidden after rollback.
+        if not head_paths:
+            return True
+
+        # Reset only patch-derived paths. Unrelated staged baseline work remains
+        # byte-for-byte in the real index, unlike a repository-wide mixed reset.
         reset = subprocess.run(
-            ["git", "reset", "--mixed", "HEAD"],
+            ["git", "reset", "--mixed", "HEAD", "--", *head_paths],
             cwd=self.repo_root,
             capture_output=True,
             text=True,
         )
         return reset.returncode == 0
+
+    def _patch_applies(self, patch_text: str, *, reverse: bool) -> bool:
+        command = ["git", "apply", "--check", "--binary"]
+        if reverse:
+            command.append("-R")
+        completed = subprocess.run(
+            command,
+            input=patch_text,
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+        )
+        return completed.returncode == 0
+
+    def _head_relative_patch_paths(
+        self,
+        patch_text: str,
+        *,
+        patch_is_forward: bool,
+    ) -> list[str]:
+        """Return exact HEAD-relative endpoints without touching the real index."""
+
+        with tempfile.TemporaryDirectory(prefix="hl-review-index-") as directory:
+            index_path = str(Path(directory) / "index")
+            env = {**os.environ, "GIT_INDEX_FILE": index_path}
+            read_tree = subprocess.run(
+                ["git", "read-tree", "HEAD"],
+                cwd=self.repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if read_tree.returncode != 0:
+                return []
+
+            command = ["git", "apply", "--cached", "--binary"]
+            # If the supplied patch is historical reverse form, reverse it to
+            # reconstruct the forward HEAD -> dirty state in the temp index.
+            if not patch_is_forward:
+                command.append("-R")
+            applied = subprocess.run(
+                command,
+                input=patch_text,
+                cwd=self.repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if applied.returncode != 0:
+                return []
+
+            names = subprocess.run(
+                [
+                    "git",
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    "HEAD",
+                    "--",
+                ],
+                cwd=self.repo_root,
+                env=env,
+                capture_output=True,
+                text=False,
+            )
+            if names.returncode != 0:
+                return []
+            return [
+                os.fsdecode(record)
+                for record in names.stdout.split(b"\0")
+                if record
+            ]
