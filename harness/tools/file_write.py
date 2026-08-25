@@ -56,7 +56,7 @@ class FileWriteTool(_BaseFileWriteTool):
             )
 
         try:
-            atomic_write_text_nofollow(decision.resolved, content)
+            directory_synced = atomic_write_text_nofollow(decision.resolved, content)
         except (OSError, SafePathError) as exc:
             return ToolResult(
                 success=False,
@@ -66,16 +66,26 @@ class FileWriteTool(_BaseFileWriteTool):
                     "canonical_path_guard",
                     canonical_path_checked=True,
                     nofollow_io=True,
+                    atomic_replace=False,
                 ),
+            )
+
+        output = f"Wrote {len(content)} chars to {file_path}"
+        if not directory_synced:
+            output += (
+                "\nWarning: content was atomically published, but the parent "
+                "directory could not be fsynced."
             )
         return ToolResult(
             success=True,
-            output=f"Wrote {len(content)} chars to {file_path}",
+            output=output,
             metadata={
                 "chars_written": len(content),
                 "lines": content.count("\n") + 1,
                 "canonical_path_checked": True,
                 "nofollow_io": True,
                 "atomic_replace": True,
+                "directory_fsync": directory_synced,
+                "durability_warning": not directory_synced,
             },
         )
