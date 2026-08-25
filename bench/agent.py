@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import io
 import json
+import math
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -47,17 +50,43 @@ class _BoundedStderrTail:
 
 
 def _validated_stderr_tail_bytes(value: object) -> int:
-    """Validate capture bounds before creating pipes or launching the Worker."""
+    """Validate an exact positive integer before allocating process resources."""
 
     if isinstance(value, bool):
         raise ValueError("rust_stderr_tail_bytes must be an integer >= 1")
-    try:
-        limit = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("rust_stderr_tail_bytes must be an integer >= 1") from exc
+
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"\+?\d+", text) is None:
+            raise ValueError("rust_stderr_tail_bytes must be an integer >= 1")
+        limit = int(text)
+    else:
+        if isinstance(value, float) and (
+            not math.isfinite(value) or not value.is_integer()
+        ):
+            raise ValueError("rust_stderr_tail_bytes must be an integer >= 1")
+        try:
+            limit = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("rust_stderr_tail_bytes must be an integer >= 1") from exc
+        try:
+            if value != limit:
+                raise ValueError("rust_stderr_tail_bytes must be an integer >= 1")
+        except TypeError as exc:
+            raise ValueError("rust_stderr_tail_bytes must be an integer >= 1") from exc
+
     if limit < 1:
         raise ValueError("rust_stderr_tail_bytes must be an integer >= 1")
     return limit
+
+
+def _close_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def _drain_stderr_fd(
@@ -121,50 +150,81 @@ class HLAgent(_base.HLAgent):
         # externally supplied constructor value must never leave a live Worker or
         # leaked pipe outside the normal teardown region.
         stderr_tail_limit = _validated_stderr_tail_bytes(self.rust_stderr_tail_bytes)
-
-        read_fd, worker_stderr_fd = os.pipe()
-        wake_stderr_fd = os.dup(worker_stderr_fd)
-        process: subprocess.Popen[str] | None = None
-
-        try:
-            process = subprocess.Popen(
-                self._rust_worker_command(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=worker_stderr_fd,
-                text=True,
-                bufsize=1,
-                start_new_session=(os.name != "nt"),
-            )
-        except Exception:
-            for descriptor in (read_fd, wake_stderr_fd):
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            raise
-        finally:
-            try:
-                os.close(worker_stderr_fd)
-            except OSError:
-                pass
-
-        assert process.stdin is not None
-        assert process.stdout is not None
-
         capture = _BoundedStderrTail(stderr_tail_limit)
         stop_marker = b"\x00HL-STDERR-STOP:" + secrets.token_bytes(32) + b"\x00"
-        stderr_thread = threading.Thread(
-            target=_drain_stderr_fd,
-            args=(read_fd, capture, stop_marker),
-            name="harness-evolver-rust-stderr-drain",
-            daemon=True,
-        )
-        stderr_thread.start()
+
+        read_fd: int | None = None
+        worker_stderr_fd: int | None = None
+        wake_stderr_fd: int | None = None
+        process: subprocess.Popen[str] | None = None
+        stderr_thread: threading.Thread | None = None
+
+        try:
+            read_fd, worker_stderr_fd = os.pipe()
+            try:
+                wake_stderr_fd = os.dup(worker_stderr_fd)
+            except Exception:
+                _close_fd(read_fd)
+                _close_fd(worker_stderr_fd)
+                read_fd = None
+                worker_stderr_fd = None
+                raise
+
+            stderr_thread = threading.Thread(
+                target=_drain_stderr_fd,
+                args=(read_fd, capture, stop_marker),
+                name="harness-evolver-rust-stderr-drain",
+                daemon=True,
+            )
+
+            try:
+                process = subprocess.Popen(
+                    self._rust_worker_command(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=worker_stderr_fd,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=(os.name != "nt"),
+                )
+            except Exception:
+                _close_fd(read_fd)
+                _close_fd(wake_stderr_fd)
+                read_fd = None
+                wake_stderr_fd = None
+                raise
+            finally:
+                _close_fd(worker_stderr_fd)
+                worker_stderr_fd = None
+
+            assert process.stdin is not None
+            assert process.stdout is not None
+
+            try:
+                stderr_thread.start()
+            except Exception:
+                if process.poll() is None:
+                    self._terminate_process(process)
+                _close_fd(wake_stderr_fd)
+                _close_fd(read_fd)
+                wake_stderr_fd = None
+                read_fd = None
+                raise
+        except Exception:
+            _close_fd(worker_stderr_fd)
+            _close_fd(wake_stderr_fd)
+            _close_fd(read_fd)
+            raise
+
+        assert process is not None
+        assert stderr_thread is not None
+        assert read_fd is not None
+        assert wake_stderr_fd is not None
+
         stderr_finished = False
 
         def finish_stderr() -> str:
-            nonlocal stderr_finished
+            nonlocal stderr_finished, read_fd, wake_stderr_fd
             if stderr_finished:
                 return capture.text()
             stderr_finished = True
@@ -174,19 +234,15 @@ class HLAgent(_base.HLAgent):
                 # EOF or an already-failed reader is also a completed drain.
                 pass
             finally:
-                try:
-                    os.close(wake_stderr_fd)
-                except OSError:
-                    pass
+                _close_fd(wake_stderr_fd)
+                wake_stderr_fd = None
 
             # The marker wakes a reader even while a descendant still owns fd 2.
             # A timeout is defensive only; the thread is daemonized and the raw
             # descriptor close below cannot deadlock on a buffered-stream lock.
             stderr_thread.join(timeout=2.0)
-            try:
-                os.close(read_fd)
-            except OSError:
-                pass
+            _close_fd(read_fd)
+            read_fd = None
             if stderr_thread.is_alive():
                 stderr_thread.join(timeout=0.1)
             return capture.text()
