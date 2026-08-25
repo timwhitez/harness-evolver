@@ -32,10 +32,23 @@ def _wait_for_pid_exit(pid: int, timeout: float = 3.0) -> None:
     assert not _pid_exists(pid)
 
 
-def test_only_explicit_supervisor_cleanup_status_is_accepted() -> None:
+def test_only_preliminary_supervisor_timeout_status_is_accepted() -> None:
     assert _supervisor_exit_confirms_cleanup(124) is True
     for returncode in (None, 0, 1, 125, 126, 137, 143, 255, -9, -15):
         assert _supervisor_exit_confirms_cleanup(returncode) is False
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="cleanup proof is attached to the Linux supervisor",
+)
+def test_managed_command_normal_exit_124_is_not_cleanup_attestation() -> None:
+    result = run_bounded_shell("exit 124", timeout_seconds=5.0)
+
+    assert result.timed_out is False
+    assert result.cancelled is False
+    assert result.returncode == 124
+    assert result.managed_process_group_terminated is False
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descendant cancellation assertion")
