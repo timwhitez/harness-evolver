@@ -46,6 +46,20 @@ class _BoundedStderrTail:
         return text
 
 
+def _validated_stderr_tail_bytes(value: object) -> int:
+    """Validate capture bounds before creating pipes or launching the Worker."""
+
+    if isinstance(value, bool):
+        raise ValueError("rust_stderr_tail_bytes must be an integer >= 1")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("rust_stderr_tail_bytes must be an integer >= 1") from exc
+    if limit < 1:
+        raise ValueError("rust_stderr_tail_bytes must be an integer >= 1")
+    return limit
+
+
 def _drain_stderr_fd(
     read_fd: int,
     capture: _BoundedStderrTail,
@@ -103,6 +117,11 @@ class HLAgent(_base.HLAgent):
         task_instruction: str,
         task_context: dict[str, Any],
     ) -> _base.TrialResult:
+        # Validate before allocating descriptors or starting a child. A malformed
+        # externally supplied constructor value must never leave a live Worker or
+        # leaked pipe outside the normal teardown region.
+        stderr_tail_limit = _validated_stderr_tail_bytes(self.rust_stderr_tail_bytes)
+
         read_fd, worker_stderr_fd = os.pipe()
         wake_stderr_fd = os.dup(worker_stderr_fd)
         process: subprocess.Popen[str] | None = None
@@ -133,7 +152,7 @@ class HLAgent(_base.HLAgent):
         assert process.stdin is not None
         assert process.stdout is not None
 
-        capture = _BoundedStderrTail(max(1, int(self.rust_stderr_tail_bytes)))
+        capture = _BoundedStderrTail(stderr_tail_limit)
         stop_marker = b"\x00HL-STDERR-STOP:" + secrets.token_bytes(32) + b"\x00"
         stderr_thread = threading.Thread(
             target=_drain_stderr_fd,
