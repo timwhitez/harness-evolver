@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from harness.tools import safe_path_io as _safe_path_io
+import harness.tools.safe_path_io as _safe_path_io
 from harness.tools.bounded_path_io import open_binary_nofollow
 
 # The reviewed streaming implementation historically imported the reader from
@@ -11,7 +11,7 @@ from harness.tools.bounded_path_io import open_binary_nofollow
 # conditional-publication behavior is modified.
 _safe_path_io.open_binary_nofollow = open_binary_nofollow
 
-from harness.tools import _streaming_file_read_impl as _impl  # noqa: E402
+import harness.tools._streaming_file_read_impl as _impl  # noqa: E402
 
 FileReadTool = _impl.FileReadTool
 
