@@ -130,9 +130,10 @@ def atomic_write_text_nofollow(
     multiply linked.
 
     The temporary file uses normal ``0666 & ~umask`` creation semantics for a
-    new target and inherits the existing target's ordinary permission bits for
-    replacement. Every failure before ``os.replace`` removes the temporary file
-    and leaves the previous target bytes unchanged.
+    new target and inherits only the existing target's ordinary ``0o777``
+    permission bits for replacement. Setuid, setgid, and sticky bits are never
+    recreated on newly written content. Every failure before ``os.replace``
+    removes the temporary file and leaves the previous target bytes unchanged.
     """
 
     payload = content.encode("utf-8")
@@ -151,9 +152,6 @@ def atomic_write_text_nofollow(
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
         descriptor = -1
         try:
-            # Match ordinary file-creation semantics from PR #37. ``os.open``
-            # applies the process umask to 0666; existing targets are fchmod'd
-            # to their retained ordinary mode before publication.
             descriptor = os.open(
                 temporary_name,
                 flags,
@@ -164,14 +162,14 @@ def atomic_write_text_nofollow(
                 stream.write(payload)
                 stream.flush()
                 if existing_mode is not None:
-                    os.fchmod(descriptor, stat.S_IMODE(existing_mode))
+                    os.fchmod(
+                        descriptor,
+                        stat.S_IMODE(existing_mode) & 0o777,
+                    )
                 os.fsync(descriptor)
             os.close(descriptor)
             descriptor = -1
 
-            # Recheck the final entry immediately before publication so a
-            # concurrent symlink swap cannot turn replacement into an unsafe
-            # follow operation. ``os.replace`` itself remains descriptor-bound.
             try:
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if stat.S_ISLNK(current.st_mode):
