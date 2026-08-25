@@ -1,25 +1,20 @@
-"""FileEdit tool — surgical find-and-replace.
-
-Performs exact string replacements in files.  This is much safer
-than sed/awk for programmatic editing because:
-  - It verifies the old_string exists (and is unique by default)
-  - It can replace all occurrences
-  - It preserves exact indentation
-"""
+"""Canonical-path protected exact-text editor."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
+import hashlib
 from typing import Any
 
-from harness.tools.base import ToolDef, ToolResult, ToolSchema, policy_guard_metadata
-from harness.tools.host_memory_guard import (
-    host_memory_access_reason,
-    host_memory_block_metadata,
-    host_memory_blocked_error,
+from harness.tools._file_edit_issue4_base import FileEditTool as _BaseFileEditTool
+from harness.tools.base import ToolResult, policy_guard_metadata
+from harness.tools.canonical_path_guard import guarded_path_failure, resolve_guarded_path
+from harness.tools.safe_path_io import (
+    SafePathError,
+    atomic_write_text_nofollow,
+    file_identity,
+    read_text_nofollow,
 )
-from harness.tools.leaderboard_guard import prohibited_path_reason
 from harness.tools.shell import (
     deliverable_size_cap_write_reason,
     staged_dependency_script_reason,
@@ -27,44 +22,8 @@ from harness.tools.shell import (
 
 
 @dataclass
-class FileEditTool(ToolDef):
-    name: str = "edit"
-    version: str = "0.1.0"
-    dependencies: list[str] = field(default_factory=list)
-    description: str = (
-        "Perform exact string replacements in a file. "
-        "The edit will fail if old_string is not unique in the file "
-        "(use replace_all=True to replace all occurrences). "
-        "Preserves exact indentation. Much safer than sed/awk."
-    )
-
-    def get_schema(self) -> ToolSchema:
-        return ToolSchema(
-            description=self.description,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute path to the file to edit.",
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "The exact text to replace.",
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "The text to replace it with.",
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "Replace all occurrences (default: false).",
-                        "default": False,
-                    },
-                },
-                "required": ["file_path", "old_string", "new_string"],
-            },
-        )
+class FileEditTool(_BaseFileEditTool):
+    """Edit one unchanged authorized inode and publish the result atomically."""
 
     def execute(
         self,
@@ -74,72 +33,72 @@ class FileEditTool(ToolDef):
         replace_all: bool = False,
         **kwargs: Any,
     ) -> ToolResult:
-        path = Path(file_path)
-        prohibited_reason = prohibited_path_reason(file_path, operation="edit")
-        if prohibited_reason:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Leaderboard integrity guard blocked edit: {prohibited_reason}.",
-                metadata=policy_guard_metadata("leaderboard_integrity_guard"),
-            )
-        if host_memory_access_reason(file_path):
-            return ToolResult(
-                success=False,
-                output="",
-                error=host_memory_blocked_error(file_path),
-                metadata=host_memory_block_metadata(),
-            )
-
-        if not path.exists():
-            return ToolResult(success=False, output="", error=f"File not found: {file_path}")
-
+        decision = resolve_guarded_path(
+            file_path,
+            operation="edit",
+            must_exist=True,
+        )
+        if not decision.allowed:
+            return guarded_path_failure("edit", decision)
         if old_string == new_string:
             return ToolResult(
-                success=False, output="", error="old_string and new_string are identical"
+                success=False,
+                output="",
+                error="old_string and new_string are identical",
             )
 
         try:
-            content = path.read_text()
-        except Exception as e:
-            return ToolResult(success=False, output="", error=f"Cannot read file: {e}")
+            content, metadata = read_text_nofollow(decision.resolved, errors="strict")
+        except (OSError, UnicodeError, SafePathError) as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Cannot read authorized path safely: {exc}",
+                metadata=policy_guard_metadata(
+                    "canonical_path_guard",
+                    canonical_path_checked=True,
+                    nofollow_io=True,
+                ),
+            )
 
         count = content.count(old_string)
         if count == 0:
-            return ToolResult(
-                success=False, output="", error="old_string not found in file"
-            )
+            return ToolResult(success=False, output="", error="old_string not found in file")
         if count > 1 and not replace_all:
             return ToolResult(
                 success=False,
                 output="",
                 error=(
                     f"old_string appears {count} times in the file. "
-                    "Use replace_all=True to replace all occurrences, "
-                    "or provide more surrounding context to make it unique."
+                    "Use replace_all=True to replace all occurrences, or provide "
+                    "more surrounding context to make it unique."
                 ),
             )
 
-        new_content = content.replace(old_string, new_string)
-        staged_dependency_reason = staged_dependency_script_reason(file_path, new_content)
-        if staged_dependency_reason:
+        new_content = content.replace(
+            old_string,
+            new_string,
+            -1 if replace_all else 1,
+        )
+        staged_reason = staged_dependency_script_reason(decision.resolved, new_content)
+        if staged_reason:
             return ToolResult(
                 success=False,
                 output="",
                 error=(
                     "Worker file policy blocked edit: "
-                    f"{staged_dependency_reason}. Keep dependency recovery visible in "
-                    "one bounded foreground shell command, or pivot to an installed, "
-                    "cached, or dependency-free path."
+                    f"{staged_reason}. Keep dependency recovery visible in one bounded "
+                    "foreground shell command, or pivot to an installed, cached, or "
+                    "dependency-free path."
                 ),
                 metadata=policy_guard_metadata("staged_dependency_script_guard"),
             )
-        size_cap_reason = deliverable_size_cap_write_reason(file_path, new_content)
-        if size_cap_reason:
+        size_reason = deliverable_size_cap_write_reason(decision.resolved, new_content)
+        if size_reason:
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Worker file policy blocked edit: {size_cap_reason}",
+                error=f"Worker file policy blocked edit: {size_reason}",
                 metadata=policy_guard_metadata(
                     "deliverable_size_cap_write_guard",
                     path=file_path,
@@ -147,10 +106,46 @@ class FileEditTool(ToolDef):
                     limit_bytes=5000,
                 ),
             )
-        path.write_text(new_content)
 
+        try:
+            directory_synced = atomic_write_text_nofollow(
+                decision.resolved,
+                new_content,
+                mode=metadata.st_mode,
+                expected_identity=file_identity(metadata),
+                expected_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            )
+        except (OSError, SafePathError) as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Cannot publish authorized edit safely: {exc}",
+                metadata=policy_guard_metadata(
+                    "canonical_path_guard",
+                    canonical_path_checked=True,
+                    nofollow_io=True,
+                    atomic_replace=False,
+                    target_identity_verified=True,
+                ),
+            )
+
+        replaced = count if replace_all else 1
+        output = f"Replaced {replaced} occurrence(s) in {file_path}"
+        if not directory_synced:
+            output += (
+                "\nWarning: content was atomically published, but the parent "
+                "directory could not be fsynced."
+            )
         return ToolResult(
             success=True,
-            output=f"Replaced {count} occurrence(s) in {file_path}",
-            metadata={"occurrences_replaced": count},
+            output=output,
+            metadata={
+                "occurrences_replaced": replaced,
+                "canonical_path_checked": True,
+                "nofollow_io": True,
+                "target_identity_verified": True,
+                "atomic_replace": True,
+                "directory_fsync": directory_synced,
+                "durability_warning": not directory_synced,
+            },
         )
