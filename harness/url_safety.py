@@ -29,13 +29,27 @@ def _contains_unsafe_endpoint_text(value: str) -> bool:
     )
 
 
+def _authority_has_empty_port(parsed: SplitResult) -> bool:
+    """Detect an explicit colon for which ``urlsplit`` reports no port.
+
+    ``SplitResult.port`` correctly raises for non-numeric and out-of-range ports,
+    but an authority ending in ``:`` (including ``[::1]:``) is normalized to
+    ``port=None``. Treat that spelling as malformed instead of silently making it
+    indistinguishable from an endpoint that never supplied a port.
+    """
+
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    return authority.endswith(":")
+
+
 def safe_endpoint(value: str | None) -> SafeEndpoint:
     """Parse an endpoint without retaining userinfo, path, query, or fragment.
 
     The parser is intentionally fail-closed for literal whitespace, control
-    characters, backslashes, and unsafe host delimiters. ``urlsplit`` otherwise
-    normalizes some of those inputs into plausible hostnames, which would make a
-    malformed endpoint look valid in persisted metadata.
+    characters, backslashes, empty/malformed ports, and unsafe host delimiters.
+    ``urlsplit`` otherwise normalizes some of those inputs into plausible
+    hostnames, which would make a malformed endpoint look valid in persisted
+    metadata.
     """
 
     # Inspect the exact caller-provided text before any trimming. Stripping first
@@ -55,7 +69,7 @@ def safe_endpoint(value: str | None) -> SafeEndpoint:
     except (TypeError, ValueError):
         return _invalid_endpoint()
 
-    if not hostname:
+    if not hostname or _authority_has_empty_port(parsed):
         return _invalid_endpoint()
     if (
         _contains_unsafe_endpoint_text(hostname)
@@ -63,8 +77,13 @@ def safe_endpoint(value: str | None) -> SafeEndpoint:
     ):
         return _invalid_endpoint()
 
-    normalized_hostname = hostname.lower().rstrip(".")
-    if not normalized_hostname or ".." in normalized_hostname:
+    raw_hostname = hostname.lower()
+    # A single trailing dot is a valid absolute DNS spelling and is removed from
+    # log metadata. Leading roots and any doubled empty label remain malformed.
+    if raw_hostname.startswith(".") or ".." in raw_hostname:
+        return _invalid_endpoint()
+    normalized_hostname = raw_hostname.rstrip(".")
+    if not normalized_hostname:
         return _invalid_endpoint()
 
     return SafeEndpoint(
