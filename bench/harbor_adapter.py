@@ -12,7 +12,7 @@ from bench._harbor_adapter_issue13_audit import (
     HarborGrepTool,
     _HARBOR_GREP_COUNTING_PYTHON,
 )
-from bench._harbor_glob_fallback import (
+from bench._harbor_glob_literal_root import (
     HarborGlobTool,
     _GLOB_FALLBACK_SCRIPT,
 )
