@@ -248,7 +248,8 @@ _v2._SECURE_EDIT = _v2._SECURE_EDIT.replace(
 
 _WRITE_CALL = "        write_atomic(parent, name, payload)\n"
 _WRITE_CALL_GUARDED = '''        expected_identity = None
-        if os.environ.get("HL_EXPECTED_PRESENT") == "1":
+        expected_present = os.environ.get("HL_EXPECTED_PRESENT")
+        if expected_present == "1":
             expected_identity = (
                 int(os.environ["HL_EXPECTED_DEV"]),
                 int(os.environ["HL_EXPECTED_INO"]),
@@ -258,8 +259,12 @@ _WRITE_CALL_GUARDED = '''        expected_identity = None
             name,
             payload,
             expected_identity=expected_identity,
-            expected_sha256=os.environ.get("HL_EXPECTED_SHA256"),
-            expected_missing=os.environ.get("HL_EXPECTED_PRESENT") == "0",
+            expected_sha256=(
+                os.environ.get("HL_EXPECTED_SHA256")
+                if expected_present == "1"
+                else None
+            ),
+            expected_missing=expected_present == "0",
         )
 '''
 if _WRITE_CALL not in _v3._SECURE_ATOMIC_WRITE:
@@ -458,8 +463,8 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
         }
         if snapshot is not None:
             environment["HL_EXPECTED_PRESENT"] = "1" if snapshot.present else "0"
-            environment["HL_EXPECTED_SHA256"] = snapshot.sha256
             if snapshot.present:
+                environment["HL_EXPECTED_SHA256"] = snapshot.sha256
                 assert snapshot.dev is not None and snapshot.ino is not None
                 environment["HL_EXPECTED_DEV"] = str(snapshot.dev)
                 environment["HL_EXPECTED_INO"] = str(snapshot.ino)
