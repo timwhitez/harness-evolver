@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Any
 
 from harness.tools._file_edit_issue4_base import FileEditTool as _BaseFileEditTool
@@ -11,6 +12,7 @@ from harness.tools.canonical_path_guard import guarded_path_failure, resolve_gua
 from harness.tools.safe_path_io import (
     SafePathError,
     atomic_write_text_nofollow,
+    file_identity,
     read_text_nofollow,
 )
 from harness.tools.shell import (
@@ -21,7 +23,7 @@ from harness.tools.shell import (
 
 @dataclass
 class FileEditTool(_BaseFileEditTool):
-    """Edit an authorized canonical target without following later symlink swaps."""
+    """Edit one unchanged authorized inode and publish the result atomically."""
 
     def execute(
         self,
@@ -106,10 +108,12 @@ class FileEditTool(_BaseFileEditTool):
             )
 
         try:
-            atomic_write_text_nofollow(
+            directory_synced = atomic_write_text_nofollow(
                 decision.resolved,
                 new_content,
                 mode=metadata.st_mode,
+                expected_identity=file_identity(metadata),
+                expected_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
             )
         except (OSError, SafePathError) as exc:
             return ToolResult(
@@ -120,17 +124,28 @@ class FileEditTool(_BaseFileEditTool):
                     "canonical_path_guard",
                     canonical_path_checked=True,
                     nofollow_io=True,
+                    atomic_replace=False,
+                    target_identity_verified=True,
                 ),
             )
 
         replaced = count if replace_all else 1
+        output = f"Replaced {replaced} occurrence(s) in {file_path}"
+        if not directory_synced:
+            output += (
+                "\nWarning: content was atomically published, but the parent "
+                "directory could not be fsynced."
+            )
         return ToolResult(
             success=True,
-            output=f"Replaced {replaced} occurrence(s) in {file_path}",
+            output=output,
             metadata={
                 "occurrences_replaced": replaced,
                 "canonical_path_checked": True,
                 "nofollow_io": True,
+                "target_identity_verified": True,
                 "atomic_replace": True,
+                "directory_fsync": directory_synced,
+                "durability_warning": not directory_synced,
             },
         )
