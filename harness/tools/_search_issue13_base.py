@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from harness.tools import _search_issue4_fixed_base as _base
+import harness.tools._search_issue4_fixed_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
