@@ -1,145 +1,175 @@
-"""Trial CLI with None-aware precedence and validated effective request values.
+"""Trial CLI with role-aware model-config discovery.
 
-The issue-12 implementation is retained in
-:mod:`scripts._run_trial_issue12_base`; this facade preserves every existing
-command/helper while validating the values produced by the precedence merge.
+This branch is stacked on the issue-12 precedence fix. It resolves the effective
+Worker role only after reading the selected dotenv, while preserving the
+explicit precedence contract:
+
+    CLI > pre-existing process environment > selected dotenv > default
+
+The exact role is then used for every explicit or automatic model-config
+selection and recorded in effective metadata with its source.
 """
 
 from __future__ import annotations
 
-import math
+from contextvars import ContextVar
+import os
+from pathlib import Path
 from typing import Any
 
-from scripts import _run_trial_issue12_base as _base
+from scripts import _run_trial_issue11_base as _base
+from scripts import _run_trial_issue12_base as _core
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
         globals()[_name] = _value
 
 _BASE_RESOLVE_AGENT_CONFIG = _base.resolve_agent_config
+_EFFECTIVE_WORKER_ROLE: ContextVar[str | None] = ContextVar(
+    "harness_evolver_effective_worker_role",
+    default=None,
+)
+_SELECTED_MODELS_PATH: ContextVar[Path | None] = ContextVar(
+    "harness_evolver_selected_models_path",
+    default=None,
+)
 
 
-def _integer_value(
-    value: object,
-    *,
-    field: str,
+def _dotenv_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _load_dotenv_without_overriding_process_environment(path: Path) -> None:
+    for key, value in _dotenv_values(path).items():
+        if not os.environ.get(key):
+            os.environ[key] = value
+
+
+def _select_models_config_for_effective_role(
+    explicit: str | None,
     parser: Any,
-) -> int:
-    """Parse one effective integer without accepting bool or non-finite floats."""
+) -> Path | None:
+    role = _EFFECTIVE_WORKER_ROLE.get()
+    if not role:
+        parser.error("internal error: effective Worker role was not resolved")
 
-    if isinstance(value, bool):
-        parser.error(f"{field} must be an integer, not a boolean")
-    if isinstance(value, float):
-        if not math.isfinite(value) or not value.is_integer():
-            parser.error(f"{field} must be a finite integer")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
-        parser.error(f"{field} must be an integer")
-    return parsed
+    if explicit:
+        path = Path(explicit)
+        if not path.exists():
+            parser.error(f"--models-config path does not exist: {path}")
+        try:
+            models = _core.ModelsConfig.from_yaml(path)
+        except Exception as exc:
+            parser.error(f"Could not load model config {path}: {exc}")
+        if role not in models.roles:
+            parser.error(
+                f"Worker role {role!r} is not configured in {path}. "
+                f"Available roles: {', '.join(sorted(models.roles)) or '(none)'}"
+            )
+        _SELECTED_MODELS_PATH.set(path)
+        return path
 
+    observed: list[tuple[Path, list[str]]] = []
+    for path in (Path("config/local.yaml"), Path("config/models.yaml")):
+        if not path.exists():
+            continue
+        try:
+            models = _core.ModelsConfig.from_yaml(path)
+        except Exception as exc:
+            parser.error(f"Could not load model config {path}: {exc}")
+        available_roles = sorted(models.roles)
+        observed.append((path, available_roles))
+        if role in models.roles:
+            _SELECTED_MODELS_PATH.set(path)
+            return path
 
-def _validate_optional_string(
-    config: dict[str, object],
-    *,
-    field: str,
-    parser: Any,
-    allow_empty: bool,
-) -> None:
-    """Validate explicit string overrides without treating them as absent.
-
-    ``None`` is the only missing-value sentinel. Empty endpoint/key strings are
-    retained deliberately so callers can clear role-level optional values.
-    Required request identity fields reject an explicit empty string rather than
-    silently falling back to the role configuration.
-    """
-
-    value = config.get(field)
-    if value is None:
-        return
-    if not isinstance(value, str):
-        parser.error(f"{field} must be a string")
-    if not allow_empty and not value.strip():
-        parser.error(f"{field} must not be empty when explicitly supplied")
-
-
-def _validate_effective_model_request_values(
-    config: dict[str, object],
-    parser: Any,
-) -> None:
-    """Reject invalid falsy values instead of silently replacing them.
-
-    ``None`` means absent. Zero remains a valid explicit value only for fields
-    whose existing schema permits zero: retry count and reasoning-token budget.
-    Provider timeout and maximum output length must be strictly positive.
-    Optional endpoint/key strings may be explicitly cleared with ``""``; model,
-    provider, and reasoning-effort identities may not.
-    """
-
-    for field in ("model", "provider", "reasoning_effort"):
-        _validate_optional_string(
-            config,
-            field=field,
-            parser=parser,
-            allow_empty=False,
+    if observed:
+        checked = "; ".join(
+            f"{path}: {', '.join(roles) or '(none)'}"
+            for path, roles in observed
         )
-    for field in ("base_url", "api_key_env"):
-        _validate_optional_string(
-            config,
-            field=field,
-            parser=parser,
-            allow_empty=True,
+        parser.error(
+            f"Worker role {role!r} is not configured in any discovered model "
+            f"config. Checked roles: {checked}"
         )
 
-    reasoning_tokens = config.get("reasoning_max_tokens")
-    if reasoning_tokens is not None:
-        parsed = _integer_value(
-            reasoning_tokens,
-            field="reasoning_max_tokens",
-            parser=parser,
-        )
-        if parsed < 0:
-            parser.error("reasoning_max_tokens must be non-negative")
-        config["reasoning_max_tokens"] = parsed
-
-    retries = config.get("max_retries")
-    if retries is not None:
-        parsed = _integer_value(retries, field="max_retries", parser=parser)
-        if parsed < 0:
-            parser.error("max_retries must be non-negative")
-        config["max_retries"] = parsed
-
-    timeout_seconds = config.get("timeout_seconds")
-    if timeout_seconds is not None:
-        parsed = _integer_value(
-            timeout_seconds,
-            field="timeout_seconds",
-            parser=parser,
-        )
-        if parsed <= 0:
-            parser.error("timeout_seconds must be positive")
-        config["timeout_seconds"] = parsed
-
-    output_tokens = config.get("max_output_tokens")
-    if output_tokens is not None:
-        parsed = _integer_value(
-            output_tokens,
-            field="max_output_tokens",
-            parser=parser,
-        )
-        if parsed <= 0:
-            parser.error("max_output_tokens must be positive")
-        # Harbor transports this optional agent kwarg as text; retain that
-        # established representation after validating the numeric contract.
-        config["max_output_tokens"] = str(parsed)
+    _SELECTED_MODELS_PATH.set(None)
+    return None
 
 
 def resolve_agent_config(args: Any, parser: Any) -> dict[str, object]:
-    config = _BASE_RESOLVE_AGENT_CONFIG(args, parser)
-    _validate_effective_model_request_values(config, parser)
+    env_file = _core._resolve_env_file(getattr(args, "env_file", None), parser)
+    process_role = str(os.environ.get("HL_WORKER_ROLE") or "").strip()
+    dotenv_role = ""
+    if env_file:
+        dotenv_role = str(_dotenv_values(env_file).get("HL_WORKER_ROLE") or "").strip()
+        _load_dotenv_without_overriding_process_environment(env_file)
+
+    raw_cli_role = getattr(args, "worker_role", None)
+    if raw_cli_role is not None and not str(raw_cli_role).strip():
+        parser.error("--worker-role must not be empty")
+    cli_role = str(raw_cli_role).strip() if raw_cli_role is not None else ""
+
+    if cli_role:
+        worker_role = cli_role
+        role_source = "cli"
+    elif process_role:
+        worker_role = process_role
+        role_source = "process_environment"
+    elif dotenv_role:
+        worker_role = dotenv_role
+        role_source = "selected_dotenv"
+    else:
+        worker_role = "worker"
+        role_source = "default"
+
+    previous_role = os.environ.get("HL_WORKER_ROLE")
+    os.environ["HL_WORKER_ROLE"] = worker_role
+    role_token = _EFFECTIVE_WORKER_ROLE.set(worker_role)
+    path_token = _SELECTED_MODELS_PATH.set(None)
+    try:
+        config = _BASE_RESOLVE_AGENT_CONFIG(args, parser)
+        selected_path = _SELECTED_MODELS_PATH.get()
+    finally:
+        _SELECTED_MODELS_PATH.reset(path_token)
+        _EFFECTIVE_WORKER_ROLE.reset(role_token)
+        if previous_role is None:
+            os.environ.pop("HL_WORKER_ROLE", None)
+        else:
+            os.environ["HL_WORKER_ROLE"] = previous_role
+
+    if selected_path is None and not str(config.get("model") or "").strip():
+        parser.error(
+            "No model configuration file was found and no explicit --model was "
+            "provided. Supply --models-config, create config/local.yaml or "
+            "config/models.yaml, or provide the model request settings on the CLI."
+        )
+
+    config["worker_role"] = worker_role
+    config["worker_role_source"] = role_source
+    config["models_config_path"] = (
+        str(selected_path) if selected_path is not None else None
+    )
     return config
 
 
+_core._load_dotenv = _load_dotenv_without_overriding_process_environment
+_core._select_models_config = _select_models_config_for_effective_role
+_core.resolve_agent_config = resolve_agent_config
+_base._load_dotenv = _load_dotenv_without_overriding_process_environment
 _base.resolve_agent_config = resolve_agent_config
 main = _base.main
 
