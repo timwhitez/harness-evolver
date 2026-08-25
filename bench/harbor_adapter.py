@@ -32,14 +32,25 @@ if [ "${HL_APPEND:-0}" = "1" ] && [ -e "$p" ]; then
 fi
 printf '%s' "$HL_FILE_CONTENT" | base64 -d >> "$tmp"
 if [ -e "$p" ]; then
-  if chmod --reference="$p" "$tmp" 2>/dev/null; then :
-  elif command -v stat >/dev/null 2>&1; then chmod "$(stat -c '%a' "$p")" "$tmp"; fi
+  if chmod --reference="$p" "$tmp" 2>/dev/null; then
+    # Rewriting content must not recreate setuid/setgid/sticky bits on the new inode.
+    chmod u-s,g-s,o-t "$tmp"
+  elif command -v stat >/dev/null 2>&1; then
+    mode=$(stat -c '%a' "$p")
+    mode=$((0$mode & 0777))
+    chmod "$(printf '%03o' "$mode")" "$tmp"
+  fi
 else
   mask=$(umask)
   mode=$((0666 & (0777 ^ 0$mask)))
   chmod "$(printf '%03o' "$mode")" "$tmp"
 fi
-if command -v sync >/dev/null 2>&1; then sync -f "$tmp" 2>/dev/null || true; fi
+if command -v sync >/dev/null 2>&1; then
+  if ! sync -f "$tmp"; then
+    echo "failed to flush temporary file before atomic replacement" >&2
+    exit 74
+  fi
+fi
 mv -f "$tmp" "$p"
 tmp=
 printf '%s\n' "$p"
