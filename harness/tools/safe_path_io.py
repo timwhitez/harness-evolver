@@ -213,6 +213,30 @@ def _stat_unconditional_target(
     return metadata
 
 
+def _validate_displaced_unconditional_target(
+    parent_fd: int,
+    name: str,
+    target: Path,
+    *,
+    expected_identity: FileIdentity,
+) -> os.stat_result:
+    """Validate the exact regular entry displaced by a pure overwrite.
+
+    Multiply-linked regular files are intentionally accepted here. A pure
+    whole-file replacement never consumes their old bytes and safely de-aliases
+    only the selected directory entry.
+    """
+
+    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SafePathError(f"Refusing non-regular overwrite target: {target}")
+    if file_identity(metadata) != expected_identity:
+        raise SafePathError(
+            f"Overwrite target changed identity before publication: {target}"
+        )
+    return metadata
+
+
 def _assert_name_identity(
     parent_fd: int,
     name: str,
@@ -281,6 +305,12 @@ def atomic_write_text_nofollow(
     back before failure, so an ordinary-file replacement at the publication
     boundary is not overwritten. Missing-target appends use ``RENAME_NOREPLACE``.
 
+    Pure overwrites use the same conditional-publication boundary. An initially
+    missing target is published with ``RENAME_NOREPLACE``. An existing regular
+    target is exchanged, then the displaced entry's type and identity are
+    verified before it is removed. A special entry or identity race is rolled
+    back atomically instead of being destroyed.
+
     Returns whether the parent-directory fsync succeeded. Once publication is
     complete, a later directory-fsync error is a durability warning rather than
     a false pre-publication failure that callers might retry unsafely.
@@ -306,6 +336,12 @@ def atomic_write_text_nofollow(
             current = None
         else:
             current = _stat_unconditional_target(parent_fd, name, target)
+
+        unconditional_identity = (
+            file_identity(current)
+            if current is not None and not conditional_existing
+            else None
+        )
 
         existing_mode = mode
         if existing_mode is None and current is not None:
@@ -363,18 +399,37 @@ def atomic_write_text_nofollow(
                 temporary_exists = False
                 exchanged = False
                 published = True
-            elif expected_missing:
+            elif expected_missing or current is None:
                 _renameat2(parent_fd, temporary_name, name, _RENAME_NOREPLACE)
                 temporary_exists = False
                 published = True
             else:
-                os.replace(
-                    temporary_name,
-                    name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
+                assert unconditional_identity is not None
+                _renameat2(parent_fd, temporary_name, name, _RENAME_EXCHANGE)
+                exchanged = True
+                try:
+                    _validate_displaced_unconditional_target(
+                        parent_fd,
+                        temporary_name,
+                        target,
+                        expected_identity=unconditional_identity,
+                    )
+                except Exception as validation_error:
+                    try:
+                        _assert_name_identity(parent_fd, name, new_identity, target)
+                        _renameat2(parent_fd, temporary_name, name, _RENAME_EXCHANGE)
+                        exchanged = False
+                    except Exception as rollback_error:
+                        raise SafePathError(
+                            "Unconditional overwrite validation failed and atomic "
+                            f"rollback could not complete; displaced target retained at "
+                            f"{temporary_name}"
+                        ) from rollback_error
+                    raise validation_error
+
+                os.unlink(temporary_name, dir_fd=parent_fd)
                 temporary_exists = False
+                exchanged = False
                 published = True
 
             try:
