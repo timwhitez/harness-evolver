@@ -22,7 +22,44 @@ _v3 = _base._v3
 _v4 = _base._v4
 
 
-_ATOMIC_FUNCTION = r'''def write_atomic(
+_ATOMIC_FUNCTION = r'''def renameat2(parent, source, destination, flags):
+    import ctypes, platform
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("race-safe conditional publication requires Linux renameat2")
+    numbers = {
+        "x86_64": 316, "amd64": 316, "i386": 353, "i686": 353,
+        "aarch64": 276, "arm64": 276, "armv7l": 382,
+        "ppc64": 357, "ppc64le": 357, "s390x": 347, "riscv64": 276,
+    }
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    function = getattr(libc, "renameat2", None)
+    if function is not None:
+        function.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        result = function(
+            parent, source_bytes, parent, destination_bytes, flags
+        )
+    else:
+        number = numbers.get(platform.machine().lower())
+        if number is None:
+            raise RuntimeError("renameat2 syscall number unavailable")
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long(number), ctypes.c_int(parent),
+            ctypes.c_char_p(source_bytes), ctypes.c_int(parent),
+            ctypes.c_char_p(destination_bytes), ctypes.c_uint(flags),
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+def write_atomic(
     parent,
     name,
     payload,
@@ -31,22 +68,26 @@ _ATOMIC_FUNCTION = r'''def write_atomic(
     expected_sha256=None,
     expected_missing=False,
 ):
-    def read_current():
+    conditional_existing = expected_identity is not None or expected_sha256 is not None
+    if expected_missing and conditional_existing:
+        raise RuntimeError("missing and existing target expectations conflict")
+
+    def read_current(current_name):
         try:
-            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            current = os.stat(current_name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             if expected_missing:
                 return None
-            if expected_identity is not None or expected_sha256 is not None:
+            if conditional_existing:
                 raise RuntimeError("target disappeared before publication")
             return None
         if stat.S_ISLNK(current.st_mode):
             raise RuntimeError("symlink target")
         if expected_missing:
             raise RuntimeError("target appeared before publication")
-        if expected_identity is None and expected_sha256 is None:
+        if not conditional_existing:
             return current
-        descriptor, metadata = open_regular(parent, name)
+        descriptor, metadata = open_regular(parent, current_name)
         try:
             chunks = []
             while True:
@@ -66,7 +107,21 @@ _ATOMIC_FUNCTION = r'''def write_atomic(
             raise RuntimeError("target content changed before publication")
         return metadata
 
-    current = read_current()
+    def assert_name_identity(current_name, expected):
+        descriptor = os.open(
+            current_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+        try:
+            actual = os.fstat(descriptor)
+            identity = (int(actual.st_dev), int(actual.st_ino))
+            if identity != tuple(expected):
+                raise RuntimeError("published target changed before rollback")
+        finally:
+            os.close(descriptor)
+
+    current = read_current(name)
     if mode is None and current is not None:
         mode = current.st_mode
 
@@ -77,6 +132,8 @@ _ATOMIC_FUNCTION = r'''def write_atomic(
         0o666,
         dir_fd=parent,
     )
+    temporary_exists = True
+    exchanged = False
     published = False
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
@@ -85,12 +142,40 @@ _ATOMIC_FUNCTION = r'''def write_atomic(
             if mode is not None:
                 os.fchmod(descriptor, stat.S_IMODE(mode) & 0o777)
             os.fsync(descriptor)
+        new_metadata = os.fstat(descriptor)
+        new_identity = (int(new_metadata.st_dev), int(new_metadata.st_ino))
         os.close(descriptor)
         descriptor = -1
 
-        read_current()
-        os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
-        published = True
+        if conditional_existing:
+            renameat2(parent, temporary, name, 2)
+            exchanged = True
+            try:
+                read_current(temporary)
+            except Exception as validation_error:
+                try:
+                    assert_name_identity(name, new_identity)
+                    renameat2(parent, temporary, name, 2)
+                    exchanged = False
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        "conditional publication validation failed and rollback "
+                        "could not complete; displaced target retained at " + temporary
+                    ) from rollback_error
+                raise validation_error
+            os.unlink(temporary, dir_fd=parent)
+            temporary_exists = False
+            exchanged = False
+            published = True
+        elif expected_missing:
+            renameat2(parent, temporary, name, 1)
+            temporary_exists = False
+            published = True
+        else:
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            temporary_exists = False
+            published = True
+
         try:
             os.fsync(parent)
         except OSError:
@@ -99,11 +184,13 @@ _ATOMIC_FUNCTION = r'''def write_atomic(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if not published:
+        if temporary_exists and not exchanged:
             try:
                 os.unlink(temporary, dir_fd=parent)
             except FileNotFoundError:
                 pass
+        if not published and exchanged:
+            pass
 '''
 
 
