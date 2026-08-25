@@ -67,3 +67,29 @@ def test_literal_edge_whitespace_fails_closed_before_normalization(raw_url: str)
     assert "base_url_host" not in redacted
     for raw_component in ["user", "secret", "Gateway.Example", "/v1"]:
         assert raw_component not in serialized
+
+
+@pytest.mark.parametrize(
+    "raw_url",
+    [
+        "gateway.example:",
+        "https://user:secret@gateway.example:/v1",
+        "https://user:secret@[2001:db8::1]:/v1",
+        ".gateway.example/v1",
+        "gateway.example../v1",
+    ],
+)
+def test_empty_ports_and_invalid_hostname_roots_fail_closed(raw_url: str) -> None:
+    endpoint = safe_endpoint(raw_url)
+    role = RoleModelConfig(model="example", base_url=raw_url)
+    redacted = role.redacted()
+    serialized = json.dumps(redacted, sort_keys=True)
+
+    assert endpoint.valid is False
+    assert endpoint.hostname is None
+    assert endpoint.port is None
+    assert redacted["base_url_valid"] is False
+    assert "base_url_host" not in redacted
+    assert "base_url_port" not in redacted
+    for raw_component in ["user", "secret", "gateway.example", "2001:db8::1", "/v1"]:
+        assert raw_component not in serialized
