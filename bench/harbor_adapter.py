@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from bench._harbor_adapter_issue4_base import *  # noqa: F401,F403
 from bench import _harbor_adapter_issue4_base as _base
-from bench._canonical_harbor_identity_guard import (
+from bench._canonical_harbor_special_write import (
     HarborFileEditTool,
     HarborFileWriteTool,
 )
