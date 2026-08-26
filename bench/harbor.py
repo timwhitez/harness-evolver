@@ -156,3 +156,12 @@ class HarborRunner(_base.HarborRunner):
             metadata["score_exclusion_reason"] = "infrastructure_error"
         elif metadata.get("score_exclusion_reason") == "infrastructure_error":
             metadata.pop("score_exclusion_reason", None)
+
+    def finalize_infrastructure_attribution(
+        self,
+        trial: _base.TrialResult,
+    ) -> _base.TrialResult:
+        """Persist the score-authoritative decision after an offline parse."""
+
+        self._mark_retry_policy_finite(trial)
+        return trial

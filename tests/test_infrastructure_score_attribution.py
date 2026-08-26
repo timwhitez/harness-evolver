@@ -10,6 +10,7 @@ from hl.types import (
     TrialStatus,
     trial_is_infrastructure_failure,
 )
+from tests.infra_fixtures import finalized_infra_metadata
 
 
 def _trial(
@@ -30,16 +31,6 @@ def _trial(
         verified=verified,
         metadata=metadata or {},
     )
-
-
-def _final_infra_metadata(**extra: object) -> dict[str, object]:
-    return {
-        "infra_attribution_finalized": True,
-        "infra_attribution_policy": "phase_owned_evidence_v2",
-        "infra_error_detected": True,
-        "score_exclusion_reason": "infrastructure_error",
-        **extra,
-    }
 
 
 @pytest.mark.parametrize(
@@ -130,7 +121,7 @@ def test_pr39_finalized_infrastructure_decision_is_excluded() -> None:
         "structured-infra",
         status=TrialStatus.TIMEOUT,
         score=0.0,
-        metadata=_final_infra_metadata(
+        metadata=finalized_infra_metadata(
             timeout_phase="environment_start",
             environment_start_evidence="Environment start timed out",
         ),
@@ -142,8 +133,8 @@ def test_pr39_finalized_infrastructure_decision_is_excluded() -> None:
 @pytest.mark.parametrize(
     "metadata",
     [
-        _final_infra_metadata(),
-        _final_infra_metadata(timeout_phase="verifier_runtime_prepare"),
+        finalized_infra_metadata(),
+        finalized_infra_metadata(timeout_phase="verifier_runtime_prepare"),
     ],
 )
 def test_verified_trial_is_never_excluded_by_finalized_failure_metadata(
@@ -165,7 +156,7 @@ def test_pr39_all_infrastructure_aggregate_is_excluded() -> None:
         "aggregate-infra",
         status=TrialStatus.ERROR,
         score=0.0,
-        metadata=_final_infra_metadata(
+        metadata=finalized_infra_metadata(
             multi_attempt_aggregate=True,
             attempt_results=[
                 {

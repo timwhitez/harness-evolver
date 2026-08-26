@@ -527,7 +527,8 @@ def _refresh_trial_from_harbor_job(trial: TrialResult) -> TrialResult | None:
     if not job_dir.exists() or not (job_dir / "result.json").exists():
         return None
     try:
-        return HarborRunner(output_dir=Path("__analysis_replay__")).parse_job_dir(
+        runner = HarborRunner(output_dir=Path("__analysis_replay__"))
+        reparsed = runner.parse_job_dir(
             job_dir,
             task_id=trial.task_id,
             returncode=int(trial.metadata.get("harbor_returncode") or 0),
@@ -536,6 +537,7 @@ def _refresh_trial_from_harbor_job(trial: TrialResult) -> TrialResult | None:
             wall_time=trial.wall_time_seconds,
             agent_config=(trial.metadata.get("model_config") or {}),
         )
+        return runner.finalize_infrastructure_attribution(reparsed)
     except Exception:
         return None
 

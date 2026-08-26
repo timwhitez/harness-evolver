@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.infra_fixtures import finalized_infra_metadata
+
 from hl.goals import GoalStore
 from hl.loop import HLLoop
 from hl.types import (
@@ -4447,23 +4449,21 @@ def test_codex_update_decision_audits_infrastructure_only_failures_without_block
         score=0.0,
         verified=False,
         error_log=["Environment start timed out after 600.0 seconds"],
-        metadata={
-            "timeout_phase": "environment_start",
-            "infra_error_detected": True,
-            "score_exclusion_reason": "infrastructure_error",
-            "environment_start_attribution_hint": (
+        metadata=finalized_infra_metadata(
+            timeout_phase="environment_start",
+            environment_start_attribution_hint=(
                 "prebuilt image inspect failed for "
                 "docker.1panel.live/alexgshaw/hf-model-inference:20251031; "
                 "heavy Dockerfile dependency install: torch, transformers"
             ),
-            "docker_image_validation_failed": True,
-            "prebuilt_image_cache_miss_detected": True,
-            "prebuilt_image_cache_warmup_commands": [
+            docker_image_validation_failed=True,
+            prebuilt_image_cache_miss_detected=True,
+            prebuilt_image_cache_warmup_commands=[
                 "docker pull docker.1panel.live/alexgshaw/hf-model-inference:20251031"
             ],
-            "network_preflight_recommended": True,
-            "heavy_dockerfile_install_detected": True,
-        },
+            network_preflight_recommended=True,
+            heavy_dockerfile_install_detected=True,
+        ),
     )
     decision = _codex_update_decision(
         {"min_failures": 1},
@@ -4498,7 +4498,7 @@ def test_analysis_candidates_include_infrastructure_failure_buckets_as_update_ev
         score=0.0,
         verified=False,
         error_log=["Environment start timed out after 600.0 seconds"],
-        metadata={"timeout_phase": "environment_start", "infra_error_detected": True},
+        metadata=finalized_infra_metadata(timeout_phase="environment_start"),
     )
     harness_trial = TrialResult(
         trial_id="trial-harness",
@@ -4552,11 +4552,7 @@ def test_analysis_infrastructure_phase_does_not_inherit_worker_dependency_mechan
                 "metadata": {"timeout_capped": True},
             },
         ],
-        metadata={
-            "timeout_phase": "environment_start",
-            "infra_error_detected": True,
-            "score_exclusion_reason": "infrastructure_error",
-        },
+        metadata=finalized_infra_metadata(timeout_phase="environment_start"),
     )
 
     buckets = _analysis_failure_buckets([infra_trial])
@@ -5458,12 +5454,10 @@ def test_iteration_analysis_labels_infrastructure_timeout_weakness_contribution(
         score=0.0,
         verified=False,
         error_log=["Verifier runtime preparation timed out"],
-        metadata={
-            "timeout_phase": "verifier_runtime_prepare",
-            "verifier_runtime_prepare_timeout": True,
-            "infra_error_detected": True,
-            "score_exclusion_reason": "infrastructure_error",
-        },
+        metadata=finalized_infra_metadata(
+            timeout_phase="verifier_runtime_prepare",
+            verifier_runtime_prepare_timeout=True,
+        ),
     )
 
     paths = _write_iteration_analysis_report(
@@ -5530,13 +5524,11 @@ def test_iteration_analysis_excludes_semantic_mechanisms_from_infra_timeout(tmp_
                 "output": "-rw-r--r-- 1 root root 9 Jun 22 /app/regex.txt\n9 /app/regex.txt",
             },
         ],
-        metadata={
-            "timeout_phase": "verifier_runtime_prepare",
-            "verifier_runtime_prepare_timeout": True,
-            "infra_error_detected": True,
-            "score_exclusion_reason": "infrastructure_error",
-            "expected_artifacts": ["/app/regex.txt"],
-        },
+        metadata=finalized_infra_metadata(
+            timeout_phase="verifier_runtime_prepare",
+            verifier_runtime_prepare_timeout=True,
+            expected_artifacts=["/app/regex.txt"],
+        ),
     )
 
     raw_mechanisms = [mechanism.name for mechanism in failure_mechanisms_for_trial(trial)]
@@ -13614,6 +13606,22 @@ def test_rebuild_analysis_refreshes_stale_trial_from_raw_harbor_job(
     raw_trial_dir = raw_job_dir / trial_id
     raw_agent_dir = raw_trial_dir / "agent"
     raw_agent_dir.mkdir(parents=True)
+    exception_traceback = (
+        "Traceback (most recent call last):\n"
+        "  File \"/usr/local/lib/python3.12/dist-packages/harbor/trial/trial.py\", "
+        "line 986, in run\n"
+        "    await self._run_verification()\n"
+        "  File \"/workspace/bench/network_environment.py\", line 191, "
+        "in _prepare_verifier_runtime\n"
+        "RuntimeError: Command timed out after 90 seconds\n"
+    )
+    (raw_trial_dir / "exception.txt").write_text(exception_traceback)
+    raw_verifier_dir = raw_trial_dir / "verifier"
+    raw_verifier_dir.mkdir()
+    (raw_verifier_dir / "test-stdout.txt").write_text(
+        "Verifier runtime network preparation timed out after 90 seconds\n"
+        "while running /tmp/hl-verifier-network-prepared setup\n"
+    )
     (raw_agent_dir / "trajectory.jsonl").write_text(
         "\n".join(
             [
@@ -13663,14 +13671,7 @@ def test_rebuild_analysis_refreshes_stale_trial_from_raw_harbor_job(
                         "exception_info": {
                             "exception_type": "RuntimeError",
                             "exception_message": "Command timed out after 90 seconds",
-                            "exception_traceback": (
-                                "Traceback (most recent call last):\n"
-                                "  File \"/usr/local/lib/python3.12/dist-packages/harbor/trial/trial.py\", line 986, in run\n"
-                                "    await self._run_verification()\n"
-                                "  File \"/workspace/bench/network_environment.py\", line 191, "
-                                "in _prepare_verifier_runtime\n"
-                                "RuntimeError: Command timed out after 90 seconds\n"
-                            ),
+                            "exception_traceback": exception_traceback,
                         },
                     }
                 ],

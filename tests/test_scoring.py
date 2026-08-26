@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from bench.scoring import Scoring
 from hl.types import TaskDifficulty, TaskDomain, TrialResult, TrialStatus
+from tests.infra_fixtures import finalized_infra_metadata
 
 
 def _trial(
@@ -34,7 +35,7 @@ def test_infrastructure_error_excluded_from_overall_score():
             "c",
             TrialStatus.ERROR,
             0.0,
-            metadata={"score_exclusion_reason": "infrastructure_error"},
+            metadata=finalized_infra_metadata(),
         ),
     ]
     summary = Scoring.build_summary("s1", trials)
@@ -54,7 +55,7 @@ def test_environment_start_timeout_excluded_from_score():
             "b",
             TrialStatus.ERROR,
             0.0,
-            metadata={"timeout_phase": "environment_start"},
+            metadata=finalized_infra_metadata(timeout_phase="environment_start"),
         ),
     ]
     summary = Scoring.build_summary("s2", trials)
@@ -69,7 +70,7 @@ def test_all_infrastructure_failures_score_zero_without_crash():
             "a",
             TrialStatus.ERROR,
             0.0,
-            metadata={"score_exclusion_reason": "infrastructure_error"},
+            metadata=finalized_infra_metadata(),
         ),
     ]
     summary = Scoring.build_summary("s3", trials)
@@ -85,7 +86,7 @@ def test_per_domain_and_difficulty_exclude_infrastructure():
             "b",
             TrialStatus.ERROR,
             0.0,
-            metadata={"timeout_phase": "environment_build"},
+            metadata=finalized_infra_metadata(timeout_phase="environment_build"),
             domain=TaskDomain.SECURITY,
         ),
     ]
