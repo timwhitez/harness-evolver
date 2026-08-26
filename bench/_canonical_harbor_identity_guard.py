@@ -391,11 +391,10 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
             if not isinstance(present, bool):
                 raise TypeError("present is not boolean")
             raw = base64.b64decode(payload.get("payload", ""), validate=True)
-            text = raw.decode("utf-8", errors="strict")
             digest = str(payload["sha256"])
             dev = int(payload["dev"]) if present else None
             ino = int(payload["ino"]) if present else None
-        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             return None, _v2.ToolResult(
                 success=False,
                 output="",
@@ -404,6 +403,21 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
                     "canonical_path_checked": True,
                     "nofollow_io": True,
                     "secure_read_protocol_error": True,
+                    "atomic_replace": False,
+                },
+            )
+        try:
+            text = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            return None, _v2.ToolResult(
+                success=False,
+                output="",
+                error=f"Cannot append non-UTF-8 text safely: {exc}",
+                metadata={
+                    "text_decode_error": True,
+                    "encoding": "utf-8",
+                    "canonical_path_checked": True,
+                    "nofollow_io": True,
                     "atomic_replace": False,
                 },
             )

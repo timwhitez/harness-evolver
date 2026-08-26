@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 from types import MethodType
 
 from bench.harbor_adapter import HarborFileEditTool, HarborFileWriteTool
@@ -20,6 +22,24 @@ def _success_with_payload(payload: bytes) -> ToolResult:
     )
 
 
+def _success_with_snapshot(payload: bytes) -> ToolResult:
+    return ToolResult(
+        success=True,
+        output=json.dumps(
+            {
+                "present": True,
+                "dev": 1,
+                "ino": 2,
+                "payload": base64.b64encode(payload).decode("ascii"),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            sort_keys=True,
+        ),
+        error="",
+        metadata={"exit_code": 0},
+    )
+
+
 def test_append_rejects_invalid_utf8_before_atomic_publish() -> None:
     tool = object.__new__(HarborFileWriteTool)
     calls: list[tuple[str, dict[str, str]]] = []
@@ -32,7 +52,7 @@ def test_append_rejects_invalid_utf8_before_atomic_publish() -> None:
     ) -> ToolResult:
         calls.append((script, env))
         if len(calls) == 1:
-            return _success_with_payload(b"old-\xff-bytes")
+            return _success_with_snapshot(b"old-\xff-bytes")
         raise AssertionError("write phase must not run after text decode failure")
 
     tool._guard_environment_path = MethodType(_guard, tool)  # type: ignore[method-assign]
@@ -86,10 +106,10 @@ def test_valid_utf8_append_builds_one_complete_atomic_payload() -> None:
     ) -> ToolResult:
         calls.append((script, env))
         if len(calls) == 1:
-            return _success_with_payload("旧内容".encode("utf-8"))
+            return _success_with_snapshot("旧内容".encode("utf-8"))
         return ToolResult(
             success=True,
-            output="write complete\n",
+            output="write complete\ndirectory_synced=1\n",
             error="",
             metadata={"exit_code": 0},
         )
