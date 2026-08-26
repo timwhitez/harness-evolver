@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from bench.harbor_adapter import _ATOMIC_WRITE_SCRIPT
+from harness.tools import safe_path_io
 from harness.tools.file_write import FileWriteTool
 
 
@@ -33,10 +34,15 @@ def test_local_replace_failure_keeps_original_and_cleans_temp(
     target = tmp_path / "target.txt"
     target.write_text("old", encoding="utf-8")
 
-    def fail_replace(source: object, destination: object) -> None:
+    def fail_replace(
+        parent_fd: int,
+        source: str,
+        destination: str,
+        flags: int,
+    ) -> None:
         raise OSError("injected replace failure")
 
-    monkeypatch.setattr("harness.tools.file_write.os.replace", fail_replace)
+    monkeypatch.setattr(safe_path_io, "_renameat2", fail_replace)
 
     result = FileWriteTool().execute(str(target), "new")
 
@@ -83,6 +89,7 @@ def _run_harbor_script(
         ["sh", "-c", _ATOMIC_WRITE_SCRIPT],
         capture_output=True,
         text=True,
+        check=False,
         env={
             **os.environ,
             "HL_FILE_PATH": str(target),
