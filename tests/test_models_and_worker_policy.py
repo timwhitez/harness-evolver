@@ -13276,25 +13276,36 @@ class _SequenceTool:
         return self.execute(**kwargs)
 
 
-def test_rust_worker_command_prefers_explicit_binary_override(monkeypatch):
-    monkeypatch.setenv("HL_WORKER_RUST_BIN", "/custom/path/hl-worker-core")
+def _write_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_rust_worker_command_prefers_explicit_binary_override(monkeypatch, tmp_path):
+    worker = _write_executable(tmp_path / "custom" / "hl-worker-core")
+    monkeypatch.setenv("HL_WORKER_RUST_BIN", str(worker))
     agent = HLAgent()
 
-    assert agent._rust_worker_command() == ["/custom/path/hl-worker-core"]
+    assert agent._rust_worker_command() == [str(worker.resolve())]
 
 
-def test_rust_worker_command_prefers_prebuilt_binary_over_cargo_run(monkeypatch):
+def test_rust_worker_command_rejects_inaccessible_explicit_override(monkeypatch, tmp_path):
+    missing = tmp_path / "missing" / "hl-worker-core"
+    monkeypatch.setenv("HL_WORKER_RUST_BIN", str(missing))
+
+    with pytest.raises(RuntimeError, match="does not reference an accessible file"):
+        HLAgent()._rust_worker_command()
+
+
+def test_rust_worker_command_prefers_prebuilt_binary_over_cargo_run(monkeypatch, tmp_path):
     monkeypatch.delenv("HL_WORKER_RUST_BIN", raising=False)
-    repo_root = Path(__file__).resolve().parents[1]
-    crate_root = repo_root / "crates" / "hl-worker-core"
-    # Pretend only the debug binary exists and is executable so the resolver
-    # must skip the absent release binary and avoid the cargo-run fallback.
-    debug_binary = crate_root / "target" / "debug" / "hl-worker-core"
-
-    monkeypatch.setattr(Path, "is_file", lambda self: self == debug_binary)
-    monkeypatch.setattr(
-        "bench.agent.os.access", lambda path, mode: Path(path) == debug_binary
+    crate_root = tmp_path / "hl-worker-core"
+    debug_binary = _write_executable(
+        crate_root / "target" / "debug" / "hl-worker-core"
     )
+    monkeypatch.setattr("bench._agent_issue8_base.worker_crate_root", lambda: crate_root)
     monkeypatch.setattr(
         HLAgent,
         "_rust_worker_binary_is_current",
@@ -13306,43 +13317,54 @@ def test_rust_worker_command_prefers_prebuilt_binary_over_cargo_run(monkeypatch)
     assert agent._rust_worker_command() == [str(debug_binary)]
 
 
-def test_rust_worker_command_skips_stale_prebuilt_binary(monkeypatch):
+def test_rust_worker_command_falls_back_to_cargo_for_stale_prebuilt_binary(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.delenv("HL_WORKER_RUST_BIN", raising=False)
-    repo_root = Path(__file__).resolve().parents[1]
-    crate_root = repo_root / "crates" / "hl-worker-core"
-    release_binary = crate_root / "target" / "release" / "hl-worker-core"
-    debug_binary = crate_root / "target" / "debug" / "hl-worker-core"
-
-    monkeypatch.setattr(
-        Path,
-        "is_file",
-        lambda self: self in {release_binary, debug_binary},
+    crate_root = tmp_path / "hl-worker-core"
+    release_binary = _write_executable(
+        crate_root / "target" / "release" / "hl-worker-core"
     )
-    monkeypatch.setattr(
-        "bench.agent.os.access",
-        lambda path, mode: Path(path) in {release_binary, debug_binary},
-    )
+    (crate_root / "Cargo.toml").write_text("[package]\nname = 'fixture'\n")
+    monkeypatch.setattr("bench._agent_issue8_base.worker_crate_root", lambda: crate_root)
     monkeypatch.setattr(
         HLAgent,
         "_rust_worker_binary_is_current",
-        lambda self, candidate, crate_root: Path(candidate) == debug_binary,
+        lambda self, candidate, crate_root: False,
     )
-
-    agent = HLAgent()
-
-    assert agent._rust_worker_command() == [str(debug_binary)]
-
-
-def test_rust_worker_command_falls_back_to_cargo_run_without_binary(monkeypatch):
-    monkeypatch.delenv("HL_WORKER_RUST_BIN", raising=False)
-    # No prebuilt binary is present on the configured paths.
-    monkeypatch.setattr(Path, "is_file", lambda self: False)
-    monkeypatch.setattr("bench.agent.os.access", lambda path, mode: False)
+    monkeypatch.setattr(
+        "bench._agent_issue8_base.shutil.which",
+        lambda command: "/toolchain/cargo" if command == "cargo" else None,
+    )
 
     agent = HLAgent()
     command = agent._rust_worker_command()
 
-    assert command[:3] == ["cargo", "+stable", "run"]
+    assert command[0:2] == ["/toolchain/cargo", "run"]
+    assert str(release_binary) not in command
+    assert "--locked" in command
+    assert command[-1] == "--"
+    assert command[command.index("--manifest-path") + 1] == str(
+        crate_root / "Cargo.toml"
+    )
+
+
+def test_rust_worker_command_falls_back_to_cargo_run_without_binary(monkeypatch, tmp_path):
+    monkeypatch.delenv("HL_WORKER_RUST_BIN", raising=False)
+    crate_root = tmp_path / "hl-worker-core"
+    crate_root.mkdir()
+    (crate_root / "Cargo.toml").write_text("[package]\nname = 'fixture'\n")
+    monkeypatch.setattr("bench._agent_issue8_base.worker_crate_root", lambda: crate_root)
+    monkeypatch.setattr(
+        "bench._agent_issue8_base.shutil.which",
+        lambda command: "/toolchain/cargo" if command == "cargo" else None,
+    )
+
+    agent = HLAgent()
+    command = agent._rust_worker_command()
+
+    assert command[:2] == ["/toolchain/cargo", "run"]
     assert command[-1] == "--"
     assert any(part.endswith("Cargo.toml") for part in command)
 
