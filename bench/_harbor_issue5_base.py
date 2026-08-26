@@ -262,3 +262,19 @@ class HarborRunner(_base.HarborRunner):
         if allowed is not None:
             return _stable_attempt_key(result) in allowed
         return super()._trial_result_matches_task(result, task_id)
+
+    def _matching_trial_results(
+        self,
+        trial_results: list[dict[str, Any]],
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        """Apply the canonical allowed-attempt context to bulk selectors too."""
+
+        allowed = _ALLOWED_ATTEMPT_KEYS.get()
+        if allowed is not None:
+            return [
+                result
+                for result in trial_results
+                if _stable_attempt_key(result) in allowed
+            ]
+        return super()._matching_trial_results(trial_results, task_id)
