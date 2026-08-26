@@ -23,14 +23,17 @@ for _name, _value in vars(_base).items():
 def test_normal_parent_exit_does_not_leave_pipe_holding_background_child(
     tmp_path: Path,
 ) -> None:
-    pid_file = tmp_path / "background.pid"
+    process_lock = tmp_path / "background.lock"
     script = tmp_path / "spawn_and_exit.py"
     script.write_text(
         "\n".join(
             [
-                "import pathlib, subprocess, sys",
-                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
-                "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')",
+                "import pathlib, subprocess, sys, time",
+                "child_code = \"import fcntl,pathlib,sys,time; h=pathlib.Path(sys.argv[1]).open('w'); fcntl.flock(h, fcntl.LOCK_EX); h.write('locked'); h.flush()\\nwhile True: time.sleep(60)\"",
+                "subprocess.Popen([sys.executable, '-c', child_code, sys.argv[1]])",
+                "deadline = time.monotonic() + 5",
+                "p = pathlib.Path(sys.argv[1])",
+                "while (not p.exists() or p.read_text() != 'locked') and time.monotonic() < deadline: time.sleep(0.01)",
                 "print('parent-exiting', flush=True)",
             ]
         ),
@@ -40,7 +43,7 @@ def test_normal_parent_exit_does_not_leave_pipe_holding_background_child(
         [
             shlex.quote(sys.executable),
             shlex.quote(str(script)),
-            shlex.quote(str(pid_file)),
+            shlex.quote(str(process_lock)),
         ]
     )
 
@@ -52,4 +55,4 @@ def test_normal_parent_exit_does_not_leave_pipe_holding_background_child(
     # The important contract is the absence of descendants. The metadata flag
     # records an explicit outer termination operation and need not be true when
     # the supervisor/namespace completed cleanup before the outer wait returned.
-    _base._wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+    _base.assert_descendant_lock_released(process_lock)

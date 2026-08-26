@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -13,35 +12,22 @@ import pytest
 import harness.tools.process_runner as process_runner
 from harness.tools.process_runner import run_bounded_shell
 from harness.tools.verify import VerifyTool
+from tests.process_test_support import assert_descendant_lock_released
 
 
-def _pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _wait_for_pid_exit(pid: int, timeout: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout
-    while _pid_exists(pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert not _pid_exists(pid)
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group assertion")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group assertion")
 def test_verify_timeout_terminates_descendant_process(tmp_path: Path) -> None:
-    pid_file = tmp_path / "child.pid"
+    process_lock = tmp_path / "child.lock"
     script = tmp_path / "spawn_child.py"
     script.write_text(
         "\n".join(
             [
                 "import pathlib, subprocess, sys, time",
-                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
-                "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')",
+                "child_code = \"import fcntl,pathlib,sys,time; h=pathlib.Path(sys.argv[1]).open('w'); fcntl.flock(h, fcntl.LOCK_EX); h.write('locked'); h.flush()\\nwhile True: time.sleep(60)\"",
+                "subprocess.Popen([sys.executable, '-c', child_code, sys.argv[1]])",
+                "deadline = time.monotonic() + 5",
+                "p = pathlib.Path(sys.argv[1])",
+                "while (not p.exists() or p.read_text() != 'locked') and time.monotonic() < deadline: time.sleep(0.01)",
                 "print('child-ready', flush=True)",
                 "print('diagnostic-before-timeout', file=sys.stderr, flush=True)",
                 "time.sleep(60)",
@@ -53,7 +39,7 @@ def test_verify_timeout_terminates_descendant_process(tmp_path: Path) -> None:
         [
             shlex.quote(sys.executable),
             shlex.quote(str(script)),
-            shlex.quote(str(pid_file)),
+            shlex.quote(str(process_lock)),
         ]
     )
 
@@ -66,24 +52,28 @@ def test_verify_timeout_terminates_descendant_process(tmp_path: Path) -> None:
     assert "child-ready" in result.output
     assert "diagnostic-before-timeout" in result.output
 
-    _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+    assert_descendant_lock_released(process_lock)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group assertion")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group assertion")
 def test_timeout_kills_descendant_after_group_leader_exits_on_sigterm(tmp_path: Path) -> None:
-    pid_file = tmp_path / "resistant-child.pid"
+    process_lock = tmp_path / "resistant-child.lock"
     child_code = (
-        "import signal,time; "
+        "import fcntl,pathlib,signal,sys,time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "time.sleep(60)"
+        "h=pathlib.Path(sys.argv[1]).open('w'); fcntl.flock(h, fcntl.LOCK_EX); "
+        "h.write('locked'); h.flush()\n"
+        "while True: time.sleep(60)"
     )
     script = tmp_path / "spawn_resistant_child.py"
     script.write_text(
         "\n".join(
             [
                 "import pathlib, subprocess, sys, time",
-                f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])",
-                "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')",
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]])",
+                "deadline = time.monotonic() + 5",
+                "p = pathlib.Path(sys.argv[1])",
+                "while (not p.exists() or p.read_text() != 'locked') and time.monotonic() < deadline: time.sleep(0.01)",
                 "print('resistant-child-ready', flush=True)",
                 "time.sleep(60)",
             ]
@@ -94,7 +84,7 @@ def test_timeout_kills_descendant_after_group_leader_exits_on_sigterm(tmp_path: 
         [
             shlex.quote(sys.executable),
             shlex.quote(str(script)),
-            shlex.quote(str(pid_file)),
+            shlex.quote(str(process_lock)),
         ]
     )
 
@@ -105,23 +95,24 @@ def test_timeout_kills_descendant_after_group_leader_exits_on_sigterm(tmp_path: 
     assert result.managed_process_group_terminated is True
     assert "resistant-child-ready" in result.stdout
     assert time.monotonic() - started < 3.5
-    _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+    assert_descendant_lock_released(process_lock)
 
 
 @pytest.mark.skipif(
-    os.name != "posix" or not Path("/proc/self/stat").is_file(),
+    sys.platform == "win32" or not Path("/proc/self/stat").is_file(),
     reason="Linux /proc descendant discovery assertion",
 )
 def test_timeout_kills_descendant_that_escapes_with_setsid(tmp_path: Path) -> None:
-    pid_file = tmp_path / "setsid-child.pid"
+    process_lock = tmp_path / "setsid-child.lock"
     child_code = "\n".join(
         [
-            "import os, pathlib, signal, sys, time",
+            "import fcntl, os, pathlib, signal, sys, time",
             "os.setsid()",
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
-            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')",
+            "h = pathlib.Path(sys.argv[1]).open('w')",
+            "fcntl.flock(h, fcntl.LOCK_EX); h.write('locked'); h.flush()",
             "print('setsid-child-ready', flush=True)",
-            "time.sleep(60)",
+            "while True: time.sleep(60)",
         ]
     )
     script = tmp_path / "spawn_setsid_child.py"
@@ -131,7 +122,8 @@ def test_timeout_kills_descendant_that_escapes_with_setsid(tmp_path: Path) -> No
                 "import pathlib, subprocess, sys, time",
                 f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]])",
                 "deadline = time.monotonic() + 5",
-                "while not pathlib.Path(sys.argv[1]).exists() and time.monotonic() < deadline: time.sleep(0.01)",
+                "p = pathlib.Path(sys.argv[1])",
+                "while (not p.exists() or p.read_text() != 'locked') and time.monotonic() < deadline: time.sleep(0.01)",
                 "print('parent-observed-setsid-child', flush=True)",
                 "time.sleep(60)",
             ]
@@ -142,7 +134,7 @@ def test_timeout_kills_descendant_that_escapes_with_setsid(tmp_path: Path) -> No
         [
             shlex.quote(sys.executable),
             shlex.quote(str(script)),
-            shlex.quote(str(pid_file)),
+            shlex.quote(str(process_lock)),
         ]
     )
 
@@ -151,22 +143,24 @@ def test_timeout_kills_descendant_that_escapes_with_setsid(tmp_path: Path) -> No
     assert result.timed_out is True
     assert result.managed_process_group_terminated is True
     assert "parent-observed-setsid-child" in result.stdout
-    escaped_pid = int(pid_file.read_text(encoding="utf-8"))
-    _wait_for_pid_exit(escaped_pid)
+    assert_descendant_lock_released(process_lock)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group assertion")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group assertion")
 def test_normal_parent_exit_does_not_leave_pipe_holding_background_child(
     tmp_path: Path,
 ) -> None:
-    pid_file = tmp_path / "background.pid"
+    process_lock = tmp_path / "background.lock"
     script = tmp_path / "spawn_and_exit.py"
     script.write_text(
         "\n".join(
             [
-                "import pathlib, subprocess, sys",
-                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
-                "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')",
+                "import pathlib, subprocess, sys, time",
+                "child_code = \"import fcntl,pathlib,sys,time; h=pathlib.Path(sys.argv[1]).open('w'); fcntl.flock(h, fcntl.LOCK_EX); h.write('locked'); h.flush()\\nwhile True: time.sleep(60)\"",
+                "subprocess.Popen([sys.executable, '-c', child_code, sys.argv[1]])",
+                "deadline = time.monotonic() + 5",
+                "p = pathlib.Path(sys.argv[1])",
+                "while (not p.exists() or p.read_text() != 'locked') and time.monotonic() < deadline: time.sleep(0.01)",
                 "print('parent-exiting', flush=True)",
             ]
         ),
@@ -176,7 +170,7 @@ def test_normal_parent_exit_does_not_leave_pipe_holding_background_child(
         [
             shlex.quote(sys.executable),
             shlex.quote(str(script)),
-            shlex.quote(str(pid_file)),
+            shlex.quote(str(process_lock)),
         ]
     )
 
@@ -185,7 +179,7 @@ def test_normal_parent_exit_does_not_leave_pipe_holding_background_child(
     assert result.timed_out is False
     assert result.managed_process_group_terminated is True
     assert "parent-exiting" in result.stdout
-    _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+    assert_descendant_lock_released(process_lock)
 
 
 def test_windows_timeout_always_invokes_taskkill_for_the_tree(monkeypatch) -> None:

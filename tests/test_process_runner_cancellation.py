@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import threading
 import time
@@ -13,23 +13,30 @@ from harness.tools.process_runner import (
     _supervisor_exit_confirms_cleanup,
     run_bounded_shell,
 )
+from tests.process_test_support import assert_descendant_lock_released
 
 
-def _pid_exists(pid: int) -> bool:
+def test_descendant_lock_assertion_rejects_a_live_owner(tmp_path: Path) -> None:
+    process_lock = tmp_path / "live-owner.lock"
+    child_code = (
+        "import fcntl,pathlib,sys,time; "
+        "h=pathlib.Path(sys.argv[1]).open('w'); "
+        "fcntl.flock(h, fcntl.LOCK_EX); h.write('locked'); h.flush(); "
+        "time.sleep(60)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", child_code, str(process_lock)])
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _wait_for_pid_exit(pid: int, timeout: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout
-    while _pid_exists(pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert not _pid_exists(pid)
+        deadline = time.monotonic() + 3
+        while (
+            (not process_lock.exists() or not process_lock.read_text())
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        with pytest.raises(AssertionError, match="still owns"):
+            assert_descendant_lock_released(process_lock, timeout=0.2)
+    finally:
+        child.kill()
+        child.wait(timeout=3)
 
 
 def test_only_preliminary_supervisor_timeout_status_is_accepted() -> None:
@@ -51,16 +58,19 @@ def test_managed_command_normal_exit_124_is_not_cleanup_attestation() -> None:
     assert result.managed_process_group_terminated is False
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX descendant cancellation assertion")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descendant cancellation assertion")
 def test_cancellation_terminates_and_reaps_descendant_tree(tmp_path: Path) -> None:
-    pid_file = tmp_path / "child.pid"
+    process_lock = tmp_path / "child.lock"
     script = tmp_path / "spawn_child.py"
     script.write_text(
         "\n".join(
             [
-                "import pathlib, subprocess, sys, time",
-                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
-                "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')",
+                "import subprocess, sys, time",
+                "child_code = \"import fcntl,pathlib,sys,time; h=pathlib.Path(sys.argv[1]).open('w'); fcntl.flock(h, fcntl.LOCK_EX); h.write('locked'); h.flush()\\nwhile True: time.sleep(60)\"",
+                "subprocess.Popen([sys.executable, '-c', child_code, sys.argv[1]])",
+                "deadline = time.monotonic() + 5",
+                "p = __import__('pathlib').Path(sys.argv[1])",
+                "while (not p.exists() or p.read_text() != 'locked') and time.monotonic() < deadline: time.sleep(0.01)",
                 "print('child-ready', flush=True)",
                 "time.sleep(60)",
             ]
@@ -72,14 +82,17 @@ def test_cancellation_terminates_and_reaps_descendant_tree(tmp_path: Path) -> No
         [
             shlex.quote(sys.executable),
             shlex.quote(str(script)),
-            shlex.quote(str(pid_file)),
+            shlex.quote(str(process_lock)),
         ]
     )
     cancel = threading.Event()
 
     def request_cancel() -> None:
         deadline = time.monotonic() + 3
-        while not pid_file.exists() and time.monotonic() < deadline:
+        while (
+            (not process_lock.exists() or process_lock.read_text() != "locked")
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.01)
         cancel.set()
 
@@ -96,4 +109,4 @@ def test_cancellation_terminates_and_reaps_descendant_tree(tmp_path: Path) -> No
     assert result.timed_out is False
     assert result.managed_process_group_terminated is True
     assert "child-ready" in result.stdout
-    _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+    assert_descendant_lock_released(process_lock)

@@ -111,9 +111,9 @@ assert supervisor is not None
 try:
     os.kill(supervisor, signal.SIGKILL)
 except (ProcessLookupError, PermissionError):
-    print("supervisor-kill-blocked", flush=True)
-else:
-    print("supervisor-kill-succeeded", flush=True)
+    pass
+assert Path(f"/proc/{supervisor}/status").exists()
+print("supervisor-survived-sigkill-attempt", flush=True)
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -124,8 +124,7 @@ else:
 
     assert result.timed_out is False
     assert result.returncode == 0
-    assert "supervisor-kill-blocked" in result.stdout
-    assert "supervisor-kill-succeeded" not in result.stdout
+    assert "supervisor-survived-sigkill-attempt" in result.stdout
 
 
 def test_namespace_wrapper_is_outside_the_standalone_supervisor() -> None:

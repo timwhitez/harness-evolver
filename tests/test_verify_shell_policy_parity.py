@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import shlex
 import sys
@@ -10,6 +9,7 @@ import pytest
 
 from harness.tools.shell import ShellTool
 from harness.tools.verify import VerifyTool
+from tests.process_test_support import assert_descendant_lock_released
 
 
 @pytest.mark.parametrize(
@@ -56,23 +56,6 @@ def test_verify_adds_verifier_specific_semantic_failure_after_shell_authorizatio
     assert "unmet threshold" in verify_result.error
 
 
-def _pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _wait_for_pid_exit(pid: int, timeout: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout
-    while _pid_exists(pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert not _pid_exists(pid)
-
-
 @pytest.mark.skipif(
     not sys.platform.startswith("linux") or not Path("/proc/self/stat").is_file(),
     reason="Linux subreaper descendant assertion",
@@ -80,17 +63,18 @@ def _wait_for_pid_exit(pid: int, timeout: float = 3.0) -> None:
 def test_shell_timeout_preserves_issue19_cleanup_after_child_clears_environment(
     tmp_path: Path,
 ) -> None:
-    pid_file = tmp_path / "setsid-child.pid"
+    process_lock = tmp_path / "setsid-child.lock"
     child_code = "\n".join(
         [
-            "import os, pathlib, signal, sys, time",
+            "import fcntl, os, pathlib, signal, sys, time",
             # Clearing inherited variables proves cleanup does not depend on the
             # earlier environment-token implementation.
             "os.environ.clear()",
             "os.setsid()",
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
-            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')",
-            "time.sleep(60)",
+            "h = pathlib.Path(sys.argv[1]).open('w')",
+            "fcntl.flock(h, fcntl.LOCK_EX); h.write('locked'); h.flush()",
+            "while True: time.sleep(60)",
         ]
     )
     script = tmp_path / "spawn_setsid_child.py"
@@ -100,7 +84,8 @@ def test_shell_timeout_preserves_issue19_cleanup_after_child_clears_environment(
                 "import pathlib, subprocess, sys, time",
                 f"subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]])",
                 "deadline = time.monotonic() + 5",
-                "while not pathlib.Path(sys.argv[1]).exists() and time.monotonic() < deadline: time.sleep(0.01)",
+                "p = pathlib.Path(sys.argv[1])",
+                "while (not p.exists() or p.read_text() != 'locked') and time.monotonic() < deadline: time.sleep(0.01)",
                 "print('setsid-child-ready', flush=True)",
                 "time.sleep(60)",
             ]
@@ -111,7 +96,7 @@ def test_shell_timeout_preserves_issue19_cleanup_after_child_clears_environment(
         [
             shlex.quote(sys.executable),
             shlex.quote(str(script)),
-            shlex.quote(str(pid_file)),
+            shlex.quote(str(process_lock)),
         ]
     )
 
@@ -120,4 +105,4 @@ def test_shell_timeout_preserves_issue19_cleanup_after_child_clears_environment(
     assert result.success is False
     assert result.metadata["timed_out"] is True
     assert "setsid-child-ready" in result.output
-    _wait_for_pid_exit(int(pid_file.read_text(encoding="utf-8")))
+    assert_descendant_lock_released(process_lock)
