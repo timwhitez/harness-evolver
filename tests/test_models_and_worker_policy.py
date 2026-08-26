@@ -197,7 +197,10 @@ def test_role_timeout_seconds_is_provider_request_only(monkeypatch):
     assert kwargs["timeout"] == 7
 
     repo = Path(__file__).resolve().parents[1]
-    config_text = (repo / "harness" / "config.py").read_text()
+    config_text = "\n".join(
+        (repo / path).read_text()
+        for path in ("harness/config.py", "harness/_config_issue9_base.py")
+    )
     assert "Single model-provider request timeout" in config_text
     assert "loop stop condition" in config_text
 
@@ -345,8 +348,14 @@ def test_python_agent_cancel_current_run_terminates_active_rust_worker(
 
 
 def test_harbor_adapter_does_not_forward_max_turns_as_worker_limit():
-    adapter_source = Path(__file__).resolve().parents[1] / "bench" / "harbor_adapter.py"
-    text = adapter_source.read_text()
+    repo = Path(__file__).resolve().parents[1]
+    text = "\n".join(
+        (repo / path).read_text()
+        for path in (
+            "bench/harbor_adapter.py",
+            "bench/_harbor_adapter_issue16_base.py",
+        )
+    )
 
     assert "max_turns_audit" in text
     assert "agent.max_turns =" not in text
@@ -373,8 +382,17 @@ def test_rust_worker_core_does_not_stop_on_turn_limit():
 def test_worker_loop_limit_fields_remain_recovery_metadata_only():
     repo = Path(__file__).resolve().parents[1]
     rust_text = (repo / "crates" / "hl-worker-core" / "src" / "main.rs").read_text()
-    agent_text = (repo / "bench" / "agent.py").read_text()
-    adapter_text = (repo / "bench" / "harbor_adapter.py").read_text()
+    agent_text = "\n".join(
+        (repo / path).read_text()
+        for path in ("bench/agent.py", "bench/_agent_bridge.py")
+    )
+    adapter_text = "\n".join(
+        (repo / path).read_text()
+        for path in (
+            "bench/harbor_adapter.py",
+            "bench/_harbor_adapter_issue16_base.py",
+        )
+    )
 
     forbidden_rust_snippets = [
         "state.turn_count >= state.max_turns",
@@ -482,7 +500,10 @@ def test_rust_worker_core_owns_dynamic_prompt_and_memory_policy():
         / "main.rs"
     )
 
-    agent_text = agent_source.read_text()
+    agent_text = "\n".join(
+        (agent_source.parents[1] / path).read_text()
+        for path in ("bench/agent.py", "bench/_agent_bridge.py")
+    )
     rust_text = rust_source.read_text()
 
     assert "prompt_policy" in agent_text

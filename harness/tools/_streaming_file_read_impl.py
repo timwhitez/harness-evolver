@@ -143,8 +143,9 @@ class FileReadTool(_base.FileReadTool):
     description: str = (
         "Stream a UTF-8 text file and return a bounded, line-numbered window. "
         "Offset and limit are 1-based; long lines and total output are capped. "
-        "Binary files, images, PDFs, invalid UTF-8, and an optional explicit "
-        "total-size cap are handled without full-file buffering."
+        "Binary files, images, PDFs, and invalid UTF-8 are rejected explicitly "
+        "without full-file buffering; an optional explicit total-size cap is "
+        "enforced while streaming."
     )
     # Kept as an optional compatibility guard for the parent #24 API. The
     # streaming implementation imposes no total-file limit by default.

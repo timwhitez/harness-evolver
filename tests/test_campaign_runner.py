@@ -1085,13 +1085,29 @@ def test_master_and_codex_loop_limit_values_are_not_runtime_timeouts():
     regression_source = (REPO_ROOT / "scripts" / "regression_check.py").read_text()
     codex_source = (REPO_ROOT / "meta" / "codex_update.py").read_text()
     loop_source = (REPO_ROOT / "hl" / "loop.py").read_text()
-    harbor_source = (REPO_ROOT / "bench" / "harbor.py").read_text()
-    agent_source = (REPO_ROOT / "bench" / "agent.py").read_text()
+    harbor_source = "\n".join(
+        (REPO_ROOT / path).read_text()
+        for path in (
+            "bench/harbor.py",
+            "bench/_harbor_issue5_logic.py",
+            "bench/_harbor_issue9_base.py",
+        )
+    )
+    agent_source = "\n".join(
+        (REPO_ROOT / path).read_text()
+        for path in ("bench/agent.py", "bench/_agent_bridge.py")
+    )
     rust_worker_source = (
         REPO_ROOT / "crates" / "hl-worker-core" / "src" / "main.rs"
     ).read_text()
     missions_source = (REPO_ROOT / "meta" / "missions.py").read_text()
-    harbor_adapter_source = (REPO_ROOT / "bench" / "harbor_adapter.py").read_text()
+    harbor_adapter_source = "\n".join(
+        (REPO_ROOT / path).read_text()
+        for path in (
+            "bench/harbor_adapter.py",
+            "bench/_harbor_adapter_issue16_base.py",
+        )
+    )
     context_isolation_source = (
         REPO_ROOT / "harness" / "context" / "isolation.py"
     ).read_text()
@@ -1308,7 +1324,10 @@ def test_worker_master_and_sub_agent_sources_have_no_time_round_attempt_caps():
     for limit_term in ("max_turns", "timeout_seconds", "deadline", "round_limit"):
         assert limit_term not in worker_loop
 
-    agent_source = (REPO_ROOT / "bench" / "agent.py").read_text()
+    agent_source = "\n".join(
+        (REPO_ROOT / path).read_text()
+        for path in ("bench/agent.py", "bench/_agent_bridge.py")
+    )
     assert "process.wait(timeout=" not in agent_source
     assert '"max_turns_audit": self.max_turns_audit' in agent_source
     assert '"max_turns": self.max_turns' not in agent_source
@@ -1327,10 +1346,26 @@ def test_agent_loop_sources_have_no_time_round_attempt_or_cap_stop_paths():
             ]
         ),
         "validation_regression_sub_agent": (REPO_ROOT / "scripts" / "regression_check.py").read_text(),
-        "harbor": (REPO_ROOT / "bench" / "harbor.py").read_text(),
-        "harbor_adapter": (REPO_ROOT / "bench" / "harbor_adapter.py").read_text(),
+        "harbor": "\n".join(
+            (REPO_ROOT / path).read_text()
+            for path in (
+                "bench/harbor.py",
+                "bench/_harbor_issue5_logic.py",
+                "bench/_harbor_issue9_base.py",
+            )
+        ),
+        "harbor_adapter": "\n".join(
+            (REPO_ROOT / path).read_text()
+            for path in (
+                "bench/harbor_adapter.py",
+                "bench/_harbor_adapter_issue16_base.py",
+            )
+        ),
         "task_catalog": (REPO_ROOT / "bench" / "tasks.py").read_text(),
-        "worker_python": (REPO_ROOT / "bench" / "agent.py").read_text(),
+        "worker_python": "\n".join(
+            (REPO_ROOT / path).read_text()
+            for path in ("bench/agent.py", "bench/_agent_bridge.py")
+        ),
         "worker_rust": (
             REPO_ROOT / "crates" / "hl-worker-core" / "src" / "main.rs"
         ).read_text(),
