@@ -12,6 +12,7 @@ import re
 from typing import Any, Iterator, TextIO
 
 from harness.tools.canonical_path_guard import guard_canonical_path_strings
+from harness.tools.safe_path_io import SafePathError
 from harness.tools.stable_tree import StableTreeError, iter_stable_regular_files
 
 _base = importlib.import_module("harness.tools._search_issue13_base")
@@ -194,6 +195,8 @@ def _python_grep(
     total_matches = 0
     input_line_limit_exceeded = False
     text_decode_error = False
+    canonical_path_failure = False
+    hardlink_alias_blocked = False
 
     def record_failure(message: object) -> None:
         nonlocal failure_count
@@ -255,7 +258,11 @@ def _python_grep(
                     record_failure(f"{candidate}: invalid UTF-8 text: {exc}")
                 except OSError as exc:
                     record_failure(f"{candidate}: {exc}")
-    except (OSError, StableTreeError) as exc:
+    except (SafePathError, StableTreeError) as exc:
+        canonical_path_failure = True
+        hardlink_alias_blocked = "multiply linked regular file" in str(exc).lower()
+        record_failure(f"{search_path}: {exc}")
+    except OSError as exc:
         record_failure(f"{search_path}: {exc}")
 
     omitted_count = max(0, total_matches - len(returned))
@@ -287,6 +294,13 @@ def _python_grep(
         metadata["input_line_limit_exceeded"] = True
     if text_decode_error:
         metadata["text_decode_error"] = True
+    if canonical_path_failure:
+        metadata.update(
+            policy_guard_metadata(
+                "canonical_path_guard",
+                hardlink_alias_blocked=hardlink_alias_blocked,
+            )
+        )
     if failure_count:
         metadata["search_failed"] = True
         metadata["partial_results_available"] = bool(returned)
