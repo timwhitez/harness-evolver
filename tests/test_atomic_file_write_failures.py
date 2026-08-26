@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from bench.harbor_adapter import _ATOMIC_WRITE_SCRIPT
+from harness.tools import safe_path_io
 from harness.tools.file_write import FileWriteTool
 
 
@@ -22,7 +23,7 @@ def test_local_fsync_failure_preserves_original_and_cleans_temp(
     def fail_fsync(descriptor: int) -> None:
         raise OSError("injected fsync failure")
 
-    monkeypatch.setattr("harness.tools.file_write.os.fsync", fail_fsync)
+    monkeypatch.setattr(safe_path_io.os, "fsync", fail_fsync)
     result = FileWriteTool().execute(str(target), "new")
 
     assert result.success is False

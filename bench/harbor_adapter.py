@@ -21,6 +21,8 @@ from bench._streaming_harbor_read import (
     _STREAMING_READ_PYTHON,
 )
 
+_ATOMIC_WRITE_SCRIPT = _base._ATOMIC_WRITE_SCRIPT
+
 
 class HLWorkerHarborAgent(_base.HLWorkerHarborAgent):
     """Build a registry containing the canonical-path protected tool classes."""
@@ -58,6 +60,7 @@ __all__ = [
     "HarborGrepTool",
     "HarborGlobTool",
     "_STREAMING_READ_PYTHON",
+    "_ATOMIC_WRITE_SCRIPT",
     "_HARBOR_GREP_COUNTING_PYTHON",
     "_GLOB_FALLBACK_SCRIPT",
 ]
