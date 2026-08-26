@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -645,6 +646,12 @@ class CodexUpdateEngine(UpdateEngine):
             )
         elif self.codex_config_home:
             env["CODEX_HOME"] = self._configured_path(self.codex_config_home)
+        interpreter_bin = str(Path(sys.executable).absolute().parent)
+        path_entries = env.get("PATH", "").split(os.pathsep)
+        if interpreter_bin not in path_entries:
+            env["PATH"] = os.pathsep.join(
+                [interpreter_bin, *[entry for entry in path_entries if entry]]
+            )
         return env
 
     def _configured_path(self, value: str) -> str:

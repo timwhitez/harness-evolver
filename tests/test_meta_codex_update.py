@@ -14578,6 +14578,17 @@ def test_codex_update_loads_env_file_for_subprocess(tmp_path):
     assert (tmp_path / "harness" / "tool.py").read_text() == "ENV_VALUE = 'from-env-file'\n"
 
 
+def test_codex_update_subprocess_path_includes_active_interpreter(monkeypatch, tmp_path):
+    caller_path = os.pathsep.join(["/usr/local/sbin", "/usr/bin", "/bin"])
+    monkeypatch.setenv("PATH", caller_path)
+    engine = CodexUpdateEngine(repo_root=tmp_path, events_dir=tmp_path / "diffs")
+
+    subprocess_path = engine._subprocess_env()["PATH"].split(os.pathsep)
+
+    assert subprocess_path[0] == str(pathlib.Path(sys.executable).absolute().parent)
+    assert os.pathsep.join(subprocess_path[1:]) == caller_path
+
+
 def test_codex_update_sets_configured_home_for_subprocess(tmp_path):
     _init_repo(tmp_path)
     validation = tmp_path / "validation_ok.py"
