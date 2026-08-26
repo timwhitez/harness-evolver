@@ -8,6 +8,14 @@ import pytest
 from harness.tools import process_runner
 
 
+def test_process_runner_facade_retains_namespace_module_reference() -> None:
+    assert (
+        process_runner._base.__name__
+        == "harness.tools._process_runner_issue19_namespace_base"
+    )
+    assert process_runner._runtime is process_runner._base._base
+
+
 @pytest.mark.parametrize(
     "argv",
     [
