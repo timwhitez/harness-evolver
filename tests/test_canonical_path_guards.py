@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from bench.harbor_adapter import HarborFileReadTool, HarborGlobTool
+from bench.harbor_adapter import HarborFileReadTool, HarborFileWriteTool, HarborGlobTool
 from harness.tools.file_edit import FileEditTool
 from harness.tools.file_read import FileReadTool
 from harness.tools.file_write import FileWriteTool
@@ -172,6 +172,52 @@ def test_harbor_parent_traversal_fails_before_any_environment_call(tmp_path: Pat
 
     assert result.success is False
     assert result.metadata["blocked_by"] == "canonical_path_guard"
+
+
+def test_harbor_write_rechecks_size_policy_on_canonical_alias(tmp_path: Path) -> None:
+    alias = tmp_path / "alias" / "gpt2.c"
+    resolved = tmp_path / "actual" / "app" / "gpt2.c"
+    tool = object.__new__(HarborFileWriteTool)
+    tool._guard_environment_path = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (str(resolved), None)
+    )
+    tool._run_secure_python = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("policy rejection must precede publication")
+        )
+    )
+
+    result = tool.execute(str(alias), "x" * 5000)
+
+    assert result.success is False
+    assert result.metadata["blocked_by"] == "deliverable_size_cap_write_guard"
+    assert result.metadata["path"] == str(resolved)
+    assert result.metadata["content_bytes"] == 5000
+    assert not resolved.exists()
+
+
+def test_harbor_write_rechecks_staged_policy_on_canonical_alias(tmp_path: Path) -> None:
+    alias = tmp_path / "benign.txt"
+    resolved = tmp_path / "script.py"
+    content = (
+        "import urllib.request\n"
+        "urllib.request.urlopen('https://files.pythonhosted.org/pkg.whl')\n"
+    )
+    tool = object.__new__(HarborFileWriteTool)
+    tool._guard_environment_path = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (str(resolved), None)
+    )
+    tool._run_secure_python = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("policy rejection must precede publication")
+        )
+    )
+
+    result = tool.execute(str(alias), content)
+
+    assert result.success is False
+    assert result.metadata["blocked_by"] == "staged_dependency_script_guard"
+    assert not resolved.exists()
 
 
 def test_harbor_glob_revalidates_every_container_match(tmp_path: Path) -> None:

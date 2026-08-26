@@ -4420,7 +4420,7 @@ def test_harbor_shell_detects_packaging_backend_failure_hidden_by_pipeline():
     assert len(environment.calls) == 1
 
 
-def test_harbor_write_tool_does_not_require_target_python(tmp_path):
+def test_harbor_write_tool_uses_target_python_for_nofollow(tmp_path):
     class FakeEnvironment:
         def __init__(self):
             self.calls = []
@@ -4468,9 +4468,10 @@ def test_harbor_write_tool_does_not_require_target_python(tmp_path):
 
     assert result.success is True
     assert path.read_text() == "line 1\nquoted '$PATH'\n"
-    assert environment.calls
-    assert "python3" not in environment.calls[0]["command"]
-    assert "base64" in environment.calls[0]["command"]
+    assert len(environment.calls) == 2
+    assert all(call["command"].startswith("python3 ") for call in environment.calls)
+    assert result.metadata["canonical_path_checked"] is True
+    assert result.metadata["nofollow_io"] is True
 
 
 def test_harbor_write_tool_blocks_staged_dependency_script_before_exec(tmp_path):
@@ -4625,8 +4626,8 @@ def test_harbor_write_tool_blocks_staged_dependency_script_after_append(tmp_path
     assert result.metadata["blocked_by"] == "staged_dependency_script_guard"
     assert "hand-written dependency downloads" in result.error
     assert path.read_text() == original
-    assert len(environment.calls) == 1
-    assert environment.calls[0]["command"].startswith("python3 ")
+    assert len(environment.calls) == 2
+    assert all(call["command"].startswith("python3 ") for call in environment.calls)
 
 
 def test_harbor_write_tool_blocks_gpt2_codegolf_append_after_composed_size(tmp_path):
@@ -4682,8 +4683,8 @@ def test_harbor_write_tool_blocks_gpt2_codegolf_append_after_composed_size(tmp_p
     assert result.metadata["blocked_by"] == "deliverable_size_cap_write_guard"
     assert result.metadata["content_bytes"] == 5010
     assert path.read_text() == original
-    assert len(environment.calls) == 1
-    assert environment.calls[0]["command"].startswith("python3 ")
+    assert len(environment.calls) == 2
+    assert all(call["command"].startswith("python3 ") for call in environment.calls)
 
 
 def test_harbor_write_tool_blocks_host_hl_memory_before_exec():
@@ -4717,7 +4718,7 @@ def test_harbor_write_tool_blocks_host_hl_memory_before_exec():
     assert environment.calls == []
 
 
-def test_harbor_read_tool_falls_back_when_target_lacks_python(tmp_path):
+def test_harbor_read_tool_fails_closed_when_target_lacks_python(tmp_path):
     class FakeEnvironment:
         def __init__(self):
             self.calls = []
@@ -4770,15 +4771,17 @@ def test_harbor_read_tool_falls_back_when_target_lacks_python(tmp_path):
         thread.join(timeout=5)
         loop.close()
 
-    assert result.success is True
-    assert "1\talpha" in result.output
-    assert "2\tbeta" in result.output
-    assert len(environment.calls) == 2
+    assert result.success is False
+    assert result.metadata["blocked_by"] == "canonical_path_guard"
+    assert result.metadata["nofollow_io_unavailable"] is True
+    assert result.metadata["unsafe_shell_fallback_allowed"] is False
+    assert len(environment.calls) == 3
     assert environment.calls[0]["command"].startswith("python3 ")
-    assert "awk" in environment.calls[1]["command"]
+    assert environment.calls[1]["command"].startswith("sh -c ")
+    assert environment.calls[2]["command"].startswith("python3 ")
 
 
-def test_harbor_read_tool_falls_back_when_missing_python_is_stdout(tmp_path):
+def test_harbor_read_tool_fails_closed_when_missing_python_is_stdout(tmp_path):
     class FakeEnvironment:
         def __init__(self):
             self.calls = []
@@ -4831,12 +4834,14 @@ def test_harbor_read_tool_falls_back_when_missing_python_is_stdout(tmp_path):
         thread.join(timeout=5)
         loop.close()
 
-    assert result.success is True
-    assert "1\t@prefix ex:" in result.output
-    assert "2\tex:a ex:b ex:c ." in result.output
-    assert len(environment.calls) == 2
+    assert result.success is False
+    assert result.metadata["blocked_by"] == "canonical_path_guard"
+    assert result.metadata["nofollow_io_unavailable"] is True
+    assert result.metadata["unsafe_shell_fallback_allowed"] is False
+    assert len(environment.calls) == 3
     assert environment.calls[0]["command"].startswith("python3 ")
-    assert "awk" in environment.calls[1]["command"]
+    assert environment.calls[1]["command"].startswith("sh -c ")
+    assert environment.calls[2]["command"].startswith("python3 ")
 
 
 def test_harbor_glob_tool_falls_back_when_target_lacks_python(tmp_path):
@@ -4887,7 +4892,7 @@ def test_harbor_glob_tool_falls_back_when_target_lacks_python(tmp_path):
             loop=loop,
             timeout_seconds=5,
         )
-        result = tool.execute("*.c", path=str(tmp_path))
+        result = tool.execute("src/*.c", path=str(tmp_path))
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
@@ -4895,12 +4900,14 @@ def test_harbor_glob_tool_falls_back_when_target_lacks_python(tmp_path):
 
     assert result.success is True
     assert str(target) in result.output
-    assert len(environment.calls) == 2
+    assert len(environment.calls) == 4
     assert environment.calls[0]["command"].startswith("python3 ")
-    assert "find" in environment.calls[1]["command"]
+    assert environment.calls[1]["command"].startswith("sh -c ")
+    assert environment.calls[2]["command"].startswith("python3 ")
+    assert "bash -c" in environment.calls[3]["command"]
 
 
-def test_harbor_edit_tool_falls_back_when_target_lacks_python(tmp_path):
+def test_harbor_edit_tool_fails_closed_when_target_lacks_python(tmp_path):
     class FakeEnvironment:
         def __init__(self):
             self.calls = []
@@ -4953,14 +4960,14 @@ def test_harbor_edit_tool_falls_back_when_target_lacks_python(tmp_path):
         thread.join(timeout=5)
         loop.close()
 
-    assert result.success is True
-    assert "replaced 1 occurrence" in result.output
-    assert path.read_text() == "return 0;\n"
-    assert len(environment.calls) == 4
+    assert result.success is False
+    assert result.metadata["blocked_by"] == "canonical_path_guard"
+    assert result.metadata["nofollow_io_unavailable"] is True
+    assert path.read_text() == "return 1;\n"
+    assert len(environment.calls) == 3
     assert environment.calls[0]["command"].startswith("python3 ")
-    assert "cat" in environment.calls[1]["command"]
+    assert environment.calls[1]["command"].startswith("sh -c ")
     assert environment.calls[2]["command"].startswith("python3 ")
-    assert "perl" in environment.calls[3]["command"]
 
 
 def test_harbor_edit_tool_blocks_staged_dependency_script_before_exec(tmp_path):
@@ -5115,8 +5122,8 @@ def test_harbor_edit_tool_blocks_staged_dependency_script_after_composed_edit(tm
     assert result.metadata["blocked_by"] == "staged_dependency_script_guard"
     assert "hand-written dependency downloads" in result.error
     assert path.read_text() == original
-    assert len(environment.calls) == 1
-    assert environment.calls[0]["command"].startswith("python3 ")
+    assert len(environment.calls) == 2
+    assert all(call["command"].startswith("python3 ") for call in environment.calls)
 
 
 def test_harbor_edit_tool_blocks_gpt2_codegolf_size_cap_after_composed_edit(tmp_path):
@@ -5173,8 +5180,8 @@ def test_harbor_edit_tool_blocks_gpt2_codegolf_size_cap_after_composed_edit(tmp_
     assert result.metadata["content_bytes"] > 5000
     assert "under 5000 bytes" in result.error
     assert path.read_text() == original
-    assert len(environment.calls) == 1
-    assert environment.calls[0]["command"].startswith("python3 ")
+    assert len(environment.calls) == 2
+    assert all(call["command"].startswith("python3 ") for call in environment.calls)
 
 
 def test_harbor_edit_tool_blocks_host_hl_memory_before_exec():

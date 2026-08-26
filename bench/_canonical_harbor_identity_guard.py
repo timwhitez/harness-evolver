@@ -451,7 +451,10 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
                 output="",
                 error=f"Worker file policy blocked write: {size_reason}",
                 metadata=_v2.policy_guard_metadata(
-                    "deliverable_size_cap_write_guard"
+                    "deliverable_size_cap_write_guard",
+                    path=resolved,
+                    content_bytes=len(effective_content.encode("utf-8")),
+                    limit_bytes=5000,
                 ),
             )
 
@@ -485,9 +488,35 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
 class HarborFileEditTool(_base.HarborFileEditTool):
     '''Retain the exact-inode edit script and expose publication durability.'''
 
-    def execute(self, *args: Any, **kwargs: Any) -> _v2.ToolResult:
+    def execute(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+        **kwargs: Any,
+    ) -> _v2.ToolResult:
+        staged_reason = _v2.staged_dependency_script_reason(
+            file_path,
+            new_string,
+        )
+        if staged_reason:
+            return _v2.ToolResult(
+                success=False,
+                output="",
+                error=f"Worker file policy blocked edit: {staged_reason}",
+                metadata=_v2.policy_guard_metadata(
+                    "staged_dependency_script_guard"
+                ),
+            )
         return _publication_metadata(
-            super().execute(*args, **kwargs),
+            super().execute(
+                file_path,
+                old_string,
+                new_string,
+                replace_all=replace_all,
+                **kwargs,
+            ),
             identity_verified=True,
         )
 

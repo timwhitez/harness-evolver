@@ -110,8 +110,43 @@ for needle, replacement, contract in (
     )
 
 
+def _static_write_policy_failure(
+    path: str,
+    content: str,
+) -> _base._v2.ToolResult | None:
+    staged_reason = _base._v2.staged_dependency_script_reason(path, content)
+    if staged_reason:
+        return _base._v2.ToolResult(
+            success=False,
+            output="",
+            error=f"Worker file policy blocked write: {staged_reason}",
+            metadata=_base._v2.policy_guard_metadata(
+                "staged_dependency_script_guard"
+            ),
+        )
+    size_reason = _base._v2.deliverable_size_cap_write_reason(path, content)
+    if size_reason:
+        return _base._v2.ToolResult(
+            success=False,
+            output="",
+            error=f"Worker file policy blocked write: {size_reason}",
+            metadata=_base._v2.policy_guard_metadata(
+                "deliverable_size_cap_write_guard",
+                path=path,
+                content_bytes=len(content.encode("utf-8")),
+                limit_bytes=5000,
+            ),
+        )
+    return None
+
+
 class HarborFileWriteTool(_base.HarborFileWriteTool):
     """Publish a pure overwrite only against the observed regular entry."""
+
+    description = (
+        "Atomically write text content inside the TerminalBench environment "
+        "using race-safe Python O_NOFOLLOW path authorization."
+    )
 
     def execute(
         self,
@@ -120,6 +155,13 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
         append: bool = False,
         **kwargs: Any,
     ) -> _base._v2.ToolResult:
+        static_failure = _static_write_policy_failure(
+            file_path,
+            content,
+        )
+        if static_failure is not None:
+            return static_failure
+
         # Append already uses the inherited snapshot plus exact-inode
         # conditional publication path.
         if append:
@@ -137,30 +179,12 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
         )
         if failure is not None:
             return failure
-
-        staged_reason = _base._v2.staged_dependency_script_reason(resolved, content)
-        if staged_reason:
-            return _base._v2.ToolResult(
-                success=False,
-                output="",
-                error=f"Worker file policy blocked write: {staged_reason}",
-                metadata=_base._v2.policy_guard_metadata(
-                    "staged_dependency_script_guard"
-                ),
-            )
-        size_reason = _base._v2.deliverable_size_cap_write_reason(
+        resolved_static_failure = _static_write_policy_failure(
             resolved,
             content,
         )
-        if size_reason:
-            return _base._v2.ToolResult(
-                success=False,
-                output="",
-                error=f"Worker file policy blocked write: {size_reason}",
-                metadata=_base._v2.policy_guard_metadata(
-                    "deliverable_size_cap_write_guard"
-                ),
-            )
+        if resolved_static_failure is not None:
+            return resolved_static_failure
 
         result = self._run_secure_python(
             _SECURE_ATOMIC_WRITE,
