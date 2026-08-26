@@ -203,6 +203,85 @@ def test_single_attempt_keeps_the_existing_parser_path(tmp_path: Path) -> None:
     assert "multi_attempt_aggregate" not in result.metadata
 
 
+def test_verified_raw_verifier_text_is_normalized_in_every_attempt(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "job"
+    attempts = [
+        _attempt(
+            f"example-task__attempt-{index}",
+            0.0,
+            input_tokens=1,
+            output_tokens=1,
+            cost_usd=0.01,
+        )
+        for index in (1, 2)
+    ]
+    _write_job(job_dir, attempts)
+    for attempt in attempts:
+        verifier = job_dir / str(attempt["trial_name"]) / "verifier"
+        verifier.mkdir()
+        (verifier / "test-stdout.txt").write_text(
+            "Verifier runtime network preparation timed out after 90 seconds\n",
+            encoding="utf-8",
+        )
+
+    result = HarborRunner().parse_job_dir(job_dir, task_id="example-task")
+
+    assert result.verified is True
+    assert result.metadata["infra_error_detected"] is False
+    for snapshot in result.metadata["attempt_results"]:
+        metadata = snapshot["metadata"]
+        assert metadata["verifier_infra_error"] is False
+        assert metadata["infra_error_detected"] is False
+        assert "score_exclusion_reason" not in metadata
+
+
+def test_mixed_aggregate_normalizes_each_untrusted_attempt_marker(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "job"
+    verified = _attempt(
+        "example-task__attempt-1",
+        0.0,
+        input_tokens=1,
+        output_tokens=1,
+        cost_usd=0.01,
+    )
+    errored = _attempt(
+        "example-task__attempt-2",
+        None,
+        input_tokens=1,
+        output_tokens=1,
+        cost_usd=0.01,
+        exception={
+            "exception_type": "RuntimeError",
+            "exception_message": "Command timed out after 90 seconds",
+            "exception_traceback": (
+                "bench/network_environment.py in _prepare_verifier_runtime"
+            ),
+        },
+    )
+    attempts = [verified, errored]
+    _write_job(job_dir, attempts)
+    verifier = job_dir / str(verified["trial_name"]) / "verifier"
+    verifier.mkdir()
+    (verifier / "test-stdout.txt").write_text(
+        "Verifier runtime network preparation timed out after 90 seconds\n",
+        encoding="utf-8",
+    )
+
+    result = HarborRunner().parse_job_dir(job_dir, task_id="example-task")
+
+    assert result.verified is False
+    assert result.metadata["infra_error_detected"] is False
+    for snapshot in result.metadata["attempt_results"]:
+        metadata = snapshot["metadata"]
+        assert metadata["verifier_infra_error"] is False
+        assert metadata["infra_error_detected"] is False
+        assert "score_exclusion_reason" not in metadata
+
+
 def test_missing_top_level_result_recovers_and_aggregates_subdirectory_attempts(
     tmp_path: Path,
 ) -> None:
