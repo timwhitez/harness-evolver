@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tomllib
 import venv
 import zipfile
+from pathlib import Path
 
 from setuptools.discovery import PEP420PackageFinder
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MODULES = {
@@ -118,6 +118,20 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
     ).create(environment)
     scripts_dir = environment / ("Scripts" if os.name == "nt" else "bin")
     python = scripts_dir / ("python.exe" if os.name == "nt" else "python")
+    nested_purelib = Path(
+        subprocess.run(
+            [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    parent_purelib = Path(sysconfig.get_paths()["purelib"]).resolve()
+    (nested_purelib / "_harness_test_parent_dependencies.pth").write_text(
+        f"{parent_purelib}\n",
+        encoding="utf-8",
+    )
     pip = [str(python), "-m", "pip"]
     installed = subprocess.run(
         [*pip, "install", "--no-deps", "--no-index", str(wheel)],
