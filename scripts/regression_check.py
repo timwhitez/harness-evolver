@@ -11,7 +11,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from hl.memory import FileSystemMemory
+    from hl.types import RegressionSnapshot
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -204,7 +208,6 @@ def main() -> int:
     from bench.harbor import HarborRunner
     from hl.memory import FileSystemMemory
     from hl.model_scope import model_scope_from_agent_config
-    from hl.types import RegressionSnapshot
     from scripts.run_trial import (
         _apply_execution_defaults,
         _require_worker_api_key,
@@ -384,7 +387,7 @@ def main() -> int:
                 result,
                 model_scope=model_scope,
             )
-        if memory.check_regression(snapshot.task_id, result):
+        if memory.snapshot_validation_failed(snapshot, result):
             failed.append(snapshot.task_id)
 
     if failed:

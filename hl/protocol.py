@@ -161,6 +161,15 @@ class MemoryStore(ABC):
         ...
 
     @abstractmethod
+    def snapshot_validation_failed(
+        self,
+        snapshot: RegressionSnapshot,
+        result: TrialResult,
+    ) -> bool:
+        """Return True when a selected snapshot fails its verifier contract."""
+        ...
+
+    @abstractmethod
     def save_patch(self, patch: HarnessPatch) -> str:
         """Save a harness edit patch with its diff and rationale."""
         ...

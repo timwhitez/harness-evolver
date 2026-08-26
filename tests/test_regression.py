@@ -6,6 +6,8 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 
+import pytest
+
 from hl.memory import FileSystemMemory
 from hl.model_scope import model_scope_from_config
 from hl.types import TrialResult, TrialStatus, RegressionSnapshot, TaskDomain, TaskDifficulty
@@ -560,3 +562,131 @@ roles:
                 "model_scope": scope,
             }
         ]
+
+    @pytest.mark.parametrize(
+        (
+            "status",
+            "score",
+            "verified",
+            "expected_exit_code",
+            "expected_message",
+            "expected_failures",
+        ),
+        [
+            (
+                TrialStatus.FAILED,
+                0.0,
+                True,
+                1,
+                "Regressions detected:\n- pending-task",
+                1,
+            ),
+            (
+                TrialStatus.PASSED,
+                1.0,
+                True,
+                0,
+                "Regression lane smoke passed for 1 snapshot(s).",
+                0,
+            ),
+        ],
+    )
+    def test_regression_check_enforces_pending_snapshot_validation(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        status,
+        score,
+        verified,
+        expected_exit_code,
+        expected_message,
+        expected_failures,
+    ):
+        from scripts import regression_check as regression_check_module
+
+        memory_path = tmp_path / "trials"
+        memory = FileSystemMemory(base_path=str(memory_path))
+        models_path = tmp_path / "models.yaml"
+        models_path.write_text(
+            """
+roles:
+  pending_worker:
+    provider: openai_compatible
+    base_url: https://api.example/v1
+    api_key_env: TEST_API_KEY
+    model: pending-test-model
+    reasoning:
+      effort: none
+    max_output_tokens: 8000
+"""
+        )
+        model_config = {
+            "provider": "openai_compatible",
+            "base_url": "https://api.example/v1",
+            "model": "pending-test-model",
+            "reasoning_effort": "none",
+            "max_output_tokens": "8000",
+        }
+        scope = model_scope_from_config(model_config)
+        memory.save_regression(
+            "pending-task",
+            RegressionSnapshot(
+                task_id="pending-task",
+                harness_version="0.1.0",
+                validation_status="pending",
+                source_summary_id="summary-1",
+                model_scope=scope,
+            ),
+        )
+
+        class FakeHarborRunner:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def build_command(self, *args, **kwargs):
+                return object()
+
+            def run_task(self, *, task_id, agent_config, **kwargs):
+                return TrialResult(
+                    trial_id="pending-validation",
+                    task_id=task_id,
+                    task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                    task_difficulty=TaskDifficulty.EASY,
+                    status=status,
+                    score=score,
+                    verified=verified,
+                    model_used="pending-test-model",
+                    metadata={"model_config": model_config},
+                )
+
+        monkeypatch.setattr("bench.harbor.HarborRunner", FakeHarborRunner)
+        monkeypatch.setenv("TEST_API_KEY", "test-secret")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "regression_check.py",
+                "--task",
+                "pending-task",
+                "--snapshot-status",
+                "pending",
+                "--memory-path",
+                str(memory_path),
+                "--models-config",
+                str(models_path),
+                "--worker-role",
+                "pending_worker",
+            ],
+        )
+
+        assert regression_check_module.main() == expected_exit_code
+        assert expected_message in capsys.readouterr().out
+        persisted = memory.get_regression_snapshot(
+            "pending-task",
+            model_scope=scope,
+        )
+        assert persisted is not None
+        assert persisted.validation_status == "pending"
+        assert persisted.regression_runs == 1
+        assert persisted.regression_failures == expected_failures
