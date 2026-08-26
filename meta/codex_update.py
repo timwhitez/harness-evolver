@@ -647,11 +647,11 @@ class CodexUpdateEngine(UpdateEngine):
         elif self.codex_config_home:
             env["CODEX_HOME"] = self._configured_path(self.codex_config_home)
         interpreter_bin = str(Path(sys.executable).absolute().parent)
-        path_entries = env.get("PATH", "").split(os.pathsep)
-        if interpreter_bin not in path_entries:
-            env["PATH"] = os.pathsep.join(
-                [interpreter_bin, *[entry for entry in path_entries if entry]]
-            )
+        existing_path = env.get("PATH")
+        if existing_path is None:
+            env["PATH"] = interpreter_bin
+        elif interpreter_bin not in existing_path.split(os.pathsep):
+            env["PATH"] = interpreter_bin + os.pathsep + existing_path
         return env
 
     def _configured_path(self, value: str) -> str:
