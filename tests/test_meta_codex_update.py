@@ -14578,6 +14578,39 @@ def test_codex_update_loads_env_file_for_subprocess(tmp_path):
     assert (tmp_path / "harness" / "tool.py").read_text() == "ENV_VALUE = 'from-env-file'\n"
 
 
+def test_codex_update_subprocess_path_includes_active_interpreter(monkeypatch, tmp_path):
+    caller_path = os.pathsep.join(["/usr/local/sbin", "", "/usr/bin", ""])
+    monkeypatch.setenv("PATH", caller_path)
+    engine = CodexUpdateEngine(repo_root=tmp_path, events_dir=tmp_path / "diffs")
+
+    subprocess_path = engine._subprocess_env()["PATH"]
+
+    interpreter_bin = str(pathlib.Path(sys.executable).absolute().parent)
+    assert subprocess_path == interpreter_bin + os.pathsep + caller_path
+
+
+def test_codex_update_subprocess_path_preserves_explicit_empty_value(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", "")
+    engine = CodexUpdateEngine(repo_root=tmp_path, events_dir=tmp_path / "diffs")
+
+    interpreter_bin = str(pathlib.Path(sys.executable).absolute().parent)
+    assert engine._subprocess_env()["PATH"] == interpreter_bin + os.pathsep
+
+
+def test_codex_update_subprocess_path_honors_env_file_entries(monkeypatch, tmp_path):
+    monkeypatch.delenv("PATH", raising=False)
+    env_file = tmp_path / ".env.local"
+    env_file.write_text("PATH=/custom/bin::\n")
+    engine = CodexUpdateEngine(
+        repo_root=tmp_path,
+        events_dir=tmp_path / "diffs",
+        env_file=env_file,
+    )
+
+    interpreter_bin = str(pathlib.Path(sys.executable).absolute().parent)
+    assert engine._subprocess_env()["PATH"] == interpreter_bin + os.pathsep + "/custom/bin::"
+
+
 def test_codex_update_sets_configured_home_for_subprocess(tmp_path):
     _init_repo(tmp_path)
     validation = tmp_path / "validation_ok.py"
