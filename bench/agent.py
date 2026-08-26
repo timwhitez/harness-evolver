@@ -17,7 +17,7 @@ from bench import _agent_issue8_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 
 @dataclass

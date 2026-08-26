@@ -26,7 +26,7 @@ from harness.tools import _process_runner_issue19_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 _BASE_SUPERVISED_COMMAND = _base.supervised_command_for_argv
 _PID_NAMESPACE_PROBE_SECONDS = 2.0

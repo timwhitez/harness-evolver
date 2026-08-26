@@ -14,7 +14,7 @@ from scripts import _run_trial_issue12_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 _BASE_RESOLVE_AGENT_CONFIG = _base.resolve_agent_config
 

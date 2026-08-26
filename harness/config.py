@@ -17,7 +17,7 @@ from harness.url_safety import safe_endpoint
 
 for _name in dir(_base):
     if not _name.startswith("__"):
-        globals()[_name] = getattr(_base, _name)
+        globals().setdefault(_name, getattr(_base, _name))
 
 
 _SECRET_KEY = re.compile(

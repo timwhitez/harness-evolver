@@ -23,13 +23,10 @@ from typing import BinaryIO, Mapping, Sequence
 from harness.tools import _process_runner_issue19_namespace_base as _base
 
 for _name, _value in vars(_base).items():
-    # Keep this facade's module reference intact.  The namespace layer itself
-    # exposes an internal ``_base`` attribute, and re-exporting that name would
-    # replace our alias before the wiring below can reach both layers.
-    if _name != "_base" and not (
-        _name.startswith("__") and _name.endswith("__")
-    ):
-        globals()[_name] = _value
+    if not (_name.startswith("__") and _name.endswith("__")):
+        # Facade-local imports and aliases win over inherited implementation
+        # details, especially the upstream module's own ``_base`` reference.
+        globals().setdefault(_name, _value)
 
 _runtime = _base._base
 _CLEANUP_TOKEN_BYTES = 32

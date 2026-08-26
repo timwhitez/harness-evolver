@@ -15,7 +15,7 @@ from bench import _harbor_issue7_identity_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 
 def _canonical_result_identity(
