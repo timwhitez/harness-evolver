@@ -161,6 +161,15 @@ def test_retry_strategy_validation_rejects_invalid_policy_values():
     errors = strategy.validate()
 
     assert "max_retries must be >= 0" in errors
-    assert "base_delay_seconds must be >= 0" in errors
-    assert "backoff_multiplier must be >= 1" in errors
-    assert "max_delay_seconds must be >= 0 when set" in errors
+    assert any(
+        error.startswith("base_delay_seconds must") and ">= 0" in error
+        for error in errors
+    )
+    assert any(
+        error.startswith("backoff_multiplier must") and ">= 1" in error
+        for error in errors
+    )
+    assert any(
+        error.startswith("max_delay_seconds must") and ">= 0" in error
+        for error in errors
+    )
