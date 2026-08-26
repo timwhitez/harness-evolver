@@ -19,7 +19,7 @@ _LITERAL_ROOT_PATTERN_BLOCK = r'''escape_glob_literal() {
   # Shell quoting protects the argument boundary, but metacharacters inside
   # the string passed to `compgen -G` remain active pattern syntax. Escape only
   # the authorized root; the requested pattern retains its reviewed semantics.
-  value=${value//\/\\}
+  value=${value//\\/\\\\}
   value=${value//\*/\\*}
   value=${value//\?/\\?}
   value=${value//\[/\\[}

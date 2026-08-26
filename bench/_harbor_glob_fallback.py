@@ -146,6 +146,11 @@ case "$root" in
   */) combined="${root}${pattern}" ;;
   *) combined="${root}/$pattern" ;;
 esac
+# pathlib treats a terminal ``**`` as a recursive directory selector. Bash
+# globstar includes files unless the pattern has a trailing slash.
+case "$pattern" in
+  "**"|*/"**") combined="${combined}/" ;;
+esac
 
 set +e
 compgen -G "$combined" | head -n 502 > "$raw"
