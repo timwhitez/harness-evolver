@@ -5,7 +5,7 @@ roles:
   # For provider-backed roles, timeout_seconds is a single model-provider
   # request timeout passed to LiteLLM. It is not a master, sub-agent, Codex
   # update, diagnostic/context, or Worker loop deadline; request timeouts are
-  # recorded and routed through Worker recovery.
+  # recorded and routed through Worker recovery; it is not a loop stop condition.
   worker:
     provider: openai_compatible
     base_url: https://api.deepseek.com/v1
