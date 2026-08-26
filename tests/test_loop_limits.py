@@ -1149,10 +1149,32 @@ def test_loop_owner_sources_do_not_reintroduce_limit_control_flow() -> None:
     packager_source = (repo_root / "meta" / "packager.py").read_text()
     missions_source = (repo_root / "meta" / "missions.py").read_text()
     regression_source = (repo_root / "scripts" / "regression_check.py").read_text()
-    agent_source = (repo_root / "bench" / "agent.py").read_text()
-    harbor_source = (repo_root / "bench" / "harbor.py").read_text()
-    harbor_adapter_source = (repo_root / "bench" / "harbor_adapter.py").read_text()
-    retry_source = (repo_root / "harness" / "recovery" / "retry.py").read_text()
+    agent_source = "\n".join(
+        (repo_root / path).read_text()
+        for path in ("bench/agent.py", "bench/_agent_bridge.py")
+    )
+    harbor_source = "\n".join(
+        (repo_root / path).read_text()
+        for path in (
+            "bench/harbor.py",
+            "bench/_harbor_issue5_logic.py",
+            "bench/_harbor_issue9_base.py",
+        )
+    )
+    harbor_adapter_source = "\n".join(
+        (repo_root / path).read_text()
+        for path in (
+            "bench/harbor_adapter.py",
+            "bench/_harbor_adapter_issue16_base.py",
+        )
+    )
+    retry_source = "\n".join(
+        (repo_root / path).read_text()
+        for path in (
+            "harness/recovery/retry.py",
+            "harness/recovery/_retry_issue20_base.py",
+        )
+    )
     task_catalog_source = (repo_root / "bench" / "tasks.py").read_text()
     context_source = "\n".join(
         [
