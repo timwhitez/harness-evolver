@@ -98,6 +98,8 @@ class HarborRunner(_base.HarborRunner):
         job_path = Path(job_dir)
         result_path = job_path / "result.json"
         top_level_valid = False
+        top_level_status_only = False
+        top_level_results_malformed = False
         top_level_candidates: list[dict[str, Any]] = []
 
         if result_path.exists():
@@ -107,20 +109,46 @@ class HarborRunner(_base.HarborRunner):
                 top_level = None
             if isinstance(top_level, dict):
                 top_level_valid = True
-                raw_results = top_level.get("trial_results") or []
-                if isinstance(raw_results, list):
+                raw_results = top_level.get("trial_results")
+                if raw_results is None or raw_results == []:
+                    top_level_status_only = True
+                elif isinstance(raw_results, list) and all(
+                    isinstance(item, dict) for item in raw_results
+                ):
                     top_level_candidates = [
                         item for item in raw_results if isinstance(item, dict)
                     ]
+                else:
+                    top_level_results_malformed = True
 
         force_no_match = False
         candidates: list[dict[str, Any]]
         if top_level_valid:
+            if top_level_results_malformed:
+                return self._malformed_trial_results_result(
+                    job_path=job_path,
+                    result_path=result_path,
+                    task_id=task_id,
+                    returncode=returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                    wall_time=wall_time,
+                    agent_config=agent_config,
+                )
+            if top_level_status_only:
+                # A status-only result has no identity evidence to contradict.
+                # Leave the context unset so the inherited parser can recover
+                # one exact, unambiguous trial artifact directory.
+                candidates = []
+            else:
+                candidates = top_level_candidates
             accepted_top_level = self._matching_trial_results(
                 top_level_candidates,
                 task_id,
             )
-            if accepted_top_level and not _top_level_has_rejected_requested_evidence(
+            if top_level_status_only:
+                pass
+            elif accepted_top_level and not _top_level_has_rejected_requested_evidence(
                 top_level_candidates,
                 accepted_top_level,
                 task_id,
@@ -136,7 +164,7 @@ class HarborRunner(_base.HarborRunner):
                 # subset.
                 candidates = top_level_candidates
                 force_no_match = True
-            else:
+            elif top_level_candidates:
                 recovered = self._recover_unrelated_top_level_from_subdirs(
                     job_path=job_path,
                     result_path=result_path,
@@ -181,6 +209,46 @@ class HarborRunner(_base.HarborRunner):
             )
         finally:
             _ALLOWED_ATTEMPT_KEYS.reset(token)
+
+    def _malformed_trial_results_result(
+        self,
+        *,
+        job_path: Path,
+        result_path: Path,
+        task_id: str,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        wall_time: float,
+        agent_config: dict[str, Any] | None,
+    ) -> _base.TrialResult:
+        observed = _base._observed_task_identities(job_path)
+        return _base.TrialResult(
+            trial_id=job_path.name,
+            task_id=task_id,
+            task_domain=_base.TaskDomain.SOFTWARE_ENGINEERING,
+            task_difficulty=_base.TaskDifficulty.MEDIUM,
+            status=_base.TrialStatus.ERROR,
+            score=0.0,
+            verified=False,
+            error_log=[
+                _base._IDENTITY_FAILURE_MESSAGE,
+                "Harbor result.json trial_results must be a list of objects",
+            ],
+            wall_time_seconds=wall_time,
+            harbor_job_dir=str(job_path),
+            harbor_stdout=stdout,
+            harbor_stderr=stderr,
+            metadata={
+                "harbor_returncode": returncode,
+                "job_result_path": str(result_path),
+                "model_config": self._model_config_metadata(agent_config),
+                "task_identity_match_failed": True,
+                "requested_task_identity": str(task_id),
+                "observed_task_identities": observed,
+                "malformed_trial_results": True,
+            },
+        )
 
     def _recover_unrelated_top_level_from_subdirs(
         self,
@@ -262,6 +330,13 @@ class HarborRunner(_base.HarborRunner):
         if allowed is not None:
             return _stable_attempt_key(result) in allowed
         return super()._trial_result_matches_task(result, task_id)
+
+    def _fallback_trial_dir(self, job_path: Path, task_id: str) -> Path | None:
+        """Permit directory fallback only when no result identity scope exists."""
+
+        if _ALLOWED_ATTEMPT_KEYS.get() is not None:
+            return None
+        return super()._fallback_trial_dir(job_path, task_id)
 
     def _matching_trial_results(
         self,
