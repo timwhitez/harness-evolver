@@ -347,7 +347,12 @@ class HarborFileWriteTool(_SecureHarborMixin, _base.HarborFileWriteTool):
                 success=False,
                 output="",
                 error=f"Worker file policy blocked write: {size_reason}",
-                metadata=policy_guard_metadata("deliverable_size_cap_write_guard"),
+                metadata=policy_guard_metadata(
+                    "deliverable_size_cap_write_guard",
+                    path=resolved,
+                    content_bytes=len(effective_content.encode("utf-8")),
+                    limit_bytes=5000,
+                ),
             )
         return self._run_secure_python(
             _SECURE_WRITE,
@@ -403,7 +408,12 @@ class HarborFileEditTool(_SecureHarborMixin, _base.HarborFileEditTool):
                 success=False,
                 output="",
                 error=f"Worker file policy blocked edit: {size_reason}",
-                metadata=policy_guard_metadata("deliverable_size_cap_write_guard"),
+                metadata=policy_guard_metadata(
+                    "deliverable_size_cap_write_guard",
+                    path=resolved,
+                    content_bytes=len(updated.encode("utf-8")),
+                    limit_bytes=5000,
+                ),
             )
         expected = hashlib.sha256(current.encode("utf-8")).hexdigest()
         return self._run_secure_python(
