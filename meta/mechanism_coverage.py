@@ -129,7 +129,7 @@ _WORKER_POLICY_COVERAGE: tuple[WorkerPolicyCoverageSpec, ...] = (
     ),
     WorkerPolicyCoverageSpec(
         "verifier_runtime_prepare_timeout",
-        "bench/harbor.py",
+        "bench/_harbor_issue9_base.py",
         (
             "def _has_verifier_runtime_prepare_timeout_marker",
             "def _with_verifier_runtime_prepare_timeout_metadata",
@@ -137,7 +137,7 @@ _WORKER_POLICY_COVERAGE: tuple[WorkerPolicyCoverageSpec, ...] = (
         "tests/test_campaign_runner.py",
         (
             "def test_iteration_analysis_labels_infrastructure_timeout_weakness_contribution",
-            '"verifier_runtime_prepare_timeout": True',
+            "verifier_runtime_prepare_timeout=True",
         ),
     ),
 )
