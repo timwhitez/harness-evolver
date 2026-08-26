@@ -268,6 +268,28 @@ class GlobTool(_BaseGlobTool):
     """Return only canonical matches contained by the authorized root."""
 
     def execute(self, pattern: str, path: str = ".", **kwargs: Any) -> ToolResult:
+        # Static policy attribution must not depend on whether a host path is
+        # mounted or exists in the current environment.
+        observed = guard_observed_text(f"{path} {pattern}", operation="read")
+        if observed.blocked_by == "host_memory_guard":
+            metadata = policy_guard_metadata(
+                "host_memory_guard",
+                semantic_failure_kind="blocked_host_memory_search",
+                blocked_reason="host_memory_search",
+                canonical_path_checked=False,
+                filesystem_accessed=False,
+            )
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Worker host-memory policy blocked glob: {observed.reason}. "
+                    "Same-task memory summaries are already injected into the "
+                    "prompt; host trial memory is not task-workspace evidence."
+                ),
+                metadata=metadata,
+            )
+
         decision = resolve_guarded_path(
             path,
             operation="read",
@@ -285,7 +307,6 @@ class GlobTool(_BaseGlobTool):
                 metadata=policy_guard_metadata("canonical_path_guard"),
             )
 
-        observed = guard_observed_text(f"{path} {pattern}", operation="read")
         if observed.blocked_by:
             return guarded_path_failure("glob", observed)
 
