@@ -1,23 +1,44 @@
 """T5: mission selection filters already-covered mechanism signatures."""
 
-import json
 from pathlib import Path
 
 from meta.codex_update import CodexUpdateEngine
 from meta.mechanism_coverage import deterministic_worker_policy_coverage
 from meta.missions import MissionFeatureCandidate, MissionPlanner
 from meta.packager import CodexWorkPacket, WorkPacketBuilder
+from tests.infra_fixtures import finalized_infra_metadata
 from tests.test_missions_debug import campaign_summary
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HISTORICAL_NOOP = (
-    ROOT
-    / "trials"
-    / "diffs"
-    / "codex_packet_20260709_123630"
-    / "codex_update_packet.json"
-)
+
+
+def _historical_noop_packet() -> dict:
+    """Build the old 17-candidate no-op shape without runtime trial memory."""
+
+    signatures = [
+        entry["signature"] for entry in deterministic_worker_policy_coverage(ROOT)
+    ]
+    assert signatures
+    candidates = [
+        {
+            "id": f"historical-covered-{index:02d}-{signatures[index % len(signatures)]}",
+            "title": f"Covered candidate {index:02d}",
+            "rationale": f"Existing policy covers {signatures[index % len(signatures)]}",
+            "success_signal": "no duplicate update is launched",
+        }
+        for index in range(17)
+    ]
+    return CodexWorkPacket(
+        packet_id="historical-noop-fixture",
+        hl_goal="Do not repeat an already-covered harness update.",
+        failing_tasks=[],
+        mission_debug={
+            "evidence_summary": {},
+            "feature_candidates": candidates,
+            "candidate_audit": candidates,
+        },
+    ).model_dump(mode="json")
 
 
 def _attributed_summary():
@@ -27,16 +48,14 @@ def _attributed_summary():
             "failure_category": "environment_start_timeout",
             "affected_components": ["bench/harbor", "bench/network_environment"],
             "timeout_phase": "environment_start",
-            "infra_error_detected": True,
-            "score_exclusion_reason": "infrastructure_error",
+            **finalized_infra_metadata(),
         }
     )
     summary["task_results"][2].update(
         {
             "failure_category": "harbor_environment_error",
             "affected_components": ["bench/harbor", "bench/network_environment"],
-            "infra_error_detected": True,
-            "score_exclusion_reason": "infrastructure_error",
+            **finalized_infra_metadata(),
         }
     )
     summary["task_results"][3].update(
@@ -132,7 +151,7 @@ def test_current_policy_filters_mechanisms_from_recent_no_diff_campaign():
 
 
 def test_historical_noop_packet_is_automatically_all_covered():
-    data = json.loads(HISTORICAL_NOOP.read_text())
+    data = _historical_noop_packet()
     builder = WorkPacketBuilder(repo_root=ROOT, memory_path=ROOT / "trials")
 
     mission = builder.prepare_mission_debug(data["mission_debug"])
@@ -144,7 +163,7 @@ def test_historical_noop_packet_is_automatically_all_covered():
 
 
 def test_historical_noop_packet_skips_before_codex_exec(tmp_path):
-    data = json.loads(HISTORICAL_NOOP.read_text())
+    data = _historical_noop_packet()
     builder = WorkPacketBuilder(repo_root=ROOT, memory_path=ROOT / "trials")
     data["mission_debug"] = builder.prepare_mission_debug(data["mission_debug"])
     packet = CodexWorkPacket.model_validate(data)
