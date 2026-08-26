@@ -60,3 +60,55 @@ def test_valid_exact_attempt_does_not_hide_contradictory_sibling(
         "path:/datasets/current/wanted-task",
         "path:/datasets/stale/other-task",
     ]
+
+
+def test_malformed_trial_results_cannot_recover_convenient_directory(
+    tmp_path: Path,
+) -> None:
+    malformed_shapes = ["malformed", {"bad": "shape"}, [1], 1, True]
+    for index, malformed in enumerate(malformed_shapes):
+        job = tmp_path / f"job-{index}"
+        trial_dir = job / "wanted-task__abcdefg"
+        trial_dir.mkdir(parents=True)
+        (trial_dir / "exception.txt").write_text(
+            "harbor.trial.trial.AgentTimeoutError: Agent execution timed out\n",
+            encoding="utf-8",
+        )
+        (job / "result.json").write_text(
+            json.dumps({"trial_results": malformed}),
+            encoding="utf-8",
+        )
+
+        result = HarborRunner().parse_job_dir(job, task_id="wanted-task")
+
+        assert result.status.value == "error"
+        assert result.harbor_trial_dir == ""
+        assert result.metadata["task_identity_match_failed"] is True
+        assert result.metadata["malformed_trial_results"] is True
+
+
+def test_contradictory_top_level_cannot_recover_convenient_directory(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "job"
+    trial_dir = job / "wanted-task__abcdefg"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "exception.txt").write_text(
+        "harbor.trial.trial.AgentTimeoutError: Agent execution timed out\n",
+        encoding="utf-8",
+    )
+    contradictory = _attempt(
+        trial_name="stale__attempt-1",
+        task_name="wanted-task",
+        task_path="/datasets/stale/other-task",
+        score=0.0,
+    )
+    (job / "result.json").write_text(
+        json.dumps({"trial_results": [contradictory]}),
+        encoding="utf-8",
+    )
+
+    result = HarborRunner().parse_job_dir(job, task_id="wanted-task")
+
+    assert result.harbor_trial_dir == ""
+    assert result.metadata["task_identity_match_failed"] is True

@@ -1185,7 +1185,7 @@ def test_harbor_agent_cancels_worker_when_coroutine_is_cancelled(monkeypatch, tm
 
 def test_parse_incomplete_harbor_job_uses_trial_artifacts_for_timeout_phase(tmp_path):
     job_dir = tmp_path / "job1"
-    trial_dir = job_dir / "task-a__abc"
+    trial_dir = job_dir / "task-a__abcdefg"
     agent_dir = trial_dir / "agent"
     agent_dir.mkdir(parents=True)
     (agent_dir / "trajectory.jsonl").write_text('{"type":"tool_call","tool":"bash"}\n')
@@ -1223,7 +1223,7 @@ def test_parse_incomplete_harbor_job_uses_trial_artifacts_for_timeout_phase(tmp_
 def test_outer_harbor_timeout_preserves_partial_artifacts(tmp_path):
     runner = HarborRunner(jobs_dir=tmp_path / "jobs", output_dir=tmp_path / "runs")
     job_dir = tmp_path / "jobs" / "job1"
-    trial_dir = job_dir / "task-a__abc"
+    trial_dir = job_dir / "task-a__abcdefg"
     agent_dir = trial_dir / "agent"
     agent_dir.mkdir(parents=True)
     (agent_dir / "trajectory.jsonl").write_text('{"type":"tool_call","tool":"bash"}\n')
@@ -1780,7 +1780,7 @@ def test_runner_retries_unverified_environment_start_timeout_until_verified(
 
 def test_incomplete_harbor_job_classifies_verifier_cancellation(tmp_path):
     job_dir = tmp_path / "job1"
-    trial_dir = job_dir / "video-processing__abc"
+    trial_dir = job_dir / "video-processing__abcdefg"
     trial_dir.mkdir(parents=True)
     (trial_dir / "exception.txt").write_text(
         "Traceback (most recent call last):\n"
@@ -1808,7 +1808,7 @@ def test_incomplete_harbor_job_classifies_verifier_cancellation(tmp_path):
 
 def test_parse_harbor_job_result_classifies_verifier_runtime_prepare_timeout(tmp_path):
     job_dir = tmp_path / "job1"
-    trial_dir = job_dir / "video-processing__abc"
+    trial_dir = job_dir / "video-processing__abcdefg"
     verifier_dir = trial_dir / "verifier"
     patched_env = trial_dir / "hl_patched_environment"
     verifier_dir.mkdir(parents=True)
@@ -1869,7 +1869,7 @@ def test_parse_harbor_job_result_classifies_verifier_runtime_prepare_timeout(tmp
         "Skipping image OS validation for "
         "docker.1panel.live/alexgshaw/video-processing:20251031: "
         "docker inspect returned 1\n"
-        "Trial video-processing__abc failed: Command timed out after 90 seconds\n"
+        "Trial video-processing__abcdefg failed: Command timed out after 90 seconds\n"
     )
     (verifier_dir / "test-stdout.txt").write_text(
         "Verifier runtime network preparation timed out after 90 seconds\n"
