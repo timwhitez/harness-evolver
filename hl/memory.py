@@ -583,7 +583,7 @@ class FileSystemMemory(MemoryStore):
         snapshot.last_regression_status = result.status.value
         snapshot.last_regression_at = datetime.now()
         snapshot.last_regression_wall_time_seconds = result.wall_time_seconds
-        if self.check_regression(task_id, result):
+        if self.snapshot_validation_failed(snapshot, result):
             snapshot.regression_failures += 1
         self.save_regression(task_id, snapshot)
         return True
@@ -635,6 +635,28 @@ class FileSystemMemory(MemoryStore):
             return True
 
         return False
+
+    def snapshot_validation_failed(
+        self,
+        snapshot: RegressionSnapshot,
+        result: TrialResult,
+    ) -> bool:
+        """Fail closed for the exact snapshot selected by a validation gate.
+
+        Unlike :meth:`check_regression`, this contract also applies to pending
+        snapshots. A pending snapshot is not yet historical solved-task memory,
+        but its post-update Harbor rerun must still produce a verified full pass
+        before the campaign may promote it to stable.
+        """
+
+        if result.task_id != snapshot.task_id:
+            return True
+        if not model_scope_matches(
+            snapshot.model_scope,
+            model_scope_from_trial(result),
+        ):
+            return True
+        return not (result.verified and result.score >= 1.0)
 
     def save_patch(self, patch: HarnessPatch) -> str:
         safe_name = patch.component_name.replace("/", "_")
