@@ -108,6 +108,16 @@ def test_glob_rejects_parent_patterns_and_symlink_escape_results(tmp_path: Path)
     }
 
 
+def test_glob_missing_non_host_root_remains_a_canonical_path_failure(
+    tmp_path: Path,
+) -> None:
+    result = GlobTool().execute("*.py", str(tmp_path / "missing-workspace"))
+
+    assert result.success is False
+    assert result.metadata["blocked_by"] == "canonical_path_guard"
+    assert result.metadata["path_resolution_failed"] is True
+
+
 def test_grep_preflights_symlinks_before_searching_content(tmp_path: Path) -> None:
     workspace, _, secret = _make_hidden_fixture(tmp_path)
     (workspace / "safe.txt").write_text("classified\n", encoding="utf-8")

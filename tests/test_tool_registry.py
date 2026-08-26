@@ -1793,13 +1793,22 @@ def test_grep_blocks_host_hl_memory_path():
     assert result.metadata["blocked_reason"] == "host_memory_search"
 
 
-def test_glob_blocks_host_hl_memory_artifact_search():
+def test_glob_blocks_host_hl_memory_artifact_search(monkeypatch):
+    def unexpected_resolution(*_args, **_kwargs):
+        raise AssertionError("host-memory policy must precede path resolution")
+
+    monkeypatch.setattr(
+        "harness.tools._search_issue4_fixed_base.resolve_guarded_path",
+        unexpected_resolution,
+    )
     tool = GlobTool()
     result = tool.execute("**/trajectory.jsonl", path="/mnt/c/tmp")
 
     assert result.success is False
     assert result.metadata["blocked_by"] == "host_memory_guard"
     assert result.metadata["blocked_reason"] == "host_memory_search"
+    assert result.metadata["canonical_path_checked"] is False
+    assert result.metadata["filesystem_accessed"] is False
 
 
 class TestFileEditTool:
