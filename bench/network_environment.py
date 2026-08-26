@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -42,6 +44,10 @@ DEFAULT_DOCKER_LABELS = {
     "com.harness-evolver.role": "benchmark",
 }
 LOCAL_IMAGE_INSPECT_TIMEOUT_SECONDS = 10
+PREBUILT_WARMUP_FAILURE_RECEIPT = "hl-prebuilt-warmup-failure.json"
+PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA = (
+    "harness-evolver.prebuilt-warmup-failure.v1"
+)
 
 
 @dataclass(frozen=True)
@@ -222,7 +228,32 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
                 session_id=str(self.session_id),
                 environment_name=str(self.environment_name),
             )
-        await self._warm_prebuilt_image_cache_if_needed(force_build)
+        receipt_path = (
+            Path(self.trial_paths.trial_dir) / PREBUILT_WARMUP_FAILURE_RECEIPT
+        )
+        receipt_path.unlink(missing_ok=True)
+        try:
+            await self._warm_prebuilt_image_cache_if_needed(force_build)
+        except RuntimeError as exc:
+            try:
+                _write_prebuilt_warmup_failure_receipt(
+                    receipt_path,
+                    kind=str(getattr(exc, "_hl_prebuilt_warmup_failure_kind", "")),
+                    deterministic_access_failure=(
+                        getattr(
+                            exc,
+                            "_hl_prebuilt_warmup_deterministic_access_failure",
+                            False,
+                        )
+                        is True
+                    ),
+                )
+            except OSError as receipt_exc:
+                self.logger.warning(
+                    "Could not persist prebuilt warmup failure provenance: %s",
+                    receipt_exc,
+                )
+            raise
         await super().start(force_build)
 
     async def _warm_prebuilt_image_cache_if_needed(self, force_build: bool) -> None:
@@ -268,11 +299,13 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
             )
         except subprocess.TimeoutExpired as exc:
             detail = _subprocess_failure_detail(exc.stdout, exc.stderr)
-            raise RuntimeError(
+            raise _prebuilt_warmup_error(
                 "Prebuilt Docker image cache warmup timed out after "
                 f"{timeout} seconds for image {image}. Run `docker pull {image}` "
                 "or `python scripts/network_preflight.py --quick` to diagnose Docker "
-                f"registry access. {detail}"
+                f"registry access. {detail}",
+                kind="prebuilt_image_cache_warmup_timeout",
+                deterministic_access_failure=False,
             ) from exc
         except subprocess.CalledProcessError as exc:
             if self._hl_original_prebuilt_image and _prebuilt_pull_failure_can_try_original(
@@ -302,21 +335,32 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
                     return
                 except RuntimeError as fallback_exc:
                     detail = _subprocess_failure_detail(exc.stdout, exc.stderr)
-                    raise RuntimeError(
+                    raise _prebuilt_warmup_error(
                         "Prebuilt Docker image cache warmup failed for image "
                         f"{image} with return code {exc.returncode}; original image "
                         f"fallback {original_image} also failed. Run `docker pull "
                         f"{image}` or `docker pull {original_image}` or `python "
                         "scripts/network_preflight.py --quick` to diagnose Docker "
                         f"registry access. Mirror error: {detail} "
-                        f"Fallback error: {fallback_exc}"
+                        f"Fallback error: {fallback_exc}",
+                        kind="prebuilt_image_cache_warmup_failure",
+                        deterministic_access_failure=(
+                            _prebuilt_pull_failure_can_try_original(
+                                "",
+                                str(fallback_exc),
+                            )
+                        ),
                     ) from fallback_exc
             detail = _subprocess_failure_detail(exc.stdout, exc.stderr)
-            raise RuntimeError(
+            raise _prebuilt_warmup_error(
                 "Prebuilt Docker image cache warmup failed for image "
                 f"{image} with return code {exc.returncode}. Run `docker pull {image}` "
                 "or `python scripts/network_preflight.py --quick` to diagnose Docker "
-                f"registry access. {detail}"
+                f"registry access. {detail}",
+                kind="prebuilt_image_cache_warmup_failure",
+                deterministic_access_failure=(
+                    _prebuilt_pull_failure_can_try_original(exc.stdout, exc.stderr)
+                ),
             ) from exc
 
     async def stop(self, delete: bool) -> None:
@@ -1140,6 +1184,71 @@ def _prebuilt_pull_failure_can_try_original(stdout: Any, stderr: Any) -> bool:
             "not found",
         ]
     )
+
+
+def _prebuilt_warmup_error(
+    message: str,
+    *,
+    kind: str,
+    deterministic_access_failure: bool,
+) -> RuntimeError:
+    error = RuntimeError(message)
+    error._hl_prebuilt_warmup_failure_kind = kind  # type: ignore[attr-defined]
+    error._hl_prebuilt_warmup_deterministic_access_failure = (  # type: ignore[attr-defined]
+        deterministic_access_failure
+    )
+    return error
+
+
+def _write_prebuilt_warmup_failure_receipt(
+    path: Path,
+    *,
+    kind: str,
+    deterministic_access_failure: bool,
+) -> None:
+    """Persist host-owned provenance before the task container can start."""
+
+    if kind not in {
+        "prebuilt_image_cache_warmup_failure",
+        "prebuilt_image_cache_warmup_timeout",
+    }:
+        return
+
+    payload = {
+        "schema": PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
+        "kind": kind,
+        "source": "apt_mirror_docker_environment_start",
+        "deterministic_access_failure": deterministic_access_failure,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{secrets.token_hex(8)}")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        content = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        written = 0
+        while written < len(content):
+            written += os.write(descriptor, content[written:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _pull_and_tag_original_prebuilt_image(source: str, target: str, timeout: int) -> None:

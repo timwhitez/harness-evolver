@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar
 import errno
-import hashlib
 from pathlib import Path
 import re
 import subprocess
@@ -66,12 +64,6 @@ _DETERMINISTIC_LAUNCH_KINDS = frozenset(
         "executable_format_error",
     }
 )
-_SEEN_INFRA_SIGNATURES: ContextVar[set[str] | None] = ContextVar(
-    "harness_evolver_seen_infra_signatures",
-    default=None,
-)
-
-
 def _normalise_failure_text(text: str) -> str:
     compact = " ".join(str(text).lower().split())
     compact = re.sub(r"\b\d+(?:\.\d+)?\b", "<n>", compact)
@@ -79,7 +71,7 @@ def _normalise_failure_text(text: str) -> str:
 
 
 class HarborRunner(_base.HarborRunner):
-    """HarborRunner with finite, provenance-aware infrastructure recovery."""
+    """HarborRunner with provenance-aware infrastructure recovery."""
 
     def run_task(
         self,
@@ -91,23 +83,20 @@ class HarborRunner(_base.HarborRunner):
         job_name: str | None = None,
         jobs_dir: str | _base.Path | None = None,
     ) -> _base.TrialResult:
-        token = _SEEN_INFRA_SIGNATURES.set(set())
-        try:
-            trial = super().run_task(
-                task_id,
-                agent_config,
-                timeout,
-                timeout_audit=timeout_audit,
-                job_name=job_name,
-                jobs_dir=jobs_dir,
-            )
-            self._mark_retry_policy_finite(trial)
-            # The baseline materializes before returning. Persist corrected
-            # attribution and finite-policy metadata as the final snapshot.
-            self._materialize_trial(trial)
-            return trial
-        finally:
-            _SEEN_INFRA_SIGNATURES.reset(token)
+        trial = super().run_task(
+            task_id,
+            agent_config,
+            timeout,
+            timeout_audit=timeout_audit,
+            job_name=job_name,
+            jobs_dir=jobs_dir,
+        )
+        self._mark_retry_policy_finite(trial)
+        # The baseline materializes before returning. Persist corrected,
+        # versioned attribution and audit-only retry metadata as the final
+        # snapshot.
+        self._materialize_trial(trial)
+        return trial
 
     def _run_task_once(
         self,
@@ -390,81 +379,36 @@ class HarborRunner(_base.HarborRunner):
         *,
         infra_error: bool,
     ) -> bool:
-        if not super()._should_retry_infra_failure(trial, infra_error=infra_error):
-            return False
-
         metadata = trial.metadata
         launch_evidence = metadata.get("harbor_launch_evidence")
         if isinstance(launch_evidence, dict) and launch_evidence.get("kind") in (
             _DETERMINISTIC_LAUNCH_KINDS
         ):
             metadata["infra_retry_suppressed_reason"] = "deterministic_harbor_launch_failure"
-            metadata["infra_retry_loop_stop_condition"] = True
+            metadata["infra_retry_suppressed_stop_condition"] = False
+            metadata["infra_retry_loop_stop_condition"] = False
             return False
-
-        attempt_index = self._nonnegative_int(metadata.get("infra_retry_attempt"), 0)
-        configured_retries = self._nonnegative_int(
-            metadata.get("infra_retries_audit_only"),
-            self.default_infra_retries,
+        return super()._should_retry_infra_failure(
+            trial,
+            infra_error=infra_error,
         )
-        metadata["infra_retry_limit"] = configured_retries
-        metadata["infra_retry_limit_enforced"] = True
-        metadata["infra_retry_unbounded_by_attempt_count"] = False
 
-        if attempt_index >= configured_retries:
-            metadata["infra_retry_suppressed_reason"] = (
-                "configured_infrastructure_retry_limit"
-            )
-            metadata["infra_retry_limit_reached"] = True
-            metadata["infra_retries_stop_condition"] = True
-            metadata["infra_retry_attempt_count_stop_condition"] = True
-            metadata["infra_retry_loop_stop_condition"] = True
-            return False
+    def _is_nonretryable_prebuilt_warmup_failure(
+        self,
+        trial: _base.TrialResult,
+    ) -> bool:
+        """Trust only parser-owned warmup provenance, never Worker-visible text."""
 
-        signature = self._infra_failure_signature(trial)
-        metadata["infra_failure_signature"] = signature
-        seen = _SEEN_INFRA_SIGNATURES.get()
-        if seen is None:
-            seen = getattr(self, "_seen_infra_failure_signatures", None)
-            if seen is None:
-                seen = set()
-                self._seen_infra_failure_signatures = seen
-        if signature in seen:
-            metadata["infra_retry_suppressed_reason"] = (
-                "repeated_infrastructure_failure_signature"
-            )
-            metadata["infra_retry_signature_repeated"] = True
-            metadata["infra_retries_stop_condition"] = True
-            metadata["infra_retry_attempt_count_stop_condition"] = False
-            metadata["infra_retry_loop_stop_condition"] = True
-            return False
-
-        seen.add(signature)
-        metadata["infra_retry_signature_repeated"] = False
-        metadata["infra_retries_stop_condition"] = False
-        return True
-
-    def _infra_failure_signature(self, trial: _base.TrialResult) -> str:
-        metadata = trial.metadata or {}
-        evidence = "\n".join(
-            [
-                str(metadata.get("infrastructure_phase") or ""),
-                str(metadata.get("timeout_phase") or ""),
-                self._structured_environment_evidence(metadata),
-            ]
+        evidence = trial.metadata.get("environment_failure_evidence")
+        return bool(
+            isinstance(evidence, dict)
+            and evidence.get("kind") == "prebuilt_image_cache_warmup_failure"
+            and evidence.get("deterministic_access_failure") is True
         )
-        material = "|".join(
-            [
-                str(trial.status.value),
-                str(metadata.get("infrastructure_phase") or ""),
-                str(metadata.get("timeout_phase") or ""),
-                str(bool(metadata.get("terminal_environment_unavailable"))),
-                _normalise_failure_text(evidence),
-            ]
-        )
-        return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _mark_retry_policy_finite(self, trial: _base.TrialResult) -> None:
+        """Retain the legacy hook name while recording audit-only retry policy."""
+
         metadata = trial.metadata
         configured_retries = self._nonnegative_int(
             metadata.get("infra_retries_configured"),
@@ -473,10 +417,10 @@ class HarborRunner(_base.HarborRunner):
         metadata.update(
             {
                 "infra_retry_limit": configured_retries,
-                "infra_retry_limit_enforced": True,
-                "infra_retry_unbounded_by_attempt_count": False,
-                "infra_retry_failure_signature_deduplication": True,
-                "infra_retry_loop_stop_condition": True,
+                "infra_retry_limit_enforced": False,
+                "infra_retry_unbounded_by_attempt_count": True,
+                "infra_retry_failure_signature_deduplication": False,
+                "infra_retry_loop_stop_condition": False,
             }
         )
         current_infra = self.is_infra_error(trial)
@@ -489,9 +433,10 @@ class HarborRunner(_base.HarborRunner):
             if not isinstance(attempt, dict):
                 continue
             attempt["infra_retry_limit"] = configured_retries
-            attempt["infra_retry_limit_enforced"] = True
-            attempt["infra_retry_unbounded_by_attempt_count"] = False
-            attempt["infra_retry_failure_signature_deduplication"] = True
+            attempt["infra_retry_limit_enforced"] = False
+            attempt["infra_retry_unbounded_by_attempt_count"] = True
+            attempt["infra_retry_failure_signature_deduplication"] = False
+            attempt["infra_retry_loop_stop_condition"] = False
 
     @staticmethod
     def _nonnegative_int(value: Any, default: int) -> int:
