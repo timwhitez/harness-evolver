@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import time
 import tomllib
@@ -35,6 +36,8 @@ from bench.network_environment import (
     DEFAULT_PREBUILT_DOCKER_HUB_MIRROR,
     DEFAULT_PYPI_INDEX_URL,
     DEFAULT_PYPI_TRUSTED_HOST,
+    PREBUILT_WARMUP_FAILURE_RECEIPT,
+    PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
     _parse_docker_labels,
 )
 from hl.types import TaskDifficulty, TaskDomain, TrialResult, TrialStatus
@@ -1007,6 +1010,9 @@ class HarborRunner:
             "trial_metrics": trial_metrics,
         }
         metadata.update(
+            self._environment_exception_evidence(exception, trial_dir=trial_dir)
+        )
+        metadata.update(
             self._environment_start_evidence_metadata(
                 job_path=job_path,
                 trial_dir=trial_dir,
@@ -1043,6 +1049,120 @@ class HarborRunner:
             artifacts=artifacts,
             metadata=metadata,
         )
+
+    @staticmethod
+    def _environment_exception_evidence(
+        exception: dict[str, Any] | None,
+        *,
+        trial_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        """Convert only typed Harbor environment exceptions into provenance."""
+
+        if not isinstance(exception, dict):
+            return {}
+
+        exception_type = str(exception.get("exception_type") or "")
+        timeout_kinds = {
+            "EnvironmentStartTimeoutError": "environment_start_timeout",
+            "harbor.trial.trial.EnvironmentStartTimeoutError": (
+                "environment_start_timeout"
+            ),
+            "EnvironmentBuildTimeoutError": "environment_build_timeout",
+            "harbor.trial.trial.EnvironmentBuildTimeoutError": (
+                "environment_build_timeout"
+            ),
+        }
+        timeout_kind = timeout_kinds.get(exception_type)
+        if timeout_kind is not None:
+            return {
+                "environment_failure_evidence": {
+                    "kind": timeout_kind,
+                    "exception_type": exception_type,
+                    "source": "harbor_trial_exception",
+                }
+            }
+
+        message = str(exception.get("exception_message") or "")
+        lowered_message = message.lower()
+        receipt = HarborRunner._read_prebuilt_warmup_failure_receipt(trial_dir)
+        receipt_kind = str(receipt.get("kind") or "")
+        expected_marker = {
+            "prebuilt_image_cache_warmup_failure": (
+                "prebuilt docker image cache warmup failed"
+            ),
+            "prebuilt_image_cache_warmup_timeout": (
+                "prebuilt docker image cache warmup timed out"
+            ),
+        }.get(receipt_kind)
+        if (
+            exception_type in {"RuntimeError", "builtins.RuntimeError"}
+            and expected_marker is not None
+            and expected_marker in lowered_message
+        ):
+            event = (
+                "Prebuilt Docker image cache warmup failed"
+                if receipt_kind == "prebuilt_image_cache_warmup_failure"
+                else "Prebuilt Docker image cache warmup timed out"
+            )
+            return {
+                "environment_failure_evidence": {
+                    "kind": receipt_kind,
+                    "event": event,
+                    "source": "host_prebuilt_warmup_receipt",
+                    "deterministic_access_failure": (
+                        receipt.get("deterministic_access_failure") is True
+                    ),
+                }
+            }
+        return {}
+
+    @staticmethod
+    def _read_prebuilt_warmup_failure_receipt(
+        trial_dir: Path | None,
+    ) -> dict[str, Any]:
+        """Read one bounded, no-follow receipt emitted before Worker startup."""
+
+        if trial_dir is None or not hasattr(os, "O_NOFOLLOW"):
+            return {}
+        path = Path(trial_dir) / PREBUILT_WARMUP_FAILURE_RECEIPT
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size > 4096
+            ):
+                return {}
+            raw = os.read(descriptor, 4097)
+        except (OSError, ValueError):
+            return {}
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        if payload.get("schema") != PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA:
+            return {}
+        if payload.get("source") != "apt_mirror_docker_environment_start":
+            return {}
+        if payload.get("kind") not in {
+            "prebuilt_image_cache_warmup_failure",
+            "prebuilt_image_cache_warmup_timeout",
+        }:
+            return {}
+        if not isinstance(payload.get("deterministic_access_failure"), bool):
+            return {}
+        return payload
 
     def _parse_result(
         self,

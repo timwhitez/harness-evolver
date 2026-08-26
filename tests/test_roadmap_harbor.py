@@ -21,6 +21,8 @@ from bench.harbor_adapter import (
 from bench.harbor import HarborRunner
 from bench.network_environment import (
     DockerResourceConfig,
+    PREBUILT_WARMUP_FAILURE_RECEIPT,
+    PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
     write_docker_resource_compose_file,
 )
 from bench.tasks import TaskCatalog
@@ -336,10 +338,10 @@ def test_harbor_runner_retries_infra_errors_beyond_audit_reference(tmp_path, mon
                             "task_name": "cobol-modernization",
                             "trial_name": trial_name,
                             "exception_info": {
-                                "exception_type": "RuntimeError",
+                                "exception_type": "EnvironmentStartTimeoutError",
                                 "exception_message": (
-                                    "E: Failed to fetch http://deb.debian.org/debian/pool/main/k/krb5/"
-                                    "krb5-locales_1.20.1-2%2bdeb12u4_all.deb 504 Gateway Timeout"
+                                    "Environment start timed out after a transient "
+                                    "Debian package fetch failure"
                                 ),
                             },
                         }
@@ -535,13 +537,24 @@ def test_harbor_runner_does_not_spin_on_prebuilt_warmup_403(tmp_path):
         job_name = argv[argv.index("--job-name") + 1]
         job_dir = tmp_path / "jobs" / job_name
         trial_name = f"mailman__{len(calls)}"
-        (job_dir / "result.json").parent.mkdir(parents=True)
+        trial_dir = job_dir / trial_name
+        trial_dir.mkdir(parents=True)
         message = (
             "Prebuilt Docker image cache warmup failed for image "
             "docker.1panel.live/alexgshaw/mailman:20251031 with return code 1. "
             "Stderr: failed to copy: httpReadSeeker: failed open: unexpected "
             "status code https://docker.1panel.live/v2/alexgshaw/mailman/manifests/"
             "20251031: 403 Forbidden"
+        )
+        (trial_dir / PREBUILT_WARMUP_FAILURE_RECEIPT).write_text(
+            json.dumps(
+                {
+                    "schema": PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
+                    "kind": "prebuilt_image_cache_warmup_failure",
+                    "source": "apt_mirror_docker_environment_start",
+                    "deterministic_access_failure": True,
+                }
+            )
         )
         (job_dir / "result.json").write_text(
             json.dumps(

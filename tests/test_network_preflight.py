@@ -1,4 +1,5 @@
 import asyncio
+import json
 import subprocess
 from types import SimpleNamespace
 
@@ -12,6 +13,8 @@ from bench.network_environment import (
     AptMirrorDockerEnvironment,
     AptMirrorConfig,
     DEFAULT_ALPINE_MIRROR,
+    PREBUILT_WARMUP_FAILURE_RECEIPT,
+    PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
     effective_docker_image_reference,
     patch_compose_for_docker_mirrors,
     patch_dockerfile_for_apt_mirrors,
@@ -613,6 +616,15 @@ def test_prebuilt_cache_warmup_timeout_raises_clear_runtime_error(monkeypatch, t
     assert "Prebuilt Docker image cache warmup timed out after 7 seconds" in message
     assert "registry.example/alexgshaw/hf-model-inference:20251031" in message
     assert "python scripts/network_preflight.py --quick" in message
+    receipt = json.loads(
+        (tmp_path / "trial" / PREBUILT_WARMUP_FAILURE_RECEIPT).read_text()
+    )
+    assert receipt == {
+        "schema": PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
+        "kind": "prebuilt_image_cache_warmup_timeout",
+        "source": "apt_mirror_docker_environment_start",
+        "deterministic_access_failure": False,
+    }
 
 
 def test_prebuilt_cache_warmup_pulls_original_when_mirror_denies(monkeypatch, tmp_path):
@@ -734,6 +746,11 @@ def test_prebuilt_cache_warmup_original_fallback_failure_reports_both(monkeypatc
     message = str(excinfo.value)
     assert mirror_ref in message
     assert original_ref in message
+    receipt = json.loads(
+        (tmp_path / "trial" / PREBUILT_WARMUP_FAILURE_RECEIPT).read_text()
+    )
+    assert receipt["kind"] == "prebuilt_image_cache_warmup_failure"
+    assert receipt["deterministic_access_failure"] is False
 
 
 def test_verifier_runtime_prepare_timeout_does_not_skip_verifier(monkeypatch, tmp_path):

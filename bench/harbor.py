@@ -81,7 +81,11 @@ class HarborRunner(_base.HarborRunner):
         )
 
     def _mark_retry_policy_finite(self, trial: _base.TrialResult) -> None:
-        """Persist one final, versioned attribution decision for score consumers."""
+        """Persist one final, versioned attribution decision for score consumers.
+
+        The hook name is retained for compatibility; retry counts and repeated
+        signatures remain audit-only and are not finite loop boundaries.
+        """
 
         # The inherited implementation calls ``self.is_infra_error()``, so the
         # value below is already computed through the strict evidence rules in

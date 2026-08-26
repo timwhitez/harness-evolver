@@ -85,6 +85,66 @@ def test_raw_phase_looking_harbor_text_is_not_structured_evidence() -> None:
     assert runner.is_infra_error(trial) is False
 
 
+def test_worker_prebuilt_warmup_lookalike_is_not_environment_provenance() -> None:
+    runner = HarborRunner()
+    trial = _trial(
+        "Prebuilt Docker image cache warmup failed: 403 Forbidden",
+        metadata={
+            "agent_exception_type": "RuntimeError",
+            "agent_exception_message": (
+                "Prebuilt Docker image cache warmup failed: 403 Forbidden"
+            ),
+        },
+    )
+
+    assert runner.is_infra_error(trial) is False
+    assert runner._should_retry_infra_failure(trial, infra_error=False) is False
+
+
+def test_worker_traceback_markers_cannot_forge_environment_provenance(
+    tmp_path: Path,
+) -> None:
+    message = (
+        "Prebuilt Docker image cache warmup failed: 403 Forbidden; "
+        "diagnostic mentions bench/network_environment.py and "
+        "_warm_prebuilt_image_cache_if_needed"
+    )
+    exception = {
+        "exception_type": "RuntimeError",
+        "exception_message": message,
+        "exception_traceback": (
+            'Traceback (most recent call last):\n'
+            '  File "bench/harbor_adapter.py", line 1, in run\n'
+            "RuntimeError: " + message
+        ),
+    }
+
+    assert (
+        HarborRunner._environment_exception_evidence(
+            exception,
+            trial_dir=tmp_path,
+        )
+        == {}
+    )
+
+
+def test_prefixed_worker_timeout_type_is_not_harbor_provenance(
+    tmp_path: Path,
+) -> None:
+    exception = {
+        "exception_type": "worker.fake.EnvironmentStartTimeoutError",
+        "exception_message": "Environment start timed out",
+    }
+
+    assert (
+        HarborRunner._environment_exception_evidence(
+            exception,
+            trial_dir=tmp_path,
+        )
+        == {}
+    )
+
+
 def test_network_marker_without_failure_evidence_is_not_infrastructure() -> None:
     runner = HarborRunner()
     trial = _trial(
@@ -298,9 +358,8 @@ def test_process_text_is_not_reclassified_after_trial_evidence_exists(
     assert runner.is_infra_error(trial) is False
 
 
-def test_configured_retry_limit_is_enforced() -> None:
+def test_configured_retry_reference_does_not_stop_recovery() -> None:
     runner = HarborRunner()
-    runner._seen_infra_failure_signatures = set()
     trial = _trial(
         "Temporary failure resolving pypi.org",
         metadata={
@@ -309,17 +368,13 @@ def test_configured_retry_limit_is_enforced() -> None:
         },
     )
 
-    assert runner._should_retry_infra_failure(trial, infra_error=True) is False
-    assert trial.metadata["infra_retry_limit_reached"] is True
-    assert (
-        trial.metadata["infra_retry_suppressed_reason"]
-        == "configured_infrastructure_retry_limit"
-    )
+    assert runner._should_retry_infra_failure(trial, infra_error=True) is True
+    assert "infra_retry_limit_reached" not in trial.metadata
+    assert "infra_retry_suppressed_reason" not in trial.metadata
 
 
-def test_repeated_failure_signature_stops_before_retry_budget_is_exhausted() -> None:
+def test_repeated_failure_signature_does_not_stop_recovery() -> None:
     runner = HarborRunner()
-    runner._seen_infra_failure_signatures = set()
     first = _trial(
         "Temporary failure resolving pypi.org",
         metadata={
@@ -344,37 +399,39 @@ def test_repeated_failure_signature_stops_before_retry_budget_is_exhausted() -> 
     )
 
     assert runner._should_retry_infra_failure(first, infra_error=True) is True
-    assert runner._should_retry_infra_failure(repeated, infra_error=True) is False
-    assert repeated.metadata["infra_retry_signature_repeated"] is True
-    assert (
-        repeated.metadata["infra_retry_suppressed_reason"]
-        == "repeated_infrastructure_failure_signature"
-    )
+    assert runner._should_retry_infra_failure(repeated, infra_error=True) is True
+    assert "infra_retry_signature_repeated" not in repeated.metadata
+    assert "infra_retry_suppressed_reason" not in repeated.metadata
 
 
-def test_run_task_terminates_a_deterministic_infrastructure_loop() -> None:
+def test_run_task_continues_repeated_infrastructure_until_task_evidence() -> None:
     runner = HarborRunner()
     calls = 0
 
     def fake_run_once(self: HarborRunner, **kwargs: object) -> TrialResult:
         nonlocal calls
         calls += 1
+        infrastructure = calls < 3
         trial = TrialResult(
             trial_id=f"trial-{calls}",
             task_id="task",
             task_domain=TaskDomain.SOFTWARE_ENGINEERING,
             task_difficulty=TaskDifficulty.MEDIUM,
-            status=TrialStatus.ERROR,
+            status=TrialStatus.ERROR if infrastructure else TrialStatus.FAILED,
             score=0.0,
-            verified=False,
-            error_log=["Harbor environment startup failed"],
-            metadata={
-                "timeout_phase": "environment_start",
-                "environment_start_evidence": (
-                    "https://pypi.org/simple failed: "
-                    "Temporary failure resolving pypi.org"
-                ),
-            },
+            verified=not infrastructure,
+            error_log=["Harbor environment startup failed"] if infrastructure else [],
+            metadata=(
+                {
+                    "timeout_phase": "environment_start",
+                    "environment_start_evidence": (
+                        "https://pypi.org/simple failed: "
+                        "Temporary failure resolving pypi.org"
+                    ),
+                }
+                if infrastructure
+                else {}
+            ),
         )
         # The raw stream is deliberately redundant; phase-owned evidence above,
         # not this Worker-visible text, is what permits attribution.
@@ -398,8 +455,8 @@ def test_run_task_terminates_a_deterministic_infrastructure_loop() -> None:
         job_name="deterministic-infra",
     )
 
-    assert calls == 2
-    assert result.metadata["infra_retry_limit_enforced"] is True
-    assert result.metadata["infra_retry_unbounded_by_attempt_count"] is False
-    assert result.metadata["infra_retry_failure_signature_deduplication"] is True
-    assert len(result.metadata["infra_retry_attempts"]) == 2
+    assert calls == 3
+    assert result.metadata["infra_retry_limit_enforced"] is False
+    assert result.metadata["infra_retry_unbounded_by_attempt_count"] is True
+    assert result.metadata["infra_retry_failure_signature_deduplication"] is False
+    assert len(result.metadata["infra_retry_attempts"]) == 3
