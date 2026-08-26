@@ -56,7 +56,7 @@ def test_local_read_rejects_final_symlink_swapped_after_authorization(
     assert secret.read_text(encoding="utf-8") == "classified\n"
 
 
-def test_local_atomic_write_replaces_swapped_symlink_without_following_it(
+def test_local_atomic_write_fails_closed_on_exchange_symlink_race(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -66,26 +66,30 @@ def test_local_atomic_write_replaces_swapped_symlink_without_following_it(
     target.write_text("old\n", encoding="utf-8")
     secret = tmp_path / "secret.txt"
     secret.write_text("classified\n", encoding="utf-8")
-    real_replace = safe_path_io.os.replace
+    real_renameat2 = safe_path_io._renameat2
     swapped = False
 
-    def racing_replace(src, dst, *args, **kwargs):
+    def racing_renameat2(parent_fd, source, destination, flags):
         nonlocal swapped
-        if not swapped and dst == target.name:
+        if (
+            not swapped
+            and destination == target.name
+            and flags == safe_path_io._RENAME_EXCHANGE
+        ):
             target.unlink()
             target.symlink_to(secret)
             swapped = True
-        return real_replace(src, dst, *args, **kwargs)
+        return real_renameat2(parent_fd, source, destination, flags)
 
-    monkeypatch.setattr(safe_path_io.os, "replace", racing_replace)
+    monkeypatch.setattr(safe_path_io, "_renameat2", racing_renameat2)
 
     result = FileWriteTool().execute(str(target), "new\n")
 
     assert swapped is True
-    assert result.success is True
-    assert target.is_symlink() is False
-    assert target.read_text(encoding="utf-8") == "new\n"
+    assert result.success is False
+    assert target.is_symlink() is True
     assert secret.read_text(encoding="utf-8") == "classified\n"
+    assert list(workspace.glob(".victim.txt.tmp-*")) == []
 
 
 def test_harbor_secure_read_rejects_post_authorization_symlink(tmp_path: Path) -> None:
