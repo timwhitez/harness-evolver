@@ -9,7 +9,7 @@ from bench import _harbor_issue5_logic as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 
 class HarborRunner(_base.HarborRunner):

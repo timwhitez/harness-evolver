@@ -10,7 +10,7 @@ from harness.tools import process_runner
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 
 def _invalid_timeout_result(value: object) -> _base.ToolResult | None:

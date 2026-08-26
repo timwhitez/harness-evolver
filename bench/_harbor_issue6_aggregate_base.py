@@ -19,7 +19,7 @@ from bench import _harbor_issue6_base as _base
 
 for _name in dir(_base):
     if not _name.startswith("__"):
-        globals()[_name] = getattr(_base, _name)
+        globals().setdefault(_name, getattr(_base, _name))
 
 
 _FORCED_TRIAL_RESULT: ContextVar[dict[str, Any] | None] = ContextVar(

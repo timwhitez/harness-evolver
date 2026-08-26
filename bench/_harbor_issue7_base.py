@@ -12,7 +12,7 @@ from harness.url_safety import safe_endpoint_hostname
 
 for _name in dir(_base):
     if not _name.startswith("__"):
-        globals()[_name] = getattr(_base, _name)
+        globals().setdefault(_name, getattr(_base, _name))
 
 
 def _base_url_host(self: object, base_url: str) -> str:

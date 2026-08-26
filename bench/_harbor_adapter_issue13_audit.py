@@ -21,7 +21,7 @@ _original._HARBOR_GREP_COUNTING_PYTHON = (
 # surface, including the embedded secure script used by direct regression tests.
 for _name, _value in vars(_original).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 _OriginalHarborGrepTool = _original.HarborGrepTool
 

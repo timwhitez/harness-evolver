@@ -19,7 +19,7 @@ from bench import _harbor_issue6_recovery_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 
 _ALLOWED_ATTEMPT_KEYS: ContextVar[frozenset[str] | None] = ContextVar(

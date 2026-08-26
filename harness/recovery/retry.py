@@ -11,7 +11,7 @@ from harness.recovery import _retry_issue20_base as _base
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        globals()[_name] = _value
+        globals().setdefault(_name, _value)
 
 
 _DECIMAL_SATURATION_PRECISION = 100
