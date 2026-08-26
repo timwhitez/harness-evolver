@@ -600,7 +600,7 @@ def test_harbor_runner_does_not_spin_on_prebuilt_warmup_403(tmp_path):
     assert len(result.metadata["infra_retry_attempts"]) == 1
 
 
-def test_harbor_runner_marks_docker_build_download_failure_as_infra():
+def test_raw_docker_build_download_text_is_not_phase_owned_infra():
     trial = TrialResult(
         trial_id="qemu-startup__abc",
         task_id="qemu-startup",
@@ -617,7 +617,7 @@ def test_harbor_runner_marks_docker_build_download_failure_as_infra():
         harbor_stdout='Acquire::http::Timeout "30";',
     )
 
-    assert HarborRunner().is_infra_error(trial) is True
+    assert HarborRunner().is_infra_error(trial) is False
 
 
 def test_parse_harbor_job_result_requires_verifier_reward(tmp_path):
@@ -689,13 +689,13 @@ def test_parse_harbor_job_result_preserves_verifier_environment_logs(tmp_path):
 
     assert result.status == TrialStatus.FAILED
     assert result.verified is True
-    assert result.metadata["verifier_infra_error"] is True
+    assert result.metadata["verifier_infra_error"] is False
     assert "uvx: command not found" in result.metadata["verifier_logs"]
     assert "SSL certificate problem" in "\n".join(result.error_log)
-    assert HarborRunner().is_infra_error(result) is True
+    assert HarborRunner().is_infra_error(result) is False
 
 
-def test_parse_harbor_job_result_marks_verifier_cache_permission_as_infra(tmp_path):
+def test_parse_harbor_job_result_keeps_cache_permission_text_diagnostic(tmp_path):
     job_dir = tmp_path / "job1"
     trial_dir = job_dir / "mailman__abc"
     verifier_dir = trial_dir / "verifier"
@@ -728,12 +728,12 @@ def test_parse_harbor_job_result_marks_verifier_cache_permission_as_infra(tmp_pa
 
     assert result.status == TrialStatus.FAILED
     assert result.verified is True
-    assert result.metadata["verifier_infra_error"] is True
+    assert result.metadata["verifier_infra_error"] is False
     assert "Failed to write to the distribution cache" in result.metadata["verifier_logs"]
-    assert HarborRunner().is_infra_error(result) is True
+    assert HarborRunner().is_infra_error(result) is False
 
 
-def test_harbor_runner_excludes_verified_verifier_infra_failures_from_score(tmp_path):
+def test_harbor_runner_does_not_exclude_verified_raw_verifier_failure(tmp_path):
     runner = HarborRunner(jobs_dir=tmp_path / "jobs", output_dir=tmp_path / "runs")
 
     def fake_run_command(argv, *, timeout_audit):
@@ -773,9 +773,9 @@ def test_harbor_runner_excludes_verified_verifier_infra_failures_from_score(tmp_
 
     assert result.status == TrialStatus.FAILED
     assert result.verified is True
-    assert result.metadata["verifier_infra_error"] is True
-    assert result.metadata["infra_error_detected"] is True
-    assert result.metadata["score_exclusion_reason"] == "infrastructure_error"
+    assert result.metadata["verifier_infra_error"] is False
+    assert result.metadata["infra_error_detected"] is False
+    assert "score_exclusion_reason" not in result.metadata
 
 
 def test_parse_harbor_job_result_does_not_treat_successful_apt_logs_as_infra(tmp_path):
@@ -965,7 +965,7 @@ def test_parse_harbor_job_result_flags_exception_after_done_tool(tmp_path):
     assert any("post-completion exception" in error for error in result.error_log)
 
 
-def test_parse_harbor_job_result_uses_exception_traceback_for_verifier_runtime_prepare(
+def test_parse_harbor_job_result_keeps_untrusted_prepare_traceback_diagnostic(
     tmp_path,
 ):
     job_dir = tmp_path / "job1"
@@ -1014,15 +1014,15 @@ def test_parse_harbor_job_result_uses_exception_traceback_for_verifier_runtime_p
     assert result.verified is False
     assert result.metadata["timeout_phase"] == "verifier_runtime_prepare"
     assert result.metadata["verifier_runtime_prepare_timeout"] is True
-    assert result.metadata["verifier_infra_error"] is True
-    assert result.metadata["infra_error_detected"] is True
-    assert result.metadata["score_exclusion_reason"] == "infrastructure_error"
-    assert HarborRunner().is_infra_error(result) is True
+    assert result.metadata["verifier_infra_error"] is False
+    assert result.metadata["infra_error_detected"] is False
+    assert "score_exclusion_reason" not in result.metadata
+    assert HarborRunner().is_infra_error(result) is False
     assert result.metadata["post_completion_agent_exception"] is False
     assert not any("post-completion exception" in error for error in result.error_log)
 
 
-def test_parse_harbor_job_selected_result_traceback_marks_verifier_runtime_prepare_infra(
+def test_selected_result_traceback_alone_is_not_verifier_prepare_provenance(
     tmp_path,
 ):
     job_dir = tmp_path / "job1"
@@ -1069,10 +1069,10 @@ def test_parse_harbor_job_selected_result_traceback_marks_verifier_runtime_prepa
     assert result.verified is False
     assert result.metadata["timeout_phase"] == "verifier_runtime_prepare"
     assert result.metadata["verifier_runtime_prepare_timeout"] is True
-    assert result.metadata["verifier_infra_error"] is True
-    assert result.metadata["infra_error_detected"] is True
-    assert result.metadata["score_exclusion_reason"] == "infrastructure_error"
-    assert HarborRunner().is_infra_error(result) is True
+    assert result.metadata["verifier_infra_error"] is False
+    assert result.metadata["infra_error_detected"] is False
+    assert "score_exclusion_reason" not in result.metadata
+    assert HarborRunner().is_infra_error(result) is False
 
 
 def test_harbor_agent_live_trajectory_sink_appends_jsonl(tmp_path):

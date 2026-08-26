@@ -15,6 +15,62 @@ for _name, _value in vars(_base).items():
 class HarborRunner(_base.HarborRunner):
     """Require independently structured provenance for infrastructure exclusion."""
 
+    def parse_job_dir(
+        self,
+        job_dir: str | _base.Path,
+        *,
+        task_id: str,
+        returncode: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+        wall_time: float = 0.0,
+        agent_config: dict[str, Any] | None = None,
+    ) -> _base.TrialResult:
+        """Normalize inherited provisional markers through the strict policy."""
+
+        trial = super().parse_job_dir(
+            job_dir,
+            task_id=task_id,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            wall_time=wall_time,
+            agent_config=agent_config,
+        )
+        attempt_results = trial.metadata.get("attempt_results")
+        if isinstance(attempt_results, list):
+            for attempt in attempt_results:
+                if not isinstance(attempt, dict):
+                    continue
+                attempt_metadata = attempt.get("metadata")
+                if not isinstance(attempt_metadata, dict):
+                    continue
+                self._normalize_provisional_attribution(
+                    attempt_metadata,
+                    strict_infrastructure=(
+                        self._attempt_snapshot_is_infrastructure(attempt)
+                    ),
+                )
+        strict_infrastructure = self.is_infra_error(trial)
+        self._normalize_provisional_attribution(
+            trial.metadata,
+            strict_infrastructure=strict_infrastructure,
+        )
+        return trial
+
+    @staticmethod
+    def _normalize_provisional_attribution(
+        metadata: dict[str, Any],
+        *,
+        strict_infrastructure: bool,
+    ) -> None:
+        metadata["infra_error_detected"] = strict_infrastructure
+        if strict_infrastructure:
+            return
+        metadata["verifier_infra_error"] = False
+        if metadata.get("score_exclusion_reason") == "infrastructure_error":
+            metadata.pop("score_exclusion_reason", None)
+
     def _trusted_early_process_failure(
         self,
         command: _base.HarborCommand,
