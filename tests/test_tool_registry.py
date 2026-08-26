@@ -335,7 +335,7 @@ class TestShellTool:
         assert result.metadata["blocked_by"] == "heavy_graphics_runtime_dependency_guard"
         assert package in result.error
         assert "Mesa/OpenGL/Vulkan/X11" in result.error
-        assert "dependency-light CV artifact" in result.error
+        assert "dependency-light artifact" in result.error
 
     @pytest.mark.parametrize(
         "command",
@@ -849,7 +849,7 @@ class TestShellTool:
         result = tool.execute("sleep 5", timeout=0.1)
         assert result.success is False
         assert "timed out" in result.error.lower()
-        assert "operation timeout" in result.error
+        assert "operation result" in result.error
         assert "loop stop condition" in result.error
         assert "master, sub-agent, or Worker loop stop condition" in result.error
         assert "agent time budget" not in result.error
@@ -869,15 +869,17 @@ class TestShellTool:
         result = tool.execute("sleep 5", timeout=0.1)
 
         assert result.success is False
-        assert "verification timed out" in result.error
-        assert "operation timeout" in result.error
+        assert "timed out" in result.error.lower()
+        assert "operation result" in result.error
         assert "loop stop condition" in result.error
         assert result.metadata["timed_out"] is True
         assert result.metadata["operation_timeout_stop_condition"] is False
         assert result.metadata["timeout_seconds_stop_condition"] is False
         assert result.metadata["loop_stop_condition"] is False
         assert result.metadata["tool_timeout_telemetry"] is True
-        assert result.metadata["tool_timeout_telemetry_source"] == "verify"
+        # Verify delegates bounded process execution to ShellTool and preserves
+        # its cleanup telemetry unchanged.
+        assert result.metadata["tool_timeout_telemetry_source"] == "shell"
         assert result.metadata["tool_timeout_telemetry_stop_condition"] is False
         assert result.metadata["timeout_telemetry_stop_condition"] is False
         assert result.metadata["elapsed_ms"] > 0
@@ -1114,7 +1116,11 @@ class TestShellTool:
         result = tool.execute(f"printf '%b' {output!r}", timeout=5)
 
         assert result.success is True
-        assert result.metadata == {"exit_code": 0}
+        assert result.metadata["exit_code"] == 0
+        assert result.metadata["operation_timeout_stop_condition"] is False
+        assert result.metadata["timeout_seconds_stop_condition"] is False
+        assert result.metadata["loop_stop_condition"] is False
+        assert result.metadata["output_bounded"] is True
 
     def test_verify_blocks_nested_external_agent_creation_before_exec(self):
         tool = VerifyTool()

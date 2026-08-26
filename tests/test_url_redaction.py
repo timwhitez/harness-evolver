@@ -15,7 +15,10 @@ def test_role_redaction_removes_every_secret_url_component() -> None:
     role = RoleModelConfig(
         provider="openai_compatible",
         model="example",
-        base_url="https://user:secret@Gateway.Example:8443/v1?token=abc#private",
+        base_url=(
+            "https://url-user-91:url-password-82@Gateway.Example:8443/"
+            "private-path-73?credential-name-64=query-secret-55#fragment-secret-46"
+        ),
         api_key_env="EXAMPLE_API_KEY",
     )
 
@@ -27,7 +30,14 @@ def test_role_redaction_removes_every_secret_url_component() -> None:
     assert redacted["base_url_port"] == 8443
     assert redacted["base_url_scheme"] == "https"
     assert redacted["base_url_valid"] is True
-    for secret in ["user", "secret", "/v1", "token", "abc", "private"]:
+    for secret in [
+        "url-user-91",
+        "url-password-82",
+        "private-path-73",
+        "credential-name-64",
+        "query-secret-55",
+        "fragment-secret-46",
+    ]:
         assert secret not in serialized
 
 
