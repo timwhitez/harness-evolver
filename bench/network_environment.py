@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from harbor.environments.definition import should_use_prebuilt_docker_image
 from harbor.environments.docker.docker import DockerEnvironment
 from harbor.models.trial.paths import EnvironmentPaths
 
@@ -283,15 +284,30 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
         await super().start(force_build)
 
     async def _warm_prebuilt_image_cache_if_needed(self, force_build: bool) -> None:
-        if force_build:
-            return
         task_env_config: Any = getattr(self, "task_env_config")
-        image = self._hl_effective_prebuilt_image or str(
-            getattr(task_env_config, "docker_image", "") or ""
-        )
+        configured_image = str(getattr(task_env_config, "docker_image", "") or "")
+        if not should_use_prebuilt_docker_image(
+            self.environment_dir,
+            docker_image=configured_image or None,
+            force_build=force_build,
+        ):
+            return
+        image = self._hl_effective_prebuilt_image or configured_image
         image = image.strip()
         if not image:
             return
+        original_image = self._hl_original_prebuilt_image.strip()
+        if original_image and not _prebuilt_reference_digests_are_compatible(
+            image,
+            original_image,
+        ):
+            raise _prebuilt_warmup_error(
+                "Prebuilt Docker image mapping changes content identity: effective "
+                f"image {image} does not have the same digest as original image "
+                f"{original_image}. Refusing local reuse or registry pull.",
+                kind="prebuilt_image_cache_warmup_failure",
+                deterministic_access_failure=False,
+            )
         digest_pinned = bool(_normalized_registry_digest(image))
         digest_available = False
         if digest_pinned:
@@ -1166,6 +1182,15 @@ def _docker_image_has_registry_provenance(
     effective or explicit original references are eligible for local reuse.
     """
 
+    image = image.strip()
+    equivalent_reference = equivalent_reference.strip()
+    if not _normalized_registry_digest(image):
+        return False
+    if equivalent_reference and not _prebuilt_reference_digests_are_compatible(
+        image,
+        equivalent_reference,
+    ):
+        return False
     references = (image, equivalent_reference)
     expected_digests = {
         digest
@@ -1267,6 +1292,19 @@ def _registry_content_digest(reference: str) -> str:
     ):
         return ""
     return digest.lower()
+
+
+def _prebuilt_reference_digests_are_compatible(
+    image: str,
+    original_image: str,
+) -> bool:
+    """Require rewritten digest references to preserve exact content identity."""
+
+    image_digest = _registry_content_digest(image)
+    original_digest = _registry_content_digest(original_image)
+    if not image_digest and not original_digest:
+        return True
+    return bool(image_digest and image_digest == original_digest)
 
 
 def _available_original_prebuilt_fallback(
