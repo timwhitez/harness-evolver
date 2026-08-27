@@ -617,7 +617,9 @@ def test_prebuilt_registry_provenance_requires_matching_repository(monkeypatch):
     ) is False
 
 
-def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_path):
+def test_prebuilt_cache_warmup_activates_local_original_digest_without_tag(
+    monkeypatch, tmp_path
+):
     calls = []
 
     def fake_init(self, environment_dir, *args, **kwargs):
@@ -626,6 +628,9 @@ def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_
         self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
         self.session_id = "sess"
         self.environment_name = "env"
+        self._env_vars = SimpleNamespace(
+            prebuilt_image_name=kwargs["task_env_config"].docker_image
+        )
         self.logger = SimpleNamespace(info=lambda *args, **kwargs: calls.append(("info", args)))
 
     async def fake_start(self, force_build):
@@ -642,25 +647,10 @@ def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_
                     '["alexgshaw/mailman@sha256:aaaa"]',
                     "",
                 )
-            if image == "registry.example/alexgshaw/mailman@sha256:aaaa" and any(
-                call[1] == [
-                    "docker",
-                    "tag",
-                    "alexgshaw/mailman@sha256:aaaa",
-                    "registry.example/alexgshaw/mailman@sha256:aaaa",
-                ]
-                for call in calls
-            ):
-                return subprocess.CompletedProcess(
-                    argv,
-                    0,
-                    '["alexgshaw/mailman@sha256:aaaa"]',
-                    "",
-                )
             return subprocess.CompletedProcess(argv, 1, "", "missing")
         if argv[:2] == ["docker", "tag"]:
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        raise AssertionError("docker pull should not run when local fallback can be tagged")
+            raise AssertionError("digest references must never be Docker tag targets")
+        raise AssertionError("docker pull should not run when exact digest is local")
 
     monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
     monkeypatch.setattr(DockerEnvironment, "start", fake_start)
@@ -677,16 +667,11 @@ def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_
 
     asyncio.run(env.start(force_build=False))
 
-    assert (
-        "run",
-        [
-            "docker",
-            "tag",
-            "alexgshaw/mailman@sha256:aaaa",
-            "registry.example/alexgshaw/mailman@sha256:aaaa",
-        ],
-        10,
-    ) in calls
+    assert all(
+        call[1][:2] != ["docker", "tag"] for call in calls if call[0] == "run"
+    )
+    assert env.task_env_config.docker_image == "alexgshaw/mailman@sha256:aaaa"
+    assert env._env_vars.prebuilt_image_name == "alexgshaw/mailman@sha256:aaaa"
     assert any(call[0] == "info" and "local fallback" in call[1][0] for call in calls)
     assert calls[-1] == ("super_start", False)
 
@@ -933,6 +918,70 @@ def test_prebuilt_cache_warmup_pulls_original_when_mirror_denies(monkeypatch, tm
     # effective mirror reference, and compose start proceeded.
     assert ("run", ("docker", "pull", original_ref)) in calls
     assert ("tag", original_ref, mirror_ref) in calls
+    assert ("super_start", False) in calls
+
+
+def test_prebuilt_cache_warmup_activates_original_digest_when_mirror_denies(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self.environment_dir = environment_dir
+        self.task_env_config = kwargs["task_env_config"]
+        self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
+        self.session_id = "sess"
+        self.environment_name = "env"
+        self._env_vars = SimpleNamespace(
+            prebuilt_image_name=kwargs["task_env_config"].docker_image
+        )
+        self.logger = SimpleNamespace(
+            info=lambda *args, **kwargs: calls.append(("info", args)),
+            warning=lambda *args, **kwargs: calls.append(("warning", args)),
+        )
+
+    async def fake_start(self, force_build):
+        calls.append(("super_start", force_build))
+
+    mirror_ref = "registry.example/alexgshaw/write-compressor@sha256:aaaa"
+    original_ref = "alexgshaw/write-compressor@sha256:aaaa"
+
+    def fake_run(argv, **kwargs):
+        calls.append(("run", tuple(argv)))
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, "", "missing")
+        if argv[:2] == ["docker", "pull"] and argv[2] == mirror_ref:
+            raise subprocess.CalledProcessError(
+                1,
+                argv,
+                output="",
+                stderr="403 Forbidden",
+            )
+        if argv[:2] == ["docker", "pull"] and argv[2] == original_ref:
+            return subprocess.CompletedProcess(argv, 0, "pulled", "")
+        if argv[:2] == ["docker", "tag"]:
+            raise AssertionError("digest references must never be Docker tag targets")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "start", fake_start)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(docker_image=original_ref),
+        prebuilt_docker_pull_timeout_seconds=7,
+        prebuilt_docker_hub_mirror="registry.example",
+    )
+
+    asyncio.run(env.start(force_build=False))
+
+    assert ("run", ("docker", "pull", original_ref)) in calls
+    assert all(
+        call[1][:2] != ("docker", "tag") for call in calls if call[0] == "run"
+    )
+    assert env.task_env_config.docker_image == original_ref
+    assert env._env_vars.prebuilt_image_name == original_ref
     assert ("super_start", False) in calls
 
 

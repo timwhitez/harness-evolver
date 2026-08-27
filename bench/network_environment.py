@@ -285,7 +285,10 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
     async def _warm_prebuilt_image_cache_if_needed(self, force_build: bool) -> None:
         if force_build:
             return
-        image = self._hl_effective_prebuilt_image or str(self.task_env_config.docker_image or "")
+        task_env_config: Any = getattr(self, "task_env_config")
+        image = self._hl_effective_prebuilt_image or str(
+            getattr(task_env_config, "docker_image", "") or ""
+        )
         image = image.strip()
         if not image:
             return
@@ -305,13 +308,15 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
             )
             return
         fallback = await asyncio.to_thread(
-            _tag_available_prebuilt_fallback,
+            _available_original_prebuilt_fallback,
             image,
             self._hl_original_prebuilt_image,
         )
         if fallback:
+            self._activate_original_prebuilt_reference(fallback)
             self.logger.info(
-                "Prebuilt image warmup satisfied from local fallback: %s -> %s",
+                "Prebuilt image warmup satisfied from local fallback; using "
+                "the exact original digest reference: %s (instead of %s)",
                 fallback,
                 image,
             )
@@ -355,12 +360,27 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
                     original_image,
                 )
                 try:
-                    await asyncio.to_thread(
-                        _pull_and_tag_original_prebuilt_image,
-                        original_image,
-                        image,
-                        timeout,
-                    )
+                    target_digest = _registry_content_digest(image)
+                    original_digest = _registry_content_digest(original_image)
+                    if target_digest or original_digest:
+                        if not target_digest or target_digest != original_digest:
+                            raise RuntimeError(
+                                "original image fallback digest does not match the "
+                                "effective mirror image digest"
+                            )
+                        await asyncio.to_thread(
+                            _pull_prebuilt_image,
+                            original_image,
+                            timeout,
+                        )
+                        self._activate_original_prebuilt_reference(original_image)
+                    else:
+                        await asyncio.to_thread(
+                            _pull_and_tag_original_prebuilt_image,
+                            original_image,
+                            image,
+                            timeout,
+                        )
                     self.logger.info(
                         "Prebuilt image warmup satisfied from original image "
                         "fallback: %s -> %s",
@@ -397,6 +417,34 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
                     _prebuilt_pull_failure_can_try_original(exc.stdout, exc.stderr)
                 ),
             ) from exc
+
+    def _activate_original_prebuilt_reference(self, original_image: str) -> None:
+        """Use an exact original digest without constructing an invalid digest tag."""
+
+        original_image = original_image.strip()
+        if not original_image or not _normalized_registry_digest(original_image):
+            raise RuntimeError(
+                "original prebuilt activation requires an exact digest reference"
+            )
+        task_env_config: Any = getattr(self, "task_env_config")
+        if hasattr(task_env_config, "model_copy"):
+            setattr(
+                self,
+                "task_env_config",
+                task_env_config.model_copy(update={"docker_image": original_image}),
+            )
+        else:
+            task_env_config.docker_image = original_image
+        env_vars: Any = getattr(self, "_env_vars")
+        if hasattr(env_vars, "model_copy"):
+            setattr(
+                self,
+                "_env_vars",
+                env_vars.model_copy(update={"prebuilt_image_name": original_image}),
+            )
+        else:
+            env_vars.prebuilt_image_name = original_image
+        self._hl_effective_prebuilt_image = original_image
 
     async def stop(self, delete: bool) -> None:
         """Stop Harbor containers without deleting Docker volumes.
@@ -1199,40 +1247,53 @@ def _normalized_registry_digest(reference: str) -> str:
     """Normalize a registry digest while preserving its content identity."""
 
     reference = reference.strip()
-    repository, separator, digest = reference.partition("@")
+    repository, separator, _ = reference.partition("@")
+    digest = _registry_content_digest(reference)
+    if not separator or not digest:
+        return ""
+    normalized_repository = _normalized_registry_repository(repository)
+    if not normalized_repository:
+        return ""
+    return f"{normalized_repository}@{digest}"
+
+
+def _registry_content_digest(reference: str) -> str:
+    """Return the normalized content digest portion of an exact image reference."""
+
+    _, separator, digest = reference.strip().partition("@")
     if not separator or not re.fullmatch(
         r"[a-zA-Z0-9_+.-]+:[0-9a-fA-F]+",
         digest,
     ):
         return ""
-    normalized_repository = _normalized_registry_repository(repository)
-    if not normalized_repository:
-        return ""
-    return f"{normalized_repository}@{digest.lower()}"
+    return digest.lower()
 
 
-def _tag_available_prebuilt_fallback(image: str, original_image: str = "") -> str:
-    """Tag a local equivalent image to the effective prebuilt reference.
+def _available_original_prebuilt_fallback(
+    image: str,
+    original_image: str = "",
+) -> str:
+    """Return an exact local original digest that can replace the mirror reference.
 
     Only an explicit original reference recorded during mirror rewriting is
-    considered, and only when it is digest-pinned. Tag-only and inferred
-    cross-registry candidates cannot establish content identity and must be
-    pulled from their declared registry.
+    considered. Both references must identify the same content digest. Docker
+    cannot create a tag whose target contains ``@digest``, so the caller must
+    activate the original reference directly instead of tagging it.
     """
 
     image = image.strip()
     original_image = original_image.strip()
+    image_digest = _registry_content_digest(image)
+    original_digest = _registry_content_digest(original_image)
     if (
         not image
         or not original_image
         or image == original_image
-        or not _normalized_registry_digest(original_image)
+        or not image_digest
+        or image_digest != original_digest
     ):
         return ""
-    if _docker_image_has_registry_provenance(original_image) and _docker_tag_image(
-        original_image,
-        image,
-    ):
+    if _docker_image_has_registry_provenance(original_image):
         return original_image
     return ""
 
@@ -1339,13 +1400,11 @@ def _write_prebuilt_warmup_failure_receipt(
         temporary.unlink(missing_ok=True)
 
 
-def _pull_and_tag_original_prebuilt_image(source: str, target: str, timeout: int) -> None:
-    """Pull the original prebuilt image and tag it to the effective reference.
+def _pull_prebuilt_image(source: str, timeout: int) -> None:
+    """Pull one exact prebuilt reference with bounded diagnostics."""
 
-    Raises RuntimeError with diagnostics if the pull or tag fails.
-    """
-    if not source or not target or source == target:
-        raise RuntimeError("original image fallback has no distinct source image")
+    if not source:
+        raise RuntimeError("prebuilt image pull requires a source image")
     try:
         completed = subprocess.run(
             ["docker", "pull", source],
@@ -1369,6 +1428,21 @@ def _pull_and_tag_original_prebuilt_image(source: str, target: str, timeout: int
         raise RuntimeError(
             f"docker pull {source} failed with return code {completed.returncode}. {detail}"
         )
+
+
+def _pull_and_tag_original_prebuilt_image(source: str, target: str, timeout: int) -> None:
+    """Pull the original prebuilt image and tag it to the effective reference.
+
+    Raises RuntimeError with diagnostics if the pull or tag fails.
+    """
+    if not source or not target or source == target:
+        raise RuntimeError("original image fallback has no distinct source image")
+    if _registry_content_digest(source) or _registry_content_digest(target):
+        raise RuntimeError(
+            "digest-pinned original image fallback must activate the original "
+            "reference directly"
+        )
+    _pull_prebuilt_image(source, timeout)
     if not _docker_tag_image(source, target):
         raise RuntimeError(f"docker tag {source} {target} failed after original pull")
 
