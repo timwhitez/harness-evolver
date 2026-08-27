@@ -1,14 +1,44 @@
+<div align="center">
+
 # HarnessEvolver
 
-HarnessEvolver is an experimental, self-owned coding-agent harness for
-[TerminalBench 2.0](https://www.tbench.ai/). It uses a Heuristic Learning (HL)
-loop to turn verified benchmark failures into small, reviewable Worker and
-harness improvements.
+**A verifier-grounded, self-improving coding-agent harness for TerminalBench 2.0.**
 
-The evaluated agent is this repository's own Worker loop. Codex, Claude Code,
-and other coding agents may be used only outside a benchmark run to analyze
-evidence and propose a bounded change to this repository; they are never the
-agent being evaluated.
+[![Research Preview](https://img.shields.io/badge/status-research_preview-7c3aed)](#status-and-scope)
+[![TerminalBench 2.0](https://img.shields.io/badge/benchmark-TerminalBench_2.0-2563eb)](https://www.tbench.ai/)
+[![Rust Worker](https://img.shields.io/badge/worker-Rust-ce422b?logo=rust&logoColor=white)](crates/hl-worker-core/)
+[![Python Orchestration](https://img.shields.io/badge/orchestration-Python-3776ab?logo=python&logoColor=white)](pyproject.toml)
+[![MIT License](https://img.shields.io/badge/license-MIT-059669)](LICENSE)
+
+[Quick start](#quick-start) · [Architecture](docs/architecture.md) ·
+[Configuration](#configuration-and-secrets) · [Contributing](CONTRIBUTING.md)
+
+</div>
+
+HarnessEvolver runs its own Rust Worker against TerminalBench tasks, treats
+Harbor/verifier output as ground truth, and converts verified failures into
+small, reviewable harness improvements through a Heuristic Learning (HL) loop.
+
+> [!IMPORTANT]
+> The evaluated agent is this repository's Worker loop and harness. Codex,
+> Claude Code, and other coding agents may analyze evidence and propose bounded
+> repository changes only outside benchmark runs; they are never substituted
+> for the Worker being evaluated.
+
+## Why HarnessEvolver?
+
+| Principle | Enforced contract |
+| --- | --- |
+| **Self-owned agent** | Task execution stays inside the Rust Worker and repository harness. |
+| **Verifier-grounded** | A model completion is not a pass; Harbor/verifier evidence decides outcomes. |
+| **Auditable learning** | Trials, trajectories, failure packets, diffs, and regression decisions remain traceable. |
+| **Bounded evolution** | Each updater cycle proposes one focused policy slice, followed by deterministic review and regression gates. |
+
+```text
+TerminalBench task → Rust Worker → Harbor verifier → failure evidence
+                           ↑                              ↓
+                     accepted policy ← review + regression ← bounded update
+```
 
 ## Status and scope
 
@@ -40,6 +70,8 @@ acceptance contract.
 ## Requirements
 
 - Python 3.11 or later
+- A stable Rust toolchain, or a current prebuilt `hl-worker-core` binary, for
+  Worker runs
 - Docker and Docker Compose v2 for real Harbor-backed trials
 - A compatible Harbor CLI installation and authentication for real trials
 - A local TerminalBench task checkout (the default path is
@@ -57,6 +89,7 @@ run the deterministic suite:
 python -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
+cargo test --manifest-path crates/hl-worker-core/Cargo.toml
 pytest tests/ -q
 ```
 
