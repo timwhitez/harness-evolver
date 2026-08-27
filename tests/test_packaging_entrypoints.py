@@ -31,6 +31,15 @@ EXPECTED_RUNTIME_RESOURCES = {
     "bench/resources/hl-worker-core/Cargo.lock",
     "bench/resources/hl-worker-core/src/main.rs",
 }
+RUNTIME_COPY_EXCLUDES = {
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "jobs",
+    "target",
+    "terminal-bench-tasks",
+    "trials",
+}
 
 
 def test_console_entrypoint_modules_are_in_discovered_packages() -> None:
@@ -80,8 +89,11 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
             "build",
             "dist",
             "*.egg-info",
+            *RUNTIME_COPY_EXCLUDES,
         ),
     )
+    for runtime_root in RUNTIME_COPY_EXCLUDES:
+        assert not (checkout / runtime_root).exists()
     wheel_dir = tmp_path / "wheelhouse"
     wheel_dir.mkdir()
     build_script = (

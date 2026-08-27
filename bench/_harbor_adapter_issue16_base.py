@@ -2,7 +2,7 @@
 
 Harbor imports this class through:
 
-    --agent-import-path bench.harbor_adapter:HLWorkerHarborAgent
+    --agent bench.harbor_adapter:HLWorkerHarborAgent
 
 The adapter keeps Codex/Forge/Claude Code out of the evaluated Worker path.
 It runs this repository's ``HLAgent`` host-side while dispatching tools into the

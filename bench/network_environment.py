@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from harbor.environments.docker.docker import DockerEnvironment
-
+from harbor.models.trial.paths import EnvironmentPaths
 
 # Public, vendor-neutral network defaults. Private mirrors, proxy roots, and
 # image overrides can be supplied through gitignored config/local.yaml.
@@ -187,7 +187,7 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
         if enabled:
             task_env_config = kwargs.get("task_env_config")
             docker_image = getattr(task_env_config, "docker_image", None)
-            if docker_image:
+            if task_env_config is not None and docker_image:
                 effective_image = effective_docker_image_reference(
                     str(docker_image),
                     self._hl_prebuilt_mirror_config,
@@ -215,9 +215,35 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
         paths = list(super()._docker_compose_paths)
         if self._hl_resource_compose_path is None:
             return paths
-        if paths and paths[-1] == self._DOCKER_COMPOSE_NO_NETWORK_PATH:
-            return [*paths[:-1], self._hl_resource_compose_path, paths[-1]]
-        return [*paths, self._hl_resource_compose_path]
+        if self._hl_resource_compose_path in paths:
+            return paths
+
+        # Harbor 0.22 replaced the legacy no-network compose override with
+        # egress-control overlays. Keep our resource policy after task-authored
+        # overrides but before whichever network overlay the installed Harbor
+        # exposes, without requiring a version-specific private sentinel.
+        network_overlays = {
+            overlay
+            for overlay in (
+                getattr(self, "_DOCKER_COMPOSE_NO_NETWORK_PATH", None),
+                getattr(self, "_DOCKER_COMPOSE_EGRESS_CONTROL_PATH", None),
+                getattr(self, "_egress_control_services_compose_path", None),
+            )
+            if overlay is not None
+        }
+        insert_at = next(
+            (
+                index
+                for index, compose_path in enumerate(paths)
+                if compose_path in network_overlays
+            ),
+            len(paths),
+        )
+        return [
+            *paths[:insert_at],
+            self._hl_resource_compose_path,
+            *paths[insert_at:],
+        ]
 
     async def start(self, force_build: bool) -> None:
         if self._hl_resource_config.enabled:
@@ -263,9 +289,14 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
         image = image.strip()
         if not image:
             return
-        if await asyncio.to_thread(_docker_image_exists_locally, image):
+        if await asyncio.to_thread(
+            _docker_image_has_registry_provenance,
+            image,
+            self._hl_original_prebuilt_image,
+        ):
             self.logger.info(
-                "Prebuilt image already available locally; skipping Docker pull warmup: %s",
+                "Registry-provenanced prebuilt image already available locally; "
+                "skipping Docker pull warmup: %s",
                 image,
             )
             return
@@ -458,7 +489,7 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
         if verifier_env_keys & set(env):
             return True
         lowered = command.lower()
-        tests_dir = str(self._env_paths.tests_dir).lower()
+        tests_dir = str(EnvironmentPaths.for_os(self.os).tests_dir).lower()
         return tests_dir in lowered or "/tests/" in lowered
 
     async def _prepare_verifier_runtime(self, verifier_timeout_sec: int | None = None) -> None:
@@ -1062,27 +1093,144 @@ def _docker_image_exists_locally(image: str) -> bool:
     return completed.returncode == 0
 
 
+def _docker_image_has_registry_provenance(
+    image: str,
+    equivalent_reference: str = "",
+) -> bool:
+    """Return whether a local tag is backed by an expected registry digest.
+
+    A locally built image can be tagged with any benchmark image name. Mere tag
+    presence therefore cannot establish that it is equivalent to the declared
+    prebuilt. Docker records registry pulls in ``RepoDigests``; require one that
+    matches either the effective reference or its explicit original reference.
+    """
+
+    references = (image, equivalent_reference)
+    expected_repositories = {
+        repository
+        for repository in (
+            _normalized_registry_repository(reference) for reference in references
+        )
+        if repository
+    }
+    if not expected_repositories:
+        return False
+    try:
+        completed = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                image,
+                "--format",
+                "{{json .RepoDigests}}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=LOCAL_IMAGE_INSPECT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if completed.returncode != 0:
+        return False
+    try:
+        repo_digests = json.loads(completed.stdout.strip() or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(repo_digests, list):
+        return False
+    actual_repositories = {
+        repository
+        for repository in (
+            _normalized_registry_repository(str(repo_digest))
+            for repo_digest in repo_digests
+        )
+        if repository
+    }
+    if any("@" in reference for reference in references if reference):
+        expected_digests = {
+            digest
+            for digest in (
+                _normalized_registry_digest(reference) for reference in references
+            )
+            if digest
+        }
+        actual_digests = {
+            digest
+            for digest in (
+                _normalized_registry_digest(str(repo_digest))
+                for repo_digest in repo_digests
+            )
+            if digest
+        }
+        return bool(expected_digests & actual_digests)
+    return bool(expected_repositories & actual_repositories)
+
+
+def _normalized_registry_repository(reference: str) -> str:
+    """Normalize a tag or digest to a registry-qualified repository name."""
+
+    reference = reference.strip()
+    if not reference or re.fullmatch(r"sha256:[0-9a-fA-F]+", reference):
+        return ""
+    reference = reference.split("@", 1)[0]
+    if not reference:
+        return ""
+
+    if _is_explicit_registry(reference):
+        registry, path = reference.split("/", 1)
+    else:
+        registry, path = "docker.io", reference
+    if not path:
+        return ""
+    head, separator, leaf = path.rpartition("/")
+    if ":" in leaf:
+        leaf = leaf.split(":", 1)[0]
+    path = f"{head}{separator}{leaf}" if separator else leaf
+    if not path:
+        return ""
+    if "/" not in path:
+        path = f"library/{path}"
+
+    registry = registry.lower()
+    if registry in {"index.docker.io", "registry-1.docker.io"}:
+        registry = "docker.io"
+    return f"{registry}/{path.lower()}"
+
+
+def _normalized_registry_digest(reference: str) -> str:
+    """Normalize a registry digest while preserving its content identity."""
+
+    reference = reference.strip()
+    repository, separator, digest = reference.partition("@")
+    if not separator or not re.fullmatch(
+        r"[a-zA-Z0-9_+.-]+:[0-9a-fA-F]+",
+        digest,
+    ):
+        return ""
+    normalized_repository = _normalized_registry_repository(repository)
+    if not normalized_repository:
+        return ""
+    return f"{normalized_repository}@{digest.lower()}"
+
+
 def _tag_available_prebuilt_fallback(image: str, original_image: str = "") -> str:
     """Tag a local equivalent image to the effective prebuilt reference.
 
     Harbor tasks frequently declare Docker Hub images that are rewritten to a
     configured mirror for China-network reliability. If the rewritten tag is
     absent but Docker already has the same task image under its original Docker
-    Hub name or Harbor's locally built ``<task>__*-main:latest`` tag, tag it to
-    the effective reference and avoid a registry pull that can deterministically
-    fail or hang.
+    Hub name with matching registry provenance, tag it to the effective reference
+    and avoid a registry pull that can deterministically fail or hang. Arbitrary
+    task-built images are never considered equivalent.
     """
 
     image = image.strip()
     if not image:
         return ""
     for candidate in _local_prebuilt_named_fallback_candidates(image, original_image):
-        if not _docker_image_exists_locally(candidate):
-            continue
-        if _docker_tag_image(candidate, image):
-            return candidate
-    for candidate in _local_prebuilt_task_image_candidates(image, original_image):
-        if not _docker_image_exists_locally(candidate):
+        if not _docker_image_has_registry_provenance(candidate):
             continue
         if _docker_tag_image(candidate, image):
             return candidate
@@ -1097,13 +1245,6 @@ def _local_prebuilt_named_fallback_candidates(image: str, original_image: str = 
     return list(dict.fromkeys(candidates))
 
 
-def _local_prebuilt_task_image_candidates(image: str, original_image: str = "") -> list[str]:
-    task_name = _task_slug_from_prebuilt_image(original_image or image)
-    if not task_name:
-        return []
-    return _docker_images_matching_prefix(f"{task_name}__", ":latest")
-
-
 def _strip_first_registry_component(image: str) -> str:
     if "/" not in image:
         return ""
@@ -1111,42 +1252,6 @@ def _strip_first_registry_component(image: str) -> str:
     if "." in first or ":" in first or first == "localhost":
         return rest
     return ""
-
-
-def _task_slug_from_prebuilt_image(image: str) -> str:
-    reference = _strip_first_registry_component(image) or image
-    if not reference or "/" not in reference:
-        return ""
-    name = reference.rsplit("/", 1)[-1]
-    name = name.split("@", 1)[0].split(":", 1)[0]
-    if not name:
-        return ""
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
-        return ""
-    return name
-
-
-def _docker_images_matching_prefix(prefix: str, suffix: str) -> list[str]:
-    try:
-        completed = subprocess.run(
-            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=LOCAL_IMAGE_INSPECT_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if completed.returncode != 0:
-        return []
-    matches: list[str] = []
-    for raw_line in completed.stdout.splitlines():
-        reference = raw_line.strip()
-        if not reference or reference.endswith(":<none>"):
-            continue
-        if reference.startswith(prefix) and reference.endswith(suffix):
-            matches.append(reference)
-    return sorted(dict.fromkeys(matches))
 
 
 def _docker_tag_image(source: str, target: str) -> bool:
