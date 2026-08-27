@@ -702,6 +702,35 @@ def test_parse_harbor_job_result_keeps_info_stderr_out_of_success_errors(tmp_pat
     assert failed_process.error_log == ["Harbor process failed"]
 
 
+def test_parse_legacy_result_keeps_info_stderr_out_of_success_errors(tmp_path):
+    output_dir = tmp_path / "runs"
+    verifier_dir = output_dir / "legacy-job" / "verifier"
+    verifier_dir.mkdir(parents=True)
+    (verifier_dir / "reward.txt").write_text("1.0\n")
+    job_dir = tmp_path / "jobs" / "legacy-job"
+    job_dir.mkdir(parents=True)
+    runner = HarborRunner(output_dir=output_dir)
+
+    passed = runner.parse_job_dir(
+        job_dir,
+        task_id="fix-git",
+        returncode=0,
+        stderr="informational logger line",
+    )
+    failed_process = runner.parse_job_dir(
+        job_dir,
+        task_id="fix-git",
+        returncode=2,
+        stderr="Harbor process failed",
+    )
+
+    assert passed.status == TrialStatus.PASSED
+    assert passed.verified is True
+    assert passed.error_log == []
+    assert passed.harbor_stderr == "informational logger line"
+    assert failed_process.error_log == ["Harbor process failed"]
+
+
 def test_parse_harbor_job_result_preserves_verifier_environment_logs(tmp_path):
     job_dir = tmp_path / "job1"
     trial_dir = job_dir / "fix-git__abc"

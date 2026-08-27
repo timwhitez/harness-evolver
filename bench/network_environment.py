@@ -289,11 +289,15 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
         image = image.strip()
         if not image:
             return
-        if await asyncio.to_thread(
-            _docker_image_has_registry_provenance,
-            image,
-            self._hl_original_prebuilt_image,
-        ):
+        digest_pinned = bool(_normalized_registry_digest(image))
+        digest_available = False
+        if digest_pinned:
+            digest_available = await asyncio.to_thread(
+                _docker_image_has_registry_provenance,
+                image,
+                self._hl_original_prebuilt_image,
+            )
+        if digest_available:
             self.logger.info(
                 "Registry-provenanced prebuilt image already available locally; "
                 "skipping Docker pull warmup: %s",
@@ -403,28 +407,36 @@ class AptMirrorDockerEnvironment(DockerEnvironment):
         scripts for images/build cache.
         """
 
-        await self.prepare_logs_for_host()
-
-        if self._keep_containers and delete:
-            self.logger.warning(
-                "Both `keep_containers` and `--delete` option are set. "
-                "keep_containers takes precedence."
-            )
-        if self._keep_containers:
-            try:
-                await self._run_docker_compose_command(["stop"])
-            except Exception as exc:
-                self.logger.warning(f"Docker compose stop failed: {exc}")
-            return
         try:
-            if delete:
-                await self._run_docker_compose_command(["down", "--remove-orphans"])
-            else:
-                await self._run_docker_compose_command(["down"])
-        except Exception as exc:
-            self.logger.warning(f"Docker compose down failed: {exc}")
-        if delete and self._hl_resource_config.enabled:
-            await self._cleanup_stopped_hl_containers()
+            await self.prepare_logs_for_host()
+
+            if self._keep_containers and delete:
+                self.logger.warning(
+                    "Both `keep_containers` and `--delete` option are set. "
+                    "keep_containers takes precedence."
+                )
+            if self._keep_containers:
+                try:
+                    await self._run_docker_compose_command(["stop"])
+                except Exception as exc:
+                    self.logger.warning(f"Docker compose stop failed: {exc}")
+                return
+            try:
+                if delete:
+                    await self._run_docker_compose_command(
+                        ["down", "--remove-orphans"]
+                    )
+                else:
+                    await self._run_docker_compose_command(["down"])
+            except Exception as exc:
+                self.logger.warning(f"Docker compose down failed: {exc}")
+            if delete and self._hl_resource_config.enabled:
+                await self._cleanup_stopped_hl_containers()
+        finally:
+            self._cleanup_mounts_compose_file()
+            self._cleanup_resources_compose_file()
+            self._cleanup_env_compose_file()
+            self._cleanup_egress_control_services_compose_file()
 
     async def _cleanup_stopped_hl_containers(self) -> None:
         label = self._hl_resource_config.labels.get("com.harness-evolver.cleanup", "task")
@@ -1097,23 +1109,24 @@ def _docker_image_has_registry_provenance(
     image: str,
     equivalent_reference: str = "",
 ) -> bool:
-    """Return whether a local tag is backed by an expected registry digest.
+    """Return whether a local image has the exact declared registry digest.
 
     A locally built image can be tagged with any benchmark image name. Mere tag
     presence therefore cannot establish that it is equivalent to the declared
-    prebuilt. Docker records registry pulls in ``RepoDigests``; require one that
-    matches either the effective reference or its explicit original reference.
+    prebuilt. Tag references cannot be proven from local Docker metadata because
+    ``RepoDigests`` does not record which tag produced a digest. Only digest-pinned
+    effective or explicit original references are eligible for local reuse.
     """
 
     references = (image, equivalent_reference)
-    expected_repositories = {
-        repository
-        for repository in (
-            _normalized_registry_repository(reference) for reference in references
+    expected_digests = {
+        digest
+        for digest in (
+            _normalized_registry_digest(reference) for reference in references
         )
-        if repository
+        if digest
     }
-    if not expected_repositories:
+    if not expected_digests:
         return False
     try:
         completed = subprocess.run(
@@ -1140,32 +1153,15 @@ def _docker_image_has_registry_provenance(
         return False
     if not isinstance(repo_digests, list):
         return False
-    actual_repositories = {
-        repository
-        for repository in (
-            _normalized_registry_repository(str(repo_digest))
+    actual_digests = {
+        digest
+        for digest in (
+            _normalized_registry_digest(str(repo_digest))
             for repo_digest in repo_digests
         )
-        if repository
+        if digest
     }
-    if any("@" in reference for reference in references if reference):
-        expected_digests = {
-            digest
-            for digest in (
-                _normalized_registry_digest(reference) for reference in references
-            )
-            if digest
-        }
-        actual_digests = {
-            digest
-            for digest in (
-                _normalized_registry_digest(str(repo_digest))
-                for repo_digest in repo_digests
-            )
-            if digest
-        }
-        return bool(expected_digests & actual_digests)
-    return bool(expected_repositories & actual_repositories)
+    return bool(expected_digests & actual_digests)
 
 
 def _normalized_registry_repository(reference: str) -> str:
@@ -1218,39 +1214,26 @@ def _normalized_registry_digest(reference: str) -> str:
 def _tag_available_prebuilt_fallback(image: str, original_image: str = "") -> str:
     """Tag a local equivalent image to the effective prebuilt reference.
 
-    Harbor tasks frequently declare Docker Hub images that are rewritten to a
-    configured mirror for China-network reliability. If the rewritten tag is
-    absent but Docker already has the same task image under its original Docker
-    Hub name with matching registry provenance, tag it to the effective reference
-    and avoid a registry pull that can deterministically fail or hang. Arbitrary
-    task-built images are never considered equivalent.
+    Only an explicit original reference recorded during mirror rewriting is
+    considered, and only when it is digest-pinned. Tag-only and inferred
+    cross-registry candidates cannot establish content identity and must be
+    pulled from their declared registry.
     """
 
     image = image.strip()
-    if not image:
+    original_image = original_image.strip()
+    if (
+        not image
+        or not original_image
+        or image == original_image
+        or not _normalized_registry_digest(original_image)
+    ):
         return ""
-    for candidate in _local_prebuilt_named_fallback_candidates(image, original_image):
-        if not _docker_image_has_registry_provenance(candidate):
-            continue
-        if _docker_tag_image(candidate, image):
-            return candidate
-    return ""
-
-
-def _local_prebuilt_named_fallback_candidates(image: str, original_image: str = "") -> list[str]:
-    candidates: list[str] = []
-    for candidate in [original_image.strip(), _strip_first_registry_component(image)]:
-        if candidate and candidate != image:
-            candidates.append(candidate)
-    return list(dict.fromkeys(candidates))
-
-
-def _strip_first_registry_component(image: str) -> str:
-    if "/" not in image:
-        return ""
-    first, rest = image.split("/", 1)
-    if "." in first or ":" in first or first == "localhost":
-        return rest
+    if _docker_image_has_registry_provenance(original_image) and _docker_tag_image(
+        original_image,
+        image,
+    ):
+        return original_image
     return ""
 
 

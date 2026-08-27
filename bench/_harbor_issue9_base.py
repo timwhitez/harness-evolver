@@ -1177,7 +1177,7 @@ class HarborRunner:
         """Legacy parser for older fixtures and incomplete Harbor runs."""
         score = 0.0
         status = TrialStatus.FAILED
-        error_log = [stderr] if stderr else []
+        error_log = [stderr] if stderr and returncode != 0 else []
         verifier_output = ""
 
         trial_path = self.output_dir / trial_id
