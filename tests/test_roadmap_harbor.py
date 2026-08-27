@@ -90,7 +90,10 @@ def test_harbor_command_uses_installed_cli_shape(tmp_path):
     )
     assert "--agent-config" not in command.argv
     assert "--output" not in command.argv
-    assert "--agent-import-path" in command.argv
+    assert "--agent-import-path" not in command.argv
+    assert command.argv[command.argv.index("--agent") + 1] == (
+        "bench.harbor_adapter:HLWorkerHarborAgent"
+    )
     assert "--include-task-name" in command.argv
     assert "--env-file" in command.argv
     assert ".env.local" in command.argv
@@ -99,8 +102,10 @@ def test_harbor_command_uses_installed_cli_shape(tmp_path):
     assert "--verifier-timeout-multiplier" not in command.argv
     assert "--environment-build-timeout-multiplier" not in command.argv
     assert "--mounts-json" in command.argv
-    assert "--environment-import-path" in command.argv
-    assert "bench.network_environment:AptMirrorDockerEnvironment" in command.argv
+    assert "--environment-import-path" not in command.argv
+    assert command.argv[command.argv.index("--env") + 1] == (
+        "bench.network_environment:AptMirrorDockerEnvironment"
+    )
     assert "--verifier-env" in command.argv
     assert "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" in command.argv
     assert "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" in command.argv
@@ -656,6 +661,74 @@ def test_parse_harbor_job_result_requires_verifier_reward(tmp_path):
         "provider": "openai",
         "model": "gpt-5.4",
     }
+
+
+def test_parse_harbor_job_result_keeps_info_stderr_out_of_success_errors(tmp_path):
+    job_dir = tmp_path / "job1"
+    trial_dir = job_dir / "fix-git__abc"
+    trial_dir.mkdir(parents=True)
+    (job_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_results": [
+                    {
+                        "task_name": "fix-git",
+                        "trial_name": "fix-git__abc",
+                        "verifier_result": {"rewards": {"reward": 1.0}},
+                    }
+                ]
+            }
+        )
+    )
+    runner = HarborRunner(output_dir=tmp_path / "runs")
+    info_log = "Registry-provenanced prebuilt image already available locally"
+
+    passed = runner.parse_job_dir(
+        job_dir,
+        task_id="fix-git",
+        returncode=0,
+        stderr=info_log,
+    )
+    failed_process = runner.parse_job_dir(
+        job_dir,
+        task_id="fix-git",
+        returncode=2,
+        stderr="Harbor process failed",
+    )
+
+    assert passed.status == TrialStatus.PASSED
+    assert passed.error_log == []
+    assert passed.harbor_stderr == info_log
+    assert failed_process.error_log == ["Harbor process failed"]
+
+
+def test_parse_legacy_result_keeps_info_stderr_out_of_success_errors(tmp_path):
+    output_dir = tmp_path / "runs"
+    verifier_dir = output_dir / "legacy-job" / "verifier"
+    verifier_dir.mkdir(parents=True)
+    (verifier_dir / "reward.txt").write_text("1.0\n")
+    job_dir = tmp_path / "jobs" / "legacy-job"
+    job_dir.mkdir(parents=True)
+    runner = HarborRunner(output_dir=output_dir)
+
+    passed = runner.parse_job_dir(
+        job_dir,
+        task_id="fix-git",
+        returncode=0,
+        stderr="informational logger line",
+    )
+    failed_process = runner.parse_job_dir(
+        job_dir,
+        task_id="fix-git",
+        returncode=2,
+        stderr="Harbor process failed",
+    )
+
+    assert passed.status == TrialStatus.PASSED
+    assert passed.verified is True
+    assert passed.error_log == []
+    assert passed.harbor_stderr == "informational logger line"
+    assert failed_process.error_log == ["Harbor process failed"]
 
 
 def test_parse_harbor_job_result_preserves_verifier_environment_logs(tmp_path):

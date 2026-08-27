@@ -224,10 +224,16 @@ def _check_harbor_source(repo_root: Path) -> ChecklistItem:
         requirement="Harbor command builder, custom Worker adapter, parser, run_trial CLI, and tests exist.",
         required=required,
     )
-    harbor_text = _read_text(repo_root / "bench/harbor.py")
+    harbor_text = _read_text(repo_root / "bench/_harbor_issue9_base.py")
     run_trial_text = _read_text(repo_root / "scripts/run_trial.py")
     if item.status == STATUS_PASS:
-        if "--agent-import-path" in harbor_text and "--include-task-name" in harbor_text:
+        if (
+            'argv.extend(["--agent", self.worker_import_path])' in harbor_text
+            and 'argv.extend(["--env", str(environment_import_path)])' in harbor_text
+            and "--include-task-name" in harbor_text
+            and "--agent-import-path" not in harbor_text
+            and "--environment-import-path" not in harbor_text
+        ):
             item.evidence.append("bench/harbor.py builds installed-Harbor CLI flags")
         else:
             item.status = STATUS_PARTIAL

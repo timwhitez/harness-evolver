@@ -1,20 +1,22 @@
 import asyncio
 import json
 import subprocess
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from harbor.environments.docker.docker import DockerEnvironment
-from harbor.models.task.config import EnvironmentConfig
+from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
+from harbor.models.trial.paths import TrialPaths
 
 import bench.network_environment as net_env
 from bench.network_environment import (
-    AptMirrorDockerEnvironment,
-    AptMirrorConfig,
     DEFAULT_ALPINE_MIRROR,
     PREBUILT_WARMUP_FAILURE_RECEIPT,
     PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
+    AptMirrorConfig,
+    AptMirrorDockerEnvironment,
     effective_docker_image_reference,
     patch_compose_for_docker_mirrors,
     patch_dockerfile_for_apt_mirrors,
@@ -382,31 +384,189 @@ def test_prebuilt_cache_warmup_runs_before_compose_up(monkeypatch, tmp_path):
 
     asyncio.run(env.start(force_build=False))
 
-    assert calls[0] == (
-        "pull",
-        ["docker", "image", "inspect", "registry.example/alexgshaw/qemu-startup:20251031"],
-        10,
-    )
+    assert calls[0][0] == "info"
     assert calls[1] == (
-        "pull",
-        ["docker", "image", "inspect", "alexgshaw/qemu-startup:20251031"],
-        10,
-    )
-    assert calls[2] == (
-        "pull",
-        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
-        10,
-    )
-    assert calls[3][0] == "info"
-    assert calls[4] == (
         "pull",
         ["docker", "pull", "registry.example/alexgshaw/qemu-startup:20251031"],
         42,
     )
-    assert calls[5] == ("super_start", False)
+    assert calls[2] == ("super_start", False)
+    assert all(
+        call[1][:3] != ["docker", "image", "inspect"]
+        for call in calls
+        if call[0] == "pull"
+    )
 
 
-def test_prebuilt_cache_warmup_skips_pull_when_image_exists_locally(monkeypatch, tmp_path):
+def test_force_build_still_warms_prebuilt_only_environment(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self.environment_dir = environment_dir
+        self.task_env_config = kwargs["task_env_config"]
+        self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
+        self.session_id = "sess"
+        self.environment_name = "env"
+        self.logger = SimpleNamespace(
+            info=lambda *args, **kwargs: calls.append(("info", args))
+        )
+
+    async def fake_start(self, force_build):
+        calls.append(("super_start", force_build))
+
+    def fake_run(argv, **kwargs):
+        calls.append(("run", tuple(argv)))
+        return subprocess.CompletedProcess(argv, 0, "pulled", "")
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "start", fake_start)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    original_ref = "alexgshaw/prebuilt-only:20251031"
+    effective_ref = "registry.example/alexgshaw/prebuilt-only:20251031"
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(docker_image=original_ref),
+        prebuilt_docker_hub_mirror="registry.example",
+    )
+
+    asyncio.run(env.start(force_build=True))
+
+    assert ("run", ("docker", "pull", effective_ref)) in calls
+    assert calls[-1] == ("super_start", True)
+
+
+def test_force_build_skips_prebuilt_warmup_when_dockerfile_exists(monkeypatch, tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    calls = []
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self.environment_dir = environment_dir
+        self.task_env_config = kwargs["task_env_config"]
+        self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
+        self.session_id = "sess"
+        self.environment_name = "env"
+        self.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    async def fake_start(self, force_build):
+        calls.append(("super_start", force_build))
+
+    def unexpected_run(argv, **kwargs):
+        raise AssertionError("Dockerfile force-build must not warm a prebuilt image")
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "start", fake_start)
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
+
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(
+            docker_image="alexgshaw/buildable:20251031",
+        ),
+        prebuilt_docker_hub_mirror="registry.example",
+    )
+
+    asyncio.run(env.start(force_build=True))
+
+    assert calls == [("super_start", True)]
+
+
+def test_resource_overlay_precedes_current_harbor_egress_overlays(
+    monkeypatch, tmp_path
+):
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("FROM scratch\n")
+    trial_dir = tmp_path / "trial"
+
+    monkeypatch.setattr(
+        DockerEnvironment,
+        "_egress_control_kernel_support",
+        staticmethod(lambda: True),
+    )
+    env = AptMirrorDockerEnvironment(
+        environment_dir,
+        environment_name="fix-git",
+        session_id="session-1",
+        trial_paths=TrialPaths(trial_dir),
+        task_env_config=EnvironmentConfig(),
+        network_policy=NetworkPolicy(network_mode=NetworkMode.NO_NETWORK),
+        apt_mirror_enabled=False,
+    )
+    resource_overlay = trial_dir / "hl-docker-resources.json"
+    egress_services_overlay = trial_dir / "egress-services.json"
+    env._hl_resource_compose_path = resource_overlay
+    env._egress_control_services_compose_path = egress_services_overlay
+
+    paths = env._docker_compose_paths
+
+    assert resource_overlay in paths
+    assert paths.index(resource_overlay) < paths.index(
+        env._DOCKER_COMPOSE_EGRESS_CONTROL_PATH
+    )
+    assert paths.index(resource_overlay) < paths.index(egress_services_overlay)
+
+
+def test_stop_cleans_current_harbor_temporary_compose_files(monkeypatch, tmp_path):
+    calls = []
+    temp_roots = []
+    compose_attrs = (
+        ("_mounts_compose_temp_dir", "_mounts_compose_path"),
+        ("_resources_compose_temp_dir", "_resources_compose_path"),
+        ("_env_compose_temp_dir", "_env_compose_path"),
+        (
+            "_egress_control_services_compose_temp_dir",
+            "_egress_control_services_compose_path",
+        ),
+    )
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self._keep_containers = False
+        self.logger = SimpleNamespace(
+            warning=lambda *args, **kwargs: calls.append(("warning", args)),
+            debug=lambda *args, **kwargs: calls.append(("debug", args)),
+        )
+        for temp_attr, path_attr in compose_attrs:
+            handle = tempfile.TemporaryDirectory()
+            root = Path(handle.name)
+            path = root / "compose.json"
+            path.write_text("{}")
+            temp_roots.append(root)
+            setattr(self, temp_attr, handle)
+            setattr(self, path_attr, path)
+
+    async def fake_prepare_logs(self):
+        calls.append(("prepare_logs",))
+
+    async def fake_compose(self, argv):
+        calls.append(("compose", argv))
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "prepare_logs_for_host", fake_prepare_logs)
+    monkeypatch.setattr(
+        DockerEnvironment,
+        "_run_docker_compose_command",
+        fake_compose,
+    )
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(),
+        docker_resource_enabled=False,
+    )
+
+    asyncio.run(env.stop(delete=True))
+
+    assert ("prepare_logs",) in calls
+    assert ("compose", ["down", "--remove-orphans"]) in calls
+    assert all(not root.exists() for root in temp_roots)
+    for temp_attr, path_attr in compose_attrs:
+        assert getattr(env, temp_attr) is None
+        assert getattr(env, path_attr) is None
+
+
+def test_prebuilt_cache_warmup_skips_pull_with_registry_provenance(
+    monkeypatch, tmp_path
+):
     calls = []
 
     def fake_init(self, environment_dir, *args, **kwargs):
@@ -423,8 +583,66 @@ def test_prebuilt_cache_warmup_skips_pull_when_image_exists_locally(monkeypatch,
     def fake_run(argv, **kwargs):
         calls.append(("run", argv))
         if argv[:3] == ["docker", "image", "inspect"]:
-            return subprocess.CompletedProcess(argv, 0, "[]", "")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                '["alexgshaw/qemu-startup@sha256:aaaa"]',
+                "",
+            )
         raise AssertionError("docker pull should not run when image inspect succeeds")
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "start", fake_start)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(
+            docker_image="alexgshaw/qemu-startup@sha256:aaaa",
+        ),
+        prebuilt_docker_pull_timeout_seconds=42,
+        prebuilt_docker_hub_mirror="registry.example",
+    )
+
+    asyncio.run(env.start(force_build=False))
+
+    assert any(
+        call[0] == "run" and call[1][:3] == ["docker", "image", "inspect"]
+        for call in calls
+    )
+    assert any(call[0] == "info" and "already available locally" in call[1][0] for call in calls)
+    assert calls[-1] == ("super_start", False)
+
+
+def test_prebuilt_cache_warmup_pulls_when_local_tag_has_no_registry_provenance(
+    monkeypatch, tmp_path
+):
+    calls = []
+    target = "registry.example/alexgshaw/qemu-startup:20251031"
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self.environment_dir = environment_dir
+        self.task_env_config = kwargs["task_env_config"]
+        self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
+        self.session_id = "sess"
+        self.environment_name = "env"
+        self.logger = SimpleNamespace(
+            info=lambda *args, **kwargs: calls.append(("info", args)),
+            warning=lambda *args, **kwargs: calls.append(("warning", args)),
+        )
+
+    async def fake_start(self, force_build):
+        calls.append(("super_start", force_build))
+
+    def fake_run(argv, **kwargs):
+        calls.append(("run", argv, kwargs.get("timeout")))
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["docker", "images", "--format"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:2] == ["docker", "pull"]:
+            return subprocess.CompletedProcess(argv, 0, "pulled", "")
+        raise AssertionError(f"unexpected command: {argv}")
 
     monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
     monkeypatch.setattr(DockerEnvironment, "start", fake_start)
@@ -441,12 +659,107 @@ def test_prebuilt_cache_warmup_skips_pull_when_image_exists_locally(monkeypatch,
 
     asyncio.run(env.start(force_build=False))
 
-    assert ("run", ["docker", "image", "inspect", "registry.example/alexgshaw/qemu-startup:20251031"]) in calls
-    assert any(call[0] == "info" and "already available locally" in call[1][0] for call in calls)
+    assert ("run", ["docker", "pull", target], 42) in calls
     assert calls[-1] == ("super_start", False)
 
 
-def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_path):
+def test_prebuilt_registry_provenance_requires_matching_repository(monkeypatch):
+    def fake_run(argv, **kwargs):
+        assert argv[-2:] == ["--format", "{{json .RepoDigests}}"]
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            '["docker.io/alexgshaw/qemu-startup@sha256:aaaa"]',
+            "",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert net_env._docker_image_has_registry_provenance(
+        "registry.example/alexgshaw/qemu-startup:20251031",
+        "alexgshaw/qemu-startup:20251031",
+    ) is False
+    assert net_env._docker_image_has_registry_provenance(
+        "registry.example/alexgshaw/other-task:20251031"
+    ) is False
+    assert net_env._docker_image_has_registry_provenance(
+        "alexgshaw/qemu-startup@sha256:aaaa"
+    ) is True
+    assert net_env._docker_image_has_registry_provenance(
+        "alexgshaw/qemu-startup@sha256:bbbb"
+    ) is False
+
+
+def test_prebuilt_registry_provenance_rejects_mismatched_declared_digests(
+    monkeypatch,
+):
+    def unexpected_run(argv, **kwargs):
+        raise AssertionError("mismatched declared digests must fail before Docker inspect")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
+
+    assert net_env._docker_image_has_registry_provenance(
+        "registry.example/alexgshaw/task@sha256:bbbb",
+        "alexgshaw/task@sha256:aaaa",
+    ) is False
+
+
+@pytest.mark.parametrize("force_build", [False, True])
+def test_prebuilt_cache_warmup_rejects_mismatched_override_digest_before_docker(
+    monkeypatch, tmp_path, force_build
+):
+    calls = []
+    original_ref = "alexgshaw/task@sha256:aaaa"
+    effective_ref = "registry.example/alexgshaw/task@sha256:bbbb"
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self.environment_dir = environment_dir
+        self.task_env_config = kwargs["task_env_config"]
+        self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
+        self.session_id = "sess"
+        self.environment_name = "env"
+        self.logger = SimpleNamespace(
+            info=lambda *args, **kwargs: calls.append(("info", args)),
+            warning=lambda *args, **kwargs: calls.append(("warning", args)),
+        )
+
+    async def fake_start(self, force_build):
+        raise AssertionError("compose start must not run for mismatched digests")
+
+    def unexpected_run(argv, **kwargs):
+        raise AssertionError("mismatched digests must fail before Docker commands")
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "start", fake_start)
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
+
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(docker_image=original_ref),
+        docker_image_overrides={original_ref: effective_ref},
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(env.start(force_build=force_build))
+
+    message = str(excinfo.value)
+    assert "mapping changes content identity" in message
+    assert original_ref in message
+    assert effective_ref in message
+    receipt = json.loads(
+        (tmp_path / "trial" / PREBUILT_WARMUP_FAILURE_RECEIPT).read_text()
+    )
+    assert receipt == {
+        "schema": PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
+        "kind": "prebuilt_image_cache_warmup_failure",
+        "source": "apt_mirror_docker_environment_start",
+        "deterministic_access_failure": False,
+    }
+
+
+def test_prebuilt_cache_warmup_activates_local_original_digest_without_tag(
+    monkeypatch, tmp_path
+):
     calls = []
 
     def fake_init(self, environment_dir, *args, **kwargs):
@@ -455,6 +768,9 @@ def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_
         self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
         self.session_id = "sess"
         self.environment_name = "env"
+        self._env_vars = SimpleNamespace(
+            prebuilt_image_name=kwargs["task_env_config"].docker_image
+        )
         self.logger = SimpleNamespace(info=lambda *args, **kwargs: calls.append(("info", args)))
 
     async def fake_start(self, force_build):
@@ -464,22 +780,17 @@ def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_
         calls.append(("run", argv, kwargs.get("timeout")))
         if argv[:3] == ["docker", "image", "inspect"]:
             image = argv[3]
-            if image == "alexgshaw/mailman:20251031":
-                return subprocess.CompletedProcess(argv, 0, "[]", "")
-            if image == "registry.example/alexgshaw/mailman:20251031" and any(
-                call[1] == [
-                    "docker",
-                    "tag",
-                    "alexgshaw/mailman:20251031",
-                    "registry.example/alexgshaw/mailman:20251031",
-                ]
-                for call in calls
-            ):
-                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            if image == "alexgshaw/mailman@sha256:aaaa":
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '["alexgshaw/mailman@sha256:aaaa"]',
+                    "",
+                )
             return subprocess.CompletedProcess(argv, 1, "", "missing")
         if argv[:2] == ["docker", "tag"]:
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        raise AssertionError("docker pull should not run when local fallback can be tagged")
+            raise AssertionError("digest references must never be Docker tag targets")
+        raise AssertionError("docker pull should not run when exact digest is local")
 
     monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
     monkeypatch.setattr(DockerEnvironment, "start", fake_start)
@@ -488,7 +799,7 @@ def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_
     env = AptMirrorDockerEnvironment(
         tmp_path,
         task_env_config=EnvironmentConfig(
-            docker_image="alexgshaw/mailman:20251031",
+            docker_image="alexgshaw/mailman@sha256:aaaa",
         ),
         prebuilt_docker_pull_timeout_seconds=42,
         prebuilt_docker_hub_mirror="registry.example",
@@ -496,21 +807,76 @@ def test_prebuilt_cache_warmup_tags_original_image_before_pull(monkeypatch, tmp_
 
     asyncio.run(env.start(force_build=False))
 
-    assert (
-        "run",
-        [
-            "docker",
-            "tag",
-            "alexgshaw/mailman:20251031",
-            "registry.example/alexgshaw/mailman:20251031",
-        ],
-        10,
-    ) in calls
+    assert all(
+        call[1][:2] != ["docker", "tag"] for call in calls if call[0] == "run"
+    )
+    assert env.task_env_config.docker_image == "alexgshaw/mailman@sha256:aaaa"
+    assert env._env_vars.prebuilt_image_name == "alexgshaw/mailman@sha256:aaaa"
     assert any(call[0] == "info" and "local fallback" in call[1][0] for call in calls)
     assert calls[-1] == ("super_start", False)
 
 
-def test_prebuilt_cache_warmup_tags_task_built_image_before_pull(monkeypatch, tmp_path):
+def test_prebuilt_cache_warmup_does_not_infer_cross_registry_fallback(
+    monkeypatch, tmp_path
+):
+    calls = []
+    target = "ghcr.io/acme/task:v1"
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self.environment_dir = environment_dir
+        self.task_env_config = kwargs["task_env_config"]
+        self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
+        self.session_id = "sess"
+        self.environment_name = "env"
+        self.logger = SimpleNamespace(
+            info=lambda *args, **kwargs: calls.append(("info", args))
+        )
+
+    async def fake_start(self, force_build):
+        calls.append(("super_start", force_build))
+
+    def fake_run(argv, **kwargs):
+        calls.append(("run", argv, kwargs.get("timeout")))
+        if argv[:3] == ["docker", "image", "inspect"]:
+            image = argv[3]
+            if image == "acme/task:v1":
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '["docker.io/acme/task@sha256:aaaa"]',
+                    "",
+                )
+            if image == target and any(
+                call[1] == ["docker", "tag", "acme/task:v1", target]
+                for call in calls
+            ):
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            return subprocess.CompletedProcess(argv, 1, "", "missing")
+        if argv[:2] in (["docker", "tag"], ["docker", "pull"]):
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "start", fake_start)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(docker_image=target),
+        prebuilt_docker_pull_timeout_seconds=42,
+    )
+
+    asyncio.run(env.start(force_build=False))
+
+    assert ("run", ["docker", "pull", target], 42) in calls
+    assert all(
+        call[1][:2] != ["docker", "tag"] for call in calls if call[0] == "run"
+    )
+    assert calls[-1] == ("super_start", False)
+
+
+def test_prebuilt_cache_warmup_does_not_promote_task_built_image(
+    monkeypatch, tmp_path
+):
     calls = []
 
     def fake_init(self, environment_dir, *args, **kwargs):
@@ -550,7 +916,9 @@ def test_prebuilt_cache_warmup_tags_task_built_image_before_pull(monkeypatch, tm
             )
         if argv[:2] == ["docker", "tag"]:
             return subprocess.CompletedProcess(argv, 0, "", "")
-        raise AssertionError("docker pull should not run when task-built fallback can be tagged")
+        if argv[:2] == ["docker", "pull"]:
+            return subprocess.CompletedProcess(argv, 0, "pulled", "")
+        raise AssertionError(f"unexpected command: {argv}")
 
     monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
     monkeypatch.setattr(DockerEnvironment, "start", fake_start)
@@ -569,15 +937,12 @@ def test_prebuilt_cache_warmup_tags_task_built_image_before_pull(monkeypatch, tm
 
     assert (
         "run",
-        [
-            "docker",
-            "tag",
-            "mailman__iljz4f8-main:latest",
-            "registry.example/alexgshaw/mailman:20251031",
-        ],
-        10,
+        ["docker", "pull", "registry.example/alexgshaw/mailman:20251031"],
+        42,
     ) in calls
-    assert all(call[1][:2] != ["docker", "pull"] for call in calls if call[0] == "run")
+    assert all(
+        call[1][:2] != ["docker", "tag"] for call in calls if call[0] == "run"
+    )
     assert calls[-1] == ("super_start", False)
 
 
@@ -696,6 +1061,70 @@ def test_prebuilt_cache_warmup_pulls_original_when_mirror_denies(monkeypatch, tm
     assert ("super_start", False) in calls
 
 
+def test_prebuilt_cache_warmup_activates_original_digest_when_mirror_denies(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self.environment_dir = environment_dir
+        self.task_env_config = kwargs["task_env_config"]
+        self.trial_paths = SimpleNamespace(trial_dir=tmp_path / "trial")
+        self.session_id = "sess"
+        self.environment_name = "env"
+        self._env_vars = SimpleNamespace(
+            prebuilt_image_name=kwargs["task_env_config"].docker_image
+        )
+        self.logger = SimpleNamespace(
+            info=lambda *args, **kwargs: calls.append(("info", args)),
+            warning=lambda *args, **kwargs: calls.append(("warning", args)),
+        )
+
+    async def fake_start(self, force_build):
+        calls.append(("super_start", force_build))
+
+    mirror_ref = "registry.example/alexgshaw/write-compressor@sha256:aaaa"
+    original_ref = "alexgshaw/write-compressor@sha256:aaaa"
+
+    def fake_run(argv, **kwargs):
+        calls.append(("run", tuple(argv)))
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, "", "missing")
+        if argv[:2] == ["docker", "pull"] and argv[2] == mirror_ref:
+            raise subprocess.CalledProcessError(
+                1,
+                argv,
+                output="",
+                stderr="403 Forbidden",
+            )
+        if argv[:2] == ["docker", "pull"] and argv[2] == original_ref:
+            return subprocess.CompletedProcess(argv, 0, "pulled", "")
+        if argv[:2] == ["docker", "tag"]:
+            raise AssertionError("digest references must never be Docker tag targets")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    monkeypatch.setattr(DockerEnvironment, "start", fake_start)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    env = AptMirrorDockerEnvironment(
+        tmp_path,
+        task_env_config=EnvironmentConfig(docker_image=original_ref),
+        prebuilt_docker_pull_timeout_seconds=7,
+        prebuilt_docker_hub_mirror="registry.example",
+    )
+
+    asyncio.run(env.start(force_build=False))
+
+    assert ("run", ("docker", "pull", original_ref)) in calls
+    assert all(
+        call[1][:2] != ("docker", "tag") for call in calls if call[0] == "run"
+    )
+    assert env.task_env_config.docker_image == original_ref
+    assert env._env_vars.prebuilt_image_name == original_ref
+    assert ("super_start", False) in calls
+
+
 def test_prebuilt_cache_warmup_original_fallback_failure_reports_both(monkeypatch, tmp_path):
     # If the original-image fallback also fails, the raised error must retain
     # both the mirror and the fallback diagnostics.
@@ -786,6 +1215,25 @@ def test_verifier_runtime_prepare_timeout_does_not_skip_verifier(monkeypatch, tm
     assert exec_calls[0][2] == 15
     assert exec_calls[1] == ("exec", "python3 /tests/test_outputs.py", 90, None)
     assert any(call[0] == "warn" for call in calls)
+
+
+def test_verifier_detection_uses_current_harbor_environment_paths(
+    monkeypatch, tmp_path
+):
+    def fake_init(self, environment_dir, *args, **kwargs):
+        self._is_windows_container = False
+        self.task_env_config = kwargs["task_env_config"]
+
+    monkeypatch.setattr(DockerEnvironment, "__init__", fake_init)
+    env = AptMirrorDockerEnvironment(tmp_path, task_env_config=EnvironmentConfig())
+
+    assert not hasattr(env, "_env_paths")
+    assert env._should_prepare_verifier_runtime(
+        "chown -R 0:0 /logs/agent", None
+    ) is False
+    assert env._should_prepare_verifier_runtime(
+        "python3 /tests/test_outputs.py", None
+    ) is True
 
 
 def test_verifier_runtime_prepare_skips_when_verifier_window_is_too_small(
@@ -1151,6 +1599,10 @@ def test_network_preflight_checks_configured_direct_download_rewrite(monkeypatch
     report = network_preflight.run_preflight(timeout=1, skip_docker_pull=True)
 
     assert report["ok"] is True
+    assert (
+        "debian_package_mirror",
+        "https://deb.debian.org/debian/dists/stable/InRelease",
+    ) in checked_urls
     assert (
         "alpine_release_mirror",
         "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/"

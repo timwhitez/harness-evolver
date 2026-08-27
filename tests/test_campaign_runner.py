@@ -2268,8 +2268,11 @@ docker_resources:
     assert payload["loop_limit_contract"]["worker_task_loop"]["max_turns_audit_only"] == 155
     assert payload["job_config"]["agent"]["kwargs"]["tool_timeout_seconds"] == 66
     assert payload["job_config"]["timeouts"] == {}
-    assert "--environment-import-path" in payload["harbor_command"]
-    assert "bench.network_environment:AptMirrorDockerEnvironment" in payload["harbor_command"]
+    assert "--environment-import-path" not in payload["harbor_command"]
+    assert (
+        "--env bench.network_environment:AptMirrorDockerEnvironment"
+        in payload["harbor_command"]
+    )
     assert payload["job_config"]["environment"]["force_build"] is True
     assert payload["job_config"]["environment"]["build_timeout_multiplier"] is None
     assert (

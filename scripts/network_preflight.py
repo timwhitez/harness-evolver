@@ -55,7 +55,7 @@ DEFAULT_PREBUILT_DOCKER_IMAGES = [
     "alexgshaw/hf-model-inference:20251031",
 ]
 DEFAULT_PREBUILT_DOCKER_PULL_IMAGES: list[str] = []
-DEBIAN_SAMPLE_PATH = "/pool/main/k/krb5/krb5-locales_1.20.1-2%2bdeb12u4_all.deb"
+DEBIAN_SAMPLE_PATH = "/dists/stable/InRelease"
 UBUNTU_SAMPLE_PATH = "/pool/main/h/hello/hello_2.10-3build1_amd64.deb"
 ALPINE_SAMPLE_URL = (
     "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/"

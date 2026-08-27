@@ -287,7 +287,7 @@ class HarborRunner:
         if network_hardened and not environment_import_path:
             environment_import_path = DEFAULT_NETWORK_ENVIRONMENT_IMPORT_PATH
         if environment_import_path:
-            argv.extend(["--environment-import-path", str(environment_import_path)])
+            argv.extend(["--env", str(environment_import_path)])
 
         environment_kwargs = self._environment_kwargs(agent_config)
         if environment_import_path == DEFAULT_NETWORK_ENVIRONMENT_IMPORT_PATH:
@@ -321,7 +321,7 @@ class HarborRunner:
             dataset_config = {"task": task_id}
 
         if agent_name == "hl-worker":
-            argv.extend(["--agent-import-path", self.worker_import_path])
+            argv.extend(["--agent", self.worker_import_path])
         else:
             argv.extend(["--agent", agent_name])
 
@@ -935,7 +935,7 @@ class HarborRunner:
         token_usage = self._token_usage(selected)
         trial_metrics = self._trial_metrics(selected, token_usage)
         errors: list[str] = []
-        if stderr:
+        if stderr and returncode != 0:
             errors.append(stderr)
         if exception:
             errors.append(str(exception.get("exception_message") or exception))
@@ -1177,7 +1177,7 @@ class HarborRunner:
         """Legacy parser for older fixtures and incomplete Harbor runs."""
         score = 0.0
         status = TrialStatus.FAILED
-        error_log = [stderr] if stderr else []
+        error_log = [stderr] if stderr and returncode != 0 else []
         verifier_output = ""
 
         trial_path = self.output_dir / trial_id
