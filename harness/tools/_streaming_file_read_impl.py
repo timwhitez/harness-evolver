@@ -12,6 +12,7 @@ from harness.tools.base import ToolResult
 from harness.tools.bounded_path_io import open_binary_nofollow
 from harness.tools.canonical_path_guard import guarded_path_failure, resolve_guarded_path
 from harness.tools.safe_path_io import SafePathError
+from harness.tools.read_window import read_window
 
 
 _BINARY_SAMPLE_BYTES = 8192
@@ -373,111 +374,25 @@ class FileReadTool(_base.FileReadTool):
         offset: int,
         limit: int,
     ) -> ToolResult:
-        records: list[tuple[int, _BoundedLine]] = []
-        line_number = 0
-        eof_reached = False
-        has_more = False
-        next_offset: int | None = None
-        output_truncated = False
-        retained_chars = 0
+        def next_line():
+            item = _read_bounded_utf8_line(stream, self.max_line_bytes)
+            return None if item is None else (item.text, item.truncated)
 
-        while line_number < offset - 1:
-            skipped = _read_bounded_utf8_line(stream, self.max_line_bytes)
-            if skipped is None:
-                eof_reached = True
-                break
-            line_number += 1
-
-        if not eof_reached:
-            while len(records) < limit:
-                bounded_line = _read_bounded_utf8_line(stream, self.max_line_bytes)
-                if bounded_line is None:
-                    eof_reached = True
-                    break
-                line_number += 1
-                suffix = (
-                    f" ... [line truncated at {self.max_line_bytes} bytes]"
-                    if bounded_line.truncated
-                    else ""
-                )
-                formatted = f"{line_number}\t{bounded_line.text}{suffix}"
-                projected = retained_chars + len(formatted) + (1 if records else 0)
-                if projected > self.max_output_chars:
-                    has_more = True
-                    next_offset = line_number
-                    output_truncated = True
-                    break
-                records.append((line_number, bounded_line))
-                retained_chars = projected
-
-            if not has_more and not eof_reached and len(records) == limit:
-                following = _read_bounded_utf8_line(stream, self.max_line_bytes)
-                if following is not None:
-                    line_number += 1
-                    has_more = True
-                    next_offset = line_number
-                else:
-                    eof_reached = True
-
-        output_lines: list[str] = []
-        truncated_line_count = 0
-        for number, bounded_line in records:
-            suffix = ""
-            if bounded_line.truncated:
-                truncated_line_count += 1
-                suffix = f" ... [line truncated at {self.max_line_bytes} bytes]"
-            output_lines.append(f"{number}\t{bounded_line.text}{suffix}")
-
-        if has_more:
-            marker = f"... (more lines, use offset={next_offset} to continue)"
-            if len(marker) >= self.max_output_chars:
-                output = marker[: self.max_output_chars]
-                output_truncated = True
-            else:
-                current = "\n".join(output_lines)
-                available = self.max_output_chars - len(marker) - 1
-                if len(current) > available:
-                    current = current[:available].rstrip()
-                    output_truncated = True
-                output = f"{current}\n{marker}" if current else marker
-        else:
-            output = "\n".join(output_lines)
-
-        if records:
-            end_line = records[-1][0]
-        elif eof_reached:
-            end_line = line_number
-        else:
-            end_line = offset - 1
-
-        result_metadata: dict[str, Any] = {
-            "start_line": offset,
-            "end_line": end_line,
-            "lines_returned": len(records),
-            "has_more": has_more,
-            "next_offset": next_offset,
-            "line_truncated_count": truncated_line_count,
-            "output_truncated": output_truncated,
-            "max_line_bytes": self.max_line_bytes,
-            "max_output_chars": self.max_output_chars,
-            "file_size": file_size,
-            "streaming_read": True,
-            "physical_line_memory_bounded": True,
-            "read_memory_bounded": True,
-            "canonical_path_checked": True,
-            "nofollow_io": True,
-            "encoding": "utf-8",
+        page = read_window(next_line, offset=offset, limit=limit,
+                           max_line_bytes=self.max_line_bytes,
+                           max_output_chars=self.max_output_chars)
+        metadata = {
+            **page["metadata"], "max_line_bytes": self.max_line_bytes,
+            "max_output_chars": self.max_output_chars, "file_size": file_size,
+            "streaming_read": True, "physical_line_memory_bounded": True,
+            "read_memory_bounded": True, "canonical_path_checked": True,
+            "nofollow_io": True, "encoding": "utf-8",
         }
         if self.max_file_bytes is not None:
-            result_metadata["max_file_bytes"] = self.max_file_bytes
-            result_metadata["live_descriptor_size_checked"] = True
-        if eof_reached:
-            result_metadata["total_lines"] = line_number
-            result_metadata["total_lines_known"] = True
-        else:
-            result_metadata["total_lines_known"] = False
-
-        return ToolResult(success=True, output=output, metadata=result_metadata)
+            metadata["max_file_bytes"] = self.max_file_bytes
+            metadata["live_descriptor_size_checked"] = True
+        return ToolResult(success=page["success"], output=page["output"],
+                          error=page["error"], metadata=metadata)
 
 
 _BoundedLine = _BoundedLine
