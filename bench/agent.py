@@ -9,11 +9,13 @@ import math
 import os
 import re
 import secrets
+import signal
 import subprocess
 import threading
 from typing import Any
 
 from bench import _agent_issue8_base as _base
+from bench.worker_protocol import WorkerStdout, WorkerProtocolError, validate_shutdown_bounds
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
@@ -140,6 +142,46 @@ class HLAgent(_base.HLAgent):
     """Packaged-runtime HLAgent whose stderr storage stays bounded in flight."""
 
     rust_stderr_tail_bytes: int = 65_536
+    rust_shutdown_timeout_seconds: float = 5.0
+    rust_stdout_frame_bytes: int = 64 * 1024 * 1024
+
+    @staticmethod
+    def _write_bridge_event(process: subprocess.Popen, event: dict[str, Any]) -> None:
+        """Send one complete JSONL message to binary stdin, including short writes."""
+        if process.stdin is None:
+            raise WorkerProtocolError("Rust Worker stdin is unavailable")
+        text = json.dumps(event, ensure_ascii=False) + "\n"
+        if isinstance(process.stdin, io.TextIOBase):
+            # Retain compatibility with direct text-stream adapter fixtures.
+            process.stdin.write(text)
+        else:
+            remaining = memoryview(text.encode("utf-8"))
+            while remaining:
+                written = process.stdin.write(remaining)
+                if written is None or written <= 0:
+                    raise BrokenPipeError("Rust Worker stdin did not accept a complete event")
+                remaining = remaining[written:]
+        process.stdin.flush()
+
+    def _terminate_process(self, process: subprocess.Popen) -> None:
+        """Stop the Worker without closing stdout from a cancellation thread.
+
+        The _run_rust_core owner closes streams in its finalizer. Termination
+        itself has a bounded wait, including after a terminal protocol timeout.
+        """
+        if process.poll() is not None:
+            return
+        self._send_process_signal(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=0.5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self._send_process_signal(process, signal.SIGKILL)
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired as exc:
+            raise WorkerProtocolError("Rust Worker did not exit after termination") from exc
 
     def _run_rust_core(
         self,
@@ -150,13 +192,16 @@ class HLAgent(_base.HLAgent):
         # externally supplied constructor value must never leave a live Worker or
         # leaked pipe outside the normal teardown region.
         stderr_tail_limit = _validated_stderr_tail_bytes(self.rust_stderr_tail_bytes)
+        shutdown_seconds, frame_bytes = validate_shutdown_bounds(
+            self.rust_shutdown_timeout_seconds, self.rust_stdout_frame_bytes,
+        )
         capture = _BoundedStderrTail(stderr_tail_limit)
         stop_marker = b"\x00HL-STDERR-STOP:" + secrets.token_bytes(32) + b"\x00"
 
         read_fd: int | None = None
         worker_stderr_fd: int | None = None
         wake_stderr_fd: int | None = None
-        process: subprocess.Popen[str] | None = None
+        process: subprocess.Popen[bytes] | None = None
         stderr_thread: threading.Thread | None = None
 
         try:
@@ -183,8 +228,8 @@ class HLAgent(_base.HLAgent):
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=worker_stderr_fd,
-                    text=True,
-                    bufsize=1,
+                    text=False,
+                    bufsize=0,
                     start_new_session=(os.name != "nt"),
                 )
             except Exception:
@@ -214,6 +259,10 @@ class HLAgent(_base.HLAgent):
             _close_fd(worker_stderr_fd)
             _close_fd(wake_stderr_fd)
             _close_fd(read_fd)
+            if process is not None:
+                for stream in (process.stdin, process.stdout):
+                    if stream is not None:
+                        stream.close()
             raise
 
         assert process is not None
@@ -259,11 +308,15 @@ class HLAgent(_base.HLAgent):
                 },
             )
 
+            stdout = WorkerStdout(process.stdout, process,
+                shutdown_seconds=shutdown_seconds, frame_bytes=frame_bytes)
             final_payload: dict[str, Any] | None = None
-            for line in process.stdout:
+            for line in stdout:
                 if not line.strip():
                     continue
                 event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise WorkerProtocolError("Rust Worker event must be a JSON object")
                 event_type = event.get("type")
                 if event_type == "llm_request":
                     self.messages = list(event.get("messages") or [])
@@ -314,7 +367,9 @@ class HLAgent(_base.HLAgent):
                     if isinstance(trajectory_event, dict):
                         self._append_trajectory(trajectory_event)
                 elif event_type == "final":
-                    final_payload = dict(event.get("result") or {})
+                    final_payload = event.get("result")
+                    if not isinstance(final_payload, dict):
+                        raise WorkerProtocolError("Rust Worker final result must be a JSON object")
                     break
                 elif event_type == "fatal":
                     raise RuntimeError(
@@ -325,13 +380,10 @@ class HLAgent(_base.HLAgent):
                         f"Unknown Rust Worker core event: {event_type!r}"
                     )
 
-            return_code = process.wait()
-            stderr = finish_stderr()
             if final_payload is None:
-                raise RuntimeError(
-                    "Rust Worker core exited without a final result"
-                    + (f": {stderr.strip()}" if stderr.strip() else "")
-                )
+                raise WorkerProtocolError("Rust Worker core exited without a final result")
+            return_code = stdout.finish()
+            stderr = finish_stderr()
             if return_code != 0:
                 raise RuntimeError(
                     f"Rust Worker core exited with code {return_code}"
@@ -346,9 +398,19 @@ class HLAgent(_base.HLAgent):
                 raise RuntimeError(f"{exc}: {stderr.strip()}") from exc
             raise
         finally:
-            if process.poll() is None:
-                self._terminate_process(process)
-            finish_stderr()
-            with self._process_lock:
-                if self._active_process is process:
-                    self._active_process = None
+            try:
+                if process.poll() is None:
+                    self._terminate_process(process)
+            finally:
+                try:
+                    finish_stderr()
+                finally:
+                    for stream in (process.stdin, process.stdout):
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except (OSError, ValueError):
+                                pass
+                    with self._process_lock:
+                        if self._active_process is process:
+                            self._active_process = None
