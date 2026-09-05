@@ -59,7 +59,10 @@ def main() -> int:
         parser.error("--record-dry-run requires --dry-run")
 
     from hl.submit import SubmitConfig, SubmitGate
+    from hl.submission_storage import valid_campaign_id
 
+    if not valid_campaign_id(args.campaign_id):
+        parser.error("--campaign-id must be one safe ASCII identifier")
     config = _load_submit_config(Path(args.config))
     if args.enabled:
         config.enabled = True
@@ -170,13 +173,13 @@ def _attempts_per_task(
         parser.error(f"--attempts-per-task-json must be a JSON object: {exc}")
     if not isinstance(data, dict):
         parser.error("--attempts-per-task-json must be a JSON object")
-    attempts: dict[str, int] = {}
-    for key, value in data.items():
-        try:
-            attempts[str(key)] = int(value)
-        except (TypeError, ValueError):
-            parser.error(f"attempt count for {key!r} must be an integer")
-    return attempts
+    from hl.submission_evidence import component, positive_int
+
+    if not data or any(not component(key) or not positive_int(value)
+                       for key, value in data.items()):
+        parser.error("--attempts-per-task-json must map task names to positive integer counts")
+    return data
+
 
 
 def _exit_code(result, dry_run: bool) -> int:
@@ -201,6 +204,7 @@ def _result_payload(result, args: argparse.Namespace, config) -> dict[str, Any]:
         "returncode": result.returncode,
         "upload_skipped": result.upload_skipped,
         "terminal": result.terminal,
+        "evidence": result.evidence,
         "dry_run": args.dry_run,
         "harbor_upload": config.harbor_upload,
         "min_attempts_per_task": config.min_attempts_per_task,

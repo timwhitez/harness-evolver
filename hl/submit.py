@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 import subprocess
@@ -11,7 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from harness.tools.leaderboard_guard import prohibited_command_reason
+from hl.submission_evidence import (
+    EvidenceError, input_reasons, inspect_job, summary_reasons,
+)
 from hl.submission_storage import prepare_store, valid_campaign_id, write_exclusive_json
 
 
@@ -50,6 +51,7 @@ class SubmitGateResult:
     intent_persisted: bool = False
     outcome_unknown: bool = False
     result_persistence_failed: bool = False
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 class SubmitGate:
@@ -77,21 +79,32 @@ class SubmitGate:
         full_regression_passed: bool,
         attempts_per_task: dict[str, int] | None = None,
     ) -> SubmitGateResult:
+        reasons = input_reasons(
+            score, tasks_evaluated, attempts_per_task, self.config.trigger_score,
+            self.config.min_tasks_evaluated, self.config.min_attempts_per_task,
+        )
+        for field in (
+            "enabled", "harbor_upload", "require_integrity_scan", "require_atif_trajectory",
+            "require_full_regression", "require_clean_git", "require_no_uncommitted_harness_diff",
+            "once_per_campaign", "stop_after_submit_attempt", "share_yes",
+        ):
+            if not isinstance(getattr(self.config, field), bool):
+                reasons.append(f"{field} must be a boolean")
         if not valid_campaign_id(campaign_id):
-            return SubmitGateResult(eligible=False, reasons=["invalid campaign_id: use 1-128 ASCII letters, digits, dot, underscore or hyphen; start with a letter/digit"])
-        reasons: list[str] = []
+            reasons.append("invalid campaign_id: use one safe ASCII identifier")
+        if not isinstance(full_regression_passed, bool):
+            reasons.append("full_regression_passed must be a boolean")
+        if reasons:
+            return SubmitGateResult(eligible=False, reasons=reasons)
+
         best_job = Path(best_job_dir)
         marker = self.submissions_dir / f"{campaign_id}.json"
         intent = self.submissions_dir / f"{campaign_id}.intent.json"
-        duplicate_submit = False
-
         if not self.config.enabled:
             reasons.append("submit.enabled is false")
         if os.path.lexists(marker) and self.config.once_per_campaign:
-            duplicate_submit = True
             reasons.append("campaign already has a submit result")
         if os.path.lexists(intent) and self.config.once_per_campaign:
-            duplicate_submit = True
             reasons.append("campaign already has a submit intent")
         if score < self.config.trigger_score:
             reasons.append(f"score {score} is below trigger {self.config.trigger_score}")
@@ -99,48 +112,53 @@ class SubmitGate:
             reasons.append(
                 f"tasks evaluated {tasks_evaluated} is below minimum {self.config.min_tasks_evaluated}"
             )
-        if self.config.min_attempts_per_task > 1:
-            if attempts_per_task is None:
-                reasons.append("attempt evidence missing for leaderboard submit gate")
-            else:
-                short_tasks = [
-                    task
-                    for task, attempts in sorted(attempts_per_task.items())
-                    if attempts < self.config.min_attempts_per_task
-                ]
-                if short_tasks:
-                    preview = ", ".join(short_tasks[:5])
-                    if len(short_tasks) > 5:
-                        preview += f", ... (+{len(short_tasks) - 5} more)"
-                    reasons.append(
-                        "tasks below minimum attempts "
-                        f"{self.config.min_attempts_per_task}: {preview}"
-                    )
-                if len(attempts_per_task) < tasks_evaluated:
-                    reasons.append(
-                        "attempt evidence task count "
-                        f"{len(attempts_per_task)} is below evaluated tasks {tasks_evaluated}"
-                    )
         if self.config.require_full_regression and not full_regression_passed:
             reasons.append("full regression did not pass")
-        if not best_job.exists():
-            reasons.append(f"best job dir not found: {best_job}")
+
+        evidence = None
+        effective_attempts = attempts_per_task
+        if not best_job.is_dir():
+            reasons.append(f"best job dir not found or not a directory: {best_job}")
         elif self.config.harbor_upload and self.config.require_integrity_scan:
-            reasons.extend(self._integrity_reasons(best_job))
-        if self.config.require_clean_git and not self._git_clean():
-            reasons.append("git working tree is not clean")
-        if self.config.require_no_uncommitted_harness_diff and self._harness_dirty():
-            reasons.append("uncommitted harness/config/script diff exists")
-        if self.config.harbor_upload and not duplicate_submit and not self._harbor_auth_ok():
-            reasons.append("harbor auth status failed")
+            try:
+                evidence = inspect_job(best_job, require_atif=self.config.require_atif_trajectory)
+            except EvidenceError as exc:
+                reasons.append(str(exc))
+            else:
+                reasons.extend(summary_reasons(evidence, score, tasks_evaluated, attempts_per_task))
+                effective_attempts = evidence.attempts_per_task
+                # Rounded caller summaries may be compared, never used to raise
+                # a raw evidence score across the configured submit threshold.
+                if evidence.score < self.config.trigger_score:
+                    reasons.append("verified Harbor job score is below the submit trigger")
+
+        if effective_attempts is None:
+            if self.config.min_attempts_per_task > 1:
+                reasons.append("attempt evidence missing for leaderboard submit gate")
+        else:
+            short_tasks = sorted(task for task, n in effective_attempts.items()
+                                 if n < self.config.min_attempts_per_task)
+            if short_tasks:
+                preview = ", ".join(short_tasks[:5])
+                if len(short_tasks) > 5:
+                    preview += f", ... (+{len(short_tasks) - 5} more)"
+                reasons.append(f"tasks below minimum attempts {self.config.min_attempts_per_task}: {preview}")
+            if len(effective_attempts) != tasks_evaluated:
+                reasons.append("attempt evidence task count disagrees with evaluated tasks")
+
+        # Do not run external commands for an already-invalid/duplicate request.
+        if not reasons:
+            if self.config.require_clean_git and not self._git_clean():
+                reasons.append("git working tree is not clean")
+            if self.config.require_no_uncommitted_harness_diff and self._harness_dirty():
+                reasons.append("uncommitted harness/config/script diff exists")
+            if self.config.harbor_upload and not self._harbor_auth_ok():
+                reasons.append("harbor auth status failed")
 
         command: list[str] = []
         if self.config.harbor_upload:
             command = [self.harbor_bin, "upload", str(best_job)]
-            if self.config.visibility == "public":
-                command.append("--public")
-            else:
-                command.append("--private")
+            command.append("--public" if self.config.visibility == "public" else "--private")
             for org in self.config.share_orgs:
                 command.extend(["--share-org", org])
             for user in self.config.share_users:
@@ -149,11 +167,9 @@ class SubmitGate:
                 command.append("--yes")
 
         return SubmitGateResult(
-            eligible=not reasons,
-            reasons=reasons,
-            command=command,
-            intent_path=str(intent),
-            result_path=str(marker),
+            eligible=not reasons, reasons=reasons, command=command,
+            intent_path=str(intent), result_path=str(marker),
+            evidence=evidence.as_dict() if evidence is not None else {},
         )
 
     def submit_once(
@@ -191,6 +207,8 @@ class SubmitGate:
             "attempts_per_task": attempts_per_task or {},
             "min_attempts_per_task": self.config.min_attempts_per_task,
             "command": gate.command,
+            "evidence": gate.evidence,
+            "integrity_scan_enabled": self.config.require_integrity_scan,
             "created_at": datetime.now().isoformat(),
         }
         try:
@@ -205,6 +223,17 @@ class SubmitGate:
             gate.outcome_unknown = os.path.lexists(gate.intent_path)
             return gate
         gate.intent_persisted = True
+        if gate.evidence:
+            try:
+                current = inspect_job(Path(best_job_dir), require_atif=self.config.require_atif_trajectory)
+                if current.fingerprint != gate.evidence["fingerprint"]:
+                    raise EvidenceError("Harbor job changed after gate validation")
+            except EvidenceError as exc:
+                gate.eligible = False
+                gate.reasons.append(f"upload cancelled before launch: {exc}")
+                self._persist_result(gate, {**intent, "attempted": False, "submitted": False,
+                                           "evidence_recheck_failed": True})
+                return gate
         gate.attempted = True
         if not self.config.harbor_upload:
             result = {
@@ -274,86 +303,9 @@ class SubmitGate:
         return completed.returncode == 0
 
     def _integrity_reasons(self, job_dir: Path) -> list[str]:
-        reasons: list[str] = []
-        result_path = job_dir / "result.json"
-        if not result_path.exists():
-            return ["Harbor job result.json missing; cannot verify upload integrity"]
+        """Compatibility helper; use the same evidence contract as check()."""
         try:
-            job_result = json.loads(result_path.read_text(errors="replace"))
-        except json.JSONDecodeError as exc:
-            return [f"Harbor job result.json is not valid JSON: {exc}"]
-        if not isinstance(job_result, dict):
-            return ["Harbor job result.json must contain an object"]
-
-        trial_results = job_result.get("trial_results") or []
-        if not isinstance(trial_results, list) or not trial_results:
-            reasons.append("Harbor job result.json contains no trial_results")
-        for trial in trial_results:
-            if not isinstance(trial, dict):
-                continue
-            trial_name = str(trial.get("trial_name") or "")
-            if self.config.require_atif_trajectory and self._trial_passed(trial):
-                if not trial_name:
-                    reasons.append("passing Harbor trial is missing trial_name")
-                elif not self._has_atif_trajectory(job_dir, trial_name):
-                    reasons.append(
-                        f"passing Harbor trial {trial_name} is missing ATIF trajectory"
-                    )
-
-        reasons.extend(self._scan_agent_artifacts(job_dir))
-        return reasons
-
-    def _trial_passed(self, trial: dict[str, Any]) -> bool:
-        rewards = (trial.get("verifier_result") or {}).get("rewards") or {}
-        if isinstance(rewards, dict):
-            if "reward" in rewards:
-                return self._float_value(rewards.get("reward")) >= 1.0
-            numeric = [
-                self._float_value(value)
-                for value in rewards.values()
-                if isinstance(value, int | float | str)
-            ]
-            numeric = [value for value in numeric if value is not None]
-            if numeric:
-                return sum(numeric) / len(numeric) >= 1.0
-        return False
-
-    def _float_value(self, value: Any) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _has_atif_trajectory(self, job_dir: Path, trial_name: str) -> bool:
-        trial_dir = job_dir / trial_name
-        candidates = [
-            trial_dir / "agent" / "trajectory.jsonl",
-            trial_dir / "agent" / "trajectory.json",
-            trial_dir / "trajectory.jsonl",
-            trial_dir / "trajectory.json",
-        ]
-        return any(path.exists() and path.stat().st_size > 0 for path in candidates)
-
-    def _scan_agent_artifacts(self, job_dir: Path) -> list[str]:
-        reasons: list[str] = []
-        for path in job_dir.rglob("*"):
-            if not path.is_file():
-                continue
-            relative = path.relative_to(job_dir)
-            parts = {part.lower() for part in relative.parts}
-            if "agent" not in parts:
-                continue
-            if "tests" in parts or "solutions" in parts or "solution" in parts:
-                reasons.append(
-                    f"agent artifact contains prohibited benchmark material: {relative}"
-                )
-                continue
-            if path.suffix.lower() not in {".json", ".jsonl", ".txt", ".md", ".log"}:
-                continue
-            if path.stat().st_size > 2_000_000:
-                continue
-            text = path.read_text(errors="replace")
-            reason = prohibited_command_reason(text)
-            if reason:
-                reasons.append(f"agent artifact {relative} violates integrity guard: {reason}")
-        return reasons
+            inspect_job(job_dir, require_atif=self.config.require_atif_trajectory)
+        except EvidenceError as exc:
+            return [str(exc)]
+        return []
