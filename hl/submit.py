@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -10,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.tools.leaderboard_guard import prohibited_command_reason
+from hl.submission_storage import prepare_store, valid_campaign_id, write_exclusive_json
 
 
 @dataclass
@@ -44,6 +47,9 @@ class SubmitGateResult:
     returncode: int | None = None
     upload_skipped: bool = False
     terminal: bool = False
+    intent_persisted: bool = False
+    outcome_unknown: bool = False
+    result_persistence_failed: bool = False
 
 
 class SubmitGate:
@@ -58,7 +64,7 @@ class SubmitGate:
     ) -> None:
         self.config = config or SubmitConfig()
         self.submissions_dir = Path(submissions_dir)
-        self.submissions_dir.mkdir(parents=True, exist_ok=True)
+        prepare_store(self.submissions_dir)
         self.harbor_bin = harbor_bin
 
     def check(
@@ -71,6 +77,8 @@ class SubmitGate:
         full_regression_passed: bool,
         attempts_per_task: dict[str, int] | None = None,
     ) -> SubmitGateResult:
+        if not valid_campaign_id(campaign_id):
+            return SubmitGateResult(eligible=False, reasons=["invalid campaign_id: use 1-128 ASCII letters, digits, dot, underscore or hyphen; start with a letter/digit"])
         reasons: list[str] = []
         best_job = Path(best_job_dir)
         marker = self.submissions_dir / f"{campaign_id}.json"
@@ -79,10 +87,10 @@ class SubmitGate:
 
         if not self.config.enabled:
             reasons.append("submit.enabled is false")
-        if marker.exists() and self.config.once_per_campaign:
+        if os.path.lexists(marker) and self.config.once_per_campaign:
             duplicate_submit = True
             reasons.append("campaign already has a submit result")
-        if intent.exists() and self.config.once_per_campaign:
+        if os.path.lexists(intent) and self.config.once_per_campaign:
             duplicate_submit = True
             reasons.append("campaign already has a submit intent")
         if score < self.config.trigger_score:
@@ -170,8 +178,11 @@ class SubmitGate:
         if not gate.eligible or dry_run:
             return gate
 
-        gate.attempted = True
         gate.terminal = self.config.stop_after_submit_attempt
+        if not self.config.once_per_campaign:
+            attempt_id = f"{campaign_id}.{uuid.uuid4().hex}"
+            gate.intent_path = str(self.submissions_dir / f"{attempt_id}.intent.json")
+            gate.result_path = str(self.submissions_dir / f"{attempt_id}.json")
         intent = {
             "campaign_id": campaign_id,
             "best_job_dir": str(best_job_dir),
@@ -182,7 +193,19 @@ class SubmitGate:
             "command": gate.command,
             "created_at": datetime.now().isoformat(),
         }
-        Path(gate.intent_path).write_text(json.dumps(intent, indent=2))
+        try:
+            write_exclusive_json(Path(gate.intent_path), intent)
+        except FileExistsError:
+            gate.eligible = False
+            gate.reasons.append("campaign already has a submit intent (exclusive claim lost)")
+            return gate
+        except (OSError, ValueError, TypeError) as exc:
+            gate.eligible = False
+            gate.reasons.append(f"submit intent could not be durably persisted: {exc}")
+            gate.outcome_unknown = os.path.lexists(gate.intent_path)
+            return gate
+        gate.intent_persisted = True
+        gate.attempted = True
         if not self.config.harbor_upload:
             result = {
                 **intent,
@@ -193,11 +216,19 @@ class SubmitGate:
                 "submitted": False,
                 "upload_skipped": True,
             }
-            Path(gate.result_path).write_text(json.dumps(result, indent=2))
+            self._persist_result(gate, result)
             gate.upload_skipped = True
             return gate
 
-        completed = subprocess.run(gate.command, capture_output=True, text=True)
+        try:
+            completed = subprocess.run(gate.command, capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            # Keep the durable claim. A failed transport/wait does not establish
+            # that the external service has not accepted the submission.
+            gate.outcome_unknown = True
+            gate.reasons.append(f"upload outcome unknown; reconcile intent before retry: {exc}")
+            self._persist_result(gate, {**intent, "submitted": False, "outcome_unknown": True})
+            return gate
         gate.returncode = completed.returncode
         gate.submitted = completed.returncode == 0
         result: dict[str, Any] = {
@@ -209,8 +240,15 @@ class SubmitGate:
             "submitted": completed.returncode == 0,
             "upload_skipped": False,
         }
-        Path(gate.result_path).write_text(json.dumps(result, indent=2))
+        self._persist_result(gate, result)
         return gate
+
+    def _persist_result(self, gate: SubmitGateResult, result: dict[str, Any]) -> None:
+        try:
+            write_exclusive_json(Path(gate.result_path), result)
+        except (OSError, ValueError, TypeError) as exc:
+            gate.result_persistence_failed = True
+            gate.reasons.append(f"submit result persistence failed; durable intent retained: {exc}")
 
     def _git_clean(self) -> bool:
         completed = subprocess.run(["git", "status", "--short"], capture_output=True, text=True)
