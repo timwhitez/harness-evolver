@@ -1,12 +1,9 @@
-"""Public bounded process runner with challenge-response cleanup attribution.
+"""Bounded exact-argv execution with single-owner pipes and cleanup attestation.
 
-The Linux namespace/subreaper implementation lives in
-:mod:`harness.tools._process_runner_issue19_namespace_base`. This facade keeps
-that containment boundary, adds exact-argv execution and cooperative
-cancellation, and reports successful cleanup only after the supervisor returns a
-random challenge that was never inherited by the managed command.
+The existing namespace/subreaper owns process-tree containment. Output is read
+nonblockingly by the caller, never by a thread sharing an owning stream. One
+resource scope covers every allocation, launch, setup failure, and teardown.
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,14 +15,13 @@ import select
 import subprocess
 import threading
 import time
-from typing import BinaryIO, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from harness.tools import _process_runner_issue19_namespace_base as _base
+from harness.tools.pipe_io import PipeReader
 
 for _name, _value in vars(_base).items():
     if not (_name.startswith("__") and _name.endswith("__")):
-        # Facade-local imports and aliases win over inherited implementation
-        # details, especially the upstream module's own ``_base`` reference.
         globals().setdefault(_name, _value)
 
 _runtime = _base._base
@@ -34,13 +30,7 @@ _CLEANUP_PROOF_WAIT_SECONDS = 0.5
 
 
 def _supervisor_exit_confirms_cleanup(returncode: int | None) -> bool:
-    """Return the preliminary handled-termination status.
-
-    Exit status 124 is necessary but not sufficient: a managed command can also
-    return 124 normally. Public cleanup attribution additionally requires the
-    random proof pipe validated by :func:`_cleanup_proof_matches`.
-    """
-
+    # Status 124 alone is not proof: managed commands can return it normally.
     return returncode == _runtime._SUPERVISOR_TIMEOUT_EXIT
 
 
@@ -51,8 +41,6 @@ _runtime._terminate_supervised_process = _base._terminate_supervised_process
 
 @dataclass(frozen=True)
 class ProcessOutcome:
-    """Result of one bounded command execution."""
-
     returncode: int
     stdout: str
     stderr: str
@@ -60,6 +48,7 @@ class ProcessOutcome:
     elapsed_ms: float
     managed_process_group_terminated: bool = False
     cancelled: bool = False
+    output_eof: bool = True
 
 
 def _validated_timeout(value: object) -> float:
@@ -87,8 +76,6 @@ def _validated_output_limit(value: object) -> int:
 
 
 def _validated_argv(value: object) -> list[str]:
-    """Return one immutable-by-convention argv snapshot before launch setup."""
-
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise ValueError("argv must be a non-empty sequence of strings")
     argv = list(value)
@@ -98,12 +85,11 @@ def _validated_argv(value: object) -> list[str]:
 
 
 def _close_fd(fd: int | None) -> None:
-    if fd is None:
-        return
-    try:
-        os.close(fd)
-    except OSError:
-        pass
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _write_all_fd(fd: int, payload: bytes) -> None:
@@ -115,56 +101,33 @@ def _write_all_fd(fd: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _close_raw_descriptor(stream: BinaryIO | None) -> None:
-    """Close a pipe fd without contending on a buffered reader lock."""
-
-    if stream is None:
-        return
-    try:
-        descriptor = stream.fileno()
-    except (OSError, ValueError):
-        return
-    _close_fd(descriptor)
-
-
 def _prepare_supervised_launch(
     argv: Sequence[str],
 ) -> tuple[list[str], tuple[int, int], int, int, bytes]:
-    """Build the supervisor argv and two parent-owned attestation pipes."""
-
-    challenge_read, challenge_write = os.pipe()
-    proof_read, proof_write = os.pipe()
-    token = secrets.token_bytes(_CLEANUP_TOKEN_BYTES)
-    command = [
-        *_base.supervised_command_for_argv(argv),
-        "--cleanup-challenge-fd",
-        str(challenge_read),
-        "--cleanup-proof-fd",
-        str(proof_write),
-    ]
-    return (
-        command,
-        (challenge_read, proof_write),
-        challenge_write,
-        proof_read,
-        token,
-    )
+    owned: list[int] = []
+    try:
+        challenge_read, challenge_write = os.pipe()
+        owned.extend((challenge_read, challenge_write))
+        proof_read, proof_write = os.pipe()
+        owned.extend((proof_read, proof_write))
+        token = secrets.token_bytes(_CLEANUP_TOKEN_BYTES)
+        command = [*_base.supervised_command_for_argv(argv),
+                   "--cleanup-challenge-fd", str(challenge_read),
+                   "--cleanup-proof-fd", str(proof_write)]
+        return command, (challenge_read, proof_write), challenge_write, proof_read, token
+    except BaseException:
+        for fd in owned:
+            _close_fd(fd)
+        raise
 
 
-def _attach_cleanup_proof(
-    process: subprocess.Popen[bytes],
-    *,
-    proof_fd: int,
-    token: bytes,
-) -> None:
-    setattr(process, "_harness_cleanup_proof_fd", proof_fd)
-    setattr(process, "_harness_cleanup_token", token)
-    setattr(process, "_harness_cleanup_proof_result", None)
+def _attach_cleanup_proof(process, *, proof_fd: int, token: bytes) -> None:
+    process._harness_cleanup_proof_fd = proof_fd
+    process._harness_cleanup_token = token
+    process._harness_cleanup_proof_result = None
 
 
-def _cleanup_proof_matches(process: subprocess.Popen[bytes]) -> bool:
-    """Consume and validate one supervisor proof exactly once."""
-
+def _cleanup_proof_matches(process) -> bool:
     cached = getattr(process, "_harness_cleanup_proof_result", None)
     if isinstance(cached, bool):
         return cached
@@ -172,13 +135,11 @@ def _cleanup_proof_matches(process: subprocess.Popen[bytes]) -> bool:
     token = getattr(process, "_harness_cleanup_token", None)
     if not isinstance(fd, int) or not isinstance(token, bytes):
         return False
-
     payload = bytearray()
     deadline = time.monotonic() + _CLEANUP_PROOF_WAIT_SECONDS
     try:
         while time.monotonic() < deadline:
-            remaining = max(0.0, deadline - time.monotonic())
-            readable, _, _ = select.select([fd], [], [], remaining)
+            readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
             if not readable:
                 break
             chunk = os.read(fd, 4096)
@@ -190,41 +151,29 @@ def _cleanup_proof_matches(process: subprocess.Popen[bytes]) -> bool:
     except (OSError, ValueError):
         pass
     finally:
+        process._harness_cleanup_proof_fd = None
         _close_fd(fd)
-        setattr(process, "_harness_cleanup_proof_fd", None)
-
     matched = bytes(payload) == token
-    setattr(process, "_harness_cleanup_proof_result", matched)
+    process._harness_cleanup_proof_result = matched
     return matched
 
 
-def _discard_cleanup_proof(process: subprocess.Popen[bytes]) -> None:
+def _discard_cleanup_proof(process) -> None:
     fd = getattr(process, "_harness_cleanup_proof_fd", None)
+    process._harness_cleanup_proof_fd = None
     if isinstance(fd, int):
         _close_fd(fd)
-        setattr(process, "_harness_cleanup_proof_fd", None)
 
 
-def _terminate_process_tree(
-    process: subprocess.Popen[bytes],
-    *,
-    process_token: str | None = None,
-) -> bool:
-    """Terminate the managed tree and require proof for a supervisor process."""
-
-    terminated = _runtime._terminate_process_tree(
-        process,
-        process_token=process_token,
-    )
+def _terminate_process_tree(process, *, process_token: str | None = None) -> bool:
+    terminated = _runtime._terminate_process_tree(process, process_token=process_token)
     if getattr(process, "_harness_evolver_supervised", False):
         return bool(terminated and _cleanup_proof_matches(process))
     return terminated
 
 
 def _run_bounded_argv(
-    argv: Sequence[str],
-    *,
-    timeout_seconds: float,
+    argv: Sequence[str], *, timeout_seconds: float,
     cwd: str | Path | None = None,
     output_limit_bytes: int = _runtime._OUTPUT_LIMIT_BYTES,
     env: Mapping[str, str] | None = None,
@@ -233,192 +182,139 @@ def _run_bounded_argv(
     normalized_argv = _validated_argv(argv)
     timeout = _validated_timeout(timeout_seconds)
     output_limit = _validated_output_limit(output_limit_bytes)
-
-    # Match subprocess.Popen's established environment contract exactly:
-    # ``None`` inherits the parent environment, while an explicit mapping is a
-    # complete replacement. Overlaying it onto ``os.environ`` can reintroduce
-    # credentials, proxy settings, or loader variables the caller deliberately
-    # removed from a verification command.
-    child_env = (
-        None
-        if env is None
-        else {str(key): str(value) for key, value in env.items()}
-    )
-
-    supervised = _runtime._is_linux_subreaper_available()
-    child_fds: tuple[int, int] = ()
-    challenge_write: int | None = None
-    proof_read: int | None = None
-    cleanup_token: bytes | None = None
-    if supervised:
-        (
-            launched_argv,
-            child_fds,
-            challenge_write,
-            proof_read,
-            cleanup_token,
-        ) = _prepare_supervised_launch(normalized_argv)
-    else:
-        launched_argv = normalized_argv
-
-    started = time.monotonic()
-    try:
-        process = subprocess.Popen(
-            launched_argv,
-            shell=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            env=child_env,
-            start_new_session=(os.name == "posix"),
-            pass_fds=child_fds,
-        )
-    except Exception:
-        for fd in (*child_fds, challenge_write, proof_read):
-            _close_fd(fd)
-        raise
-
-    if supervised:
-        setattr(process, "_harness_evolver_supervised", True)
-        for fd in child_fds:
-            _close_fd(fd)
-        assert challenge_write is not None
-        assert proof_read is not None
-        assert cleanup_token is not None
-        _attach_cleanup_proof(
-            process,
-            proof_fd=proof_read,
-            token=cleanup_token,
-        )
-        try:
-            _write_all_fd(challenge_write, cleanup_token)
-        except OSError:
-            # The supervisor will fail setup and no proof can be accepted.
-            _discard_cleanup_proof(process)
-        finally:
-            _close_fd(challenge_write)
-
-    assert process.stdout is not None
-    assert process.stderr is not None
+    child_env = None if env is None else {str(k): str(v) for k, v in env.items()}
+    # Capture allocation cannot strand a child: do it before acquiring resources.
     stdout_capture = _runtime._BoundedCapture(output_limit)
     stderr_capture = _runtime._BoundedCapture(output_limit)
-    stdout_thread = _runtime._start_drain_thread(
-        process.stdout,
-        stdout_capture,
-        "stdout",
-    )
-    stderr_thread = _runtime._start_drain_thread(
-        process.stderr,
-        stderr_capture,
-        "stderr",
-    )
+    supervised = _runtime._is_linux_subreaper_available()
+    child_fds: tuple[int, ...] = ()
+    challenge_write = proof_read = None
+    process = None
+    readers: list[tuple[PipeReader, object]] = []
+    timed_out = cancelled = cleanup_confirmed = False
+    started = time.monotonic()
 
-    timed_out = False
-    cancelled = False
-    cleanup_confirmed = False
-    deadline = started + timeout
+    def pump() -> bool:
+        progress = False
+        for reader, capture in list(readers):
+            data = reader.read()
+            if data == b"":
+                readers.remove((reader, capture))
+            elif data is not None:
+                capture.feed(data)
+                progress = True
+        return progress
+
+    def drain_for(seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while readers and time.monotonic() < deadline:
+            if not pump():
+                time.sleep(0.01)
+
     try:
+        launched_argv = normalized_argv
+        if supervised:
+            launched_argv, child_fds, challenge_write, proof_read, token = (
+                _prepare_supervised_launch(normalized_argv)
+            )
+        process = subprocess.Popen(
+            launched_argv, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=cwd, env=child_env, bufsize=0,
+            start_new_session=(os.name == "posix"), pass_fds=child_fds,
+        )
+        if supervised:
+            process._harness_evolver_supervised = True
+            while child_fds:
+                fd, *remaining = child_fds
+                child_fds = tuple(remaining)
+                _close_fd(fd)
+            _attach_cleanup_proof(process, proof_fd=proof_read, token=token)
+            proof_read = None  # ownership transferred to process attribute
+            try:
+                _write_all_fd(challenge_write, token)
+            except OSError:
+                _discard_cleanup_proof(process)
+            finally:
+                fd, challenge_write = challenge_write, None
+                _close_fd(fd)
+        assert process.stdout is not None and process.stderr is not None
+        readers.append((PipeReader(process.stdout), stdout_capture))
+        readers.append((PipeReader(process.stderr), stderr_capture))
+        deadline = started + timeout
         while process.poll() is None:
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 cleanup_confirmed = _terminate_process_tree(process)
                 break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if time.monotonic() >= deadline:
                 timed_out = True
                 cleanup_confirmed = _terminate_process_tree(process)
                 break
-            time.sleep(min(0.02, remaining))
-
-        _runtime._join_stream_threads(
-            stdout_thread,
-            stderr_thread,
-            timeout=_runtime._STREAM_JOIN_SECONDS,
-        )
-        if stdout_thread.is_alive() or stderr_thread.is_alive():
+            if not pump():
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        drain_for(_runtime._STREAM_JOIN_SECONDS)
+        if readers:
             background_cleanup = _terminate_process_tree(process)
             if timed_out or cancelled:
                 cleanup_confirmed = cleanup_confirmed or background_cleanup
-            _runtime._join_stream_threads(
-                stdout_thread,
-                stderr_thread,
-                timeout=_runtime._STREAM_JOIN_SECONDS,
-            )
+            drain_for(_runtime._STREAM_JOIN_SECONDS)
     finally:
-        _runtime._reap_process(process)
-        if stdout_thread.is_alive():
-            _close_raw_descriptor(process.stdout)
-        if stderr_thread.is_alive():
-            _close_raw_descriptor(process.stderr)
-        _runtime._join_stream_threads(
-            stdout_thread,
-            stderr_thread,
-            timeout=_runtime._STREAM_JOIN_SECONDS,
-        )
-        if not stdout_thread.is_alive():
-            _runtime._close_stream(process.stdout)
-        if not stderr_thread.is_alive():
-            _runtime._close_stream(process.stderr)
-        _discard_cleanup_proof(process)
-
+        # Also covers Popen, reader initialization, capture.feed, and cancellation
+        # exceptions. Never raw-close a descriptor owned by a Python stream.
+        try:
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        _terminate_process_tree(process)
+                except Exception:
+                    # Preserve the original setup/read error; reaping is still tried.
+                    pass
+                finally:
+                    try:
+                        _runtime._reap_process(process)
+                    finally:
+                        _runtime._close_stream(process.stdout)
+                        _runtime._close_stream(process.stderr)
+                        _discard_cleanup_proof(process)
+        finally:
+            for fd in (*child_fds, challenge_write, proof_read):
+                _close_fd(fd)
     return ProcessOutcome(
         returncode=process.returncode if process.returncode is not None else -1,
-        stdout=stdout_capture.text(),
-        stderr=stderr_capture.text(),
-        timed_out=timed_out,
-        cancelled=cancelled,
+        stdout=stdout_capture.text(), stderr=stderr_capture.text(),
+        timed_out=timed_out, cancelled=cancelled,
         elapsed_ms=(time.monotonic() - started) * 1000,
         managed_process_group_terminated=cleanup_confirmed,
+        output_eof=not readers,
     )
 
 
 def run_bounded_argv(
-    argv: Sequence[str],
-    *,
-    timeout_seconds: float,
+    argv: Sequence[str], *, timeout_seconds: float,
     cwd: str | Path | None = None,
     output_limit_bytes: int = _runtime._OUTPUT_LIMIT_BYTES,
     env: Mapping[str, str] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> ProcessOutcome:
-    """Run exact argv with bounded output and complete managed-tree cleanup."""
-
-    return _run_bounded_argv(
-        argv,
-        timeout_seconds=timeout_seconds,
-        cwd=cwd,
-        output_limit_bytes=output_limit_bytes,
-        env=env,
-        cancel_event=cancel_event,
-    )
+    return _run_bounded_argv(argv, timeout_seconds=timeout_seconds, cwd=cwd,
+                             output_limit_bytes=output_limit_bytes, env=env,
+                             cancel_event=cancel_event)
 
 
 def run_bounded_shell(
-    command: str,
-    *,
-    timeout_seconds: float,
+    command: str, *, timeout_seconds: float,
     cwd: str | Path | None = None,
     output_limit_bytes: int = _runtime._OUTPUT_LIMIT_BYTES,
     env: Mapping[str, str] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> ProcessOutcome:
-    """Run one platform shell command through the shared bounded runner."""
-
     if not isinstance(command, str):
         raise TypeError("command must be a string")
-    if os.name == "nt":
-        shell = os.environ.get("COMSPEC") or "cmd.exe"
-        argv = [shell, "/d", "/s", "/c", command]
-    else:
-        argv = ["/bin/sh", "-c", command]
-    return _run_bounded_argv(
-        argv,
-        timeout_seconds=timeout_seconds,
-        cwd=cwd,
-        output_limit_bytes=output_limit_bytes,
-        env=env,
-        cancel_event=cancel_event,
-    )
+    argv = ([os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
+            if os.name == "nt" else ["/bin/sh", "-c", command])
+    return _run_bounded_argv(argv, timeout_seconds=timeout_seconds, cwd=cwd,
+                             output_limit_bytes=output_limit_bytes, env=env,
+                             cancel_event=cancel_event)
 
 
 supervised_command_for_argv = _base.supervised_command_for_argv
