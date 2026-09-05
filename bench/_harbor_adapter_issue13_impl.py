@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from harness.tools.descriptor_open import embedded_opener_source
+
 from bench import _harbor_adapter_issue13_base as _base
 from bench import _canonical_harbor_grep as _canonical
 
 
 _COUNT_PREFIX = "__HL_GREP_COUNT__"
 
-_HARBOR_GREP_COUNTING_PYTHON = r'''
+_HARBOR_GREP_COUNTING_PYTHON = embedded_opener_source() + r'''
 import os
 from pathlib import Path
 import re
@@ -89,10 +91,8 @@ def open_root_nofollow(path: str):
             next_parent = os.open(component, directory_flags, dir_fd=parent)
             os.close(parent)
             parent = next_parent
-        descriptor = os.open(
-            target.name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=parent,
+        descriptor, _ = open_readonly_checked(
+            parent, target.name, unique=False, allow_directory=True,
         )
         return parent, descriptor, target
     except Exception:
@@ -179,10 +179,8 @@ def scan_root_directory(root_descriptor: int) -> None:
                 if stat.S_ISLNK(metadata.st_mode):
                     authorize_symlink(candidate)
                     continue
-                descriptor = os.open(
-                    name,
-                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=directory_fd,
+                descriptor, _ = open_readonly_checked(
+                    directory_fd, name, unique=False,
                 )
                 try:
                     scan_descriptor(descriptor, candidate)

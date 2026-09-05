@@ -10,13 +10,14 @@ from typing import Any
 from bench import _harbor_adapter_issue4_base as _base
 from bench._canonical_harbor_paths import _CanonicalHarborPathMixin
 from harness.tools.base import ToolResult, policy_guard_metadata
+from harness.tools.descriptor_open import embedded_opener_source
 from harness.tools.shell import (
     deliverable_size_cap_write_reason,
     staged_dependency_script_reason,
 )
 
 
-_SAFE_PREAMBLE = r'''
+_SAFE_PREAMBLE = embedded_opener_source() + r'''
 import base64, hashlib, os, pathlib, secrets, stat, sys
 
 def parent_fd(raw_path, create=False):
@@ -45,12 +46,7 @@ def parent_fd(raw_path, create=False):
         raise
 
 def open_regular(parent, name):
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        dir_fd=parent,
-    )
-    metadata = os.fstat(descriptor)
+    descriptor, metadata = open_readonly_checked(parent, name, unique=False)
     if not stat.S_ISREG(metadata.st_mode):
         os.close(descriptor)
         raise RuntimeError("not a regular file")
@@ -416,7 +412,7 @@ class HarborFileEditTool(_SecureHarborMixin, _base.HarborFileEditTool):
                 ),
             )
         expected = hashlib.sha256(current.encode("utf-8")).hexdigest()
-        return self._run_secure_python(
+        result = self._run_secure_python(
             _SECURE_EDIT,
             env={
                 "HL_FILE_PATH": resolved,
@@ -426,3 +422,5 @@ class HarborFileEditTool(_SecureHarborMixin, _base.HarborFileEditTool):
                 "HL_EXPECTED_SHA256": expected,
             },
         )
+        result.metadata["publication_attempted"] = True
+        return result

@@ -7,10 +7,8 @@ import os
 from pathlib import Path
 from typing import BinaryIO, Iterator
 
-from harness.tools.safe_path_io import (
-    _open_parent_nofollow,
-    _validate_unique_regular_file,
-)
+from harness.tools.descriptor_open import open_readonly_checked
+from harness.tools.safe_path_io import SafePathError, _open_parent_nofollow
 
 
 def _open_regular_nofollow(
@@ -18,20 +16,11 @@ def _open_regular_nofollow(
     name: str,
     target: Path,
 ) -> tuple[int, os.stat_result]:
-    """Open one uniquely linked regular file relative to a stable parent."""
-
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        dir_fd=parent_fd,
-    )
+    """Pin/type-check before a readable open; never wait for a FIFO peer."""
     try:
-        metadata = os.fstat(descriptor)
-        _validate_unique_regular_file(metadata, target)
-        return descriptor, metadata
-    except Exception:
-        os.close(descriptor)
-        raise
+        return open_readonly_checked(parent_fd, name)
+    except ValueError as exc:
+        raise SafePathError(f"Cannot open regular target safely: {target}: {exc}") from exc
 
 
 @contextmanager
@@ -46,12 +35,14 @@ def open_binary_nofollow(
         target,
     ):
         descriptor, metadata = _open_regular_nofollow(parent_fd, name, target)
-        stream = os.fdopen(descriptor, "rb", buffering=0, closefd=False)
+        stream = None
         try:
+            stream = os.fdopen(descriptor, "rb", buffering=0, closefd=False)
             yield stream, metadata
         finally:
             try:
-                stream.close()
+                if stream is not None:
+                    stream.close()
             finally:
                 os.close(descriptor)
 

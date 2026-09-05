@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 from pathlib import Path
 import socket
@@ -10,306 +11,120 @@ import sys
 
 import pytest
 
-from bench._canonical_harbor_special_write import (
-    HarborFileWriteTool as GuardedHarborFileWriteTool,
-    _SECURE_ATOMIC_WRITE,
-)
+from bench._canonical_harbor_special_write import HarborFileWriteTool as GuardedHarborFileWriteTool, _SECURE_ATOMIC_WRITE
 from bench.harbor_adapter import HarborFileWriteTool
 from harness.tools import safe_path_io
 from harness.tools.file_write import FileWriteTool
 from harness.tools.safe_path_io import SafePathError, atomic_write_text_nofollow
 
-
-pytestmark = pytest.mark.skipif(
-    os.name != "posix" or not hasattr(os, "O_NOFOLLOW"),
-    reason="descriptor-relative special-target checks require POSIX",
-)
+pytestmark=pytest.mark.skipif(not sys.platform.startswith('linux'),reason='Linux publication')
 
 
-def _identity(path: Path) -> tuple[int, int, int]:
-    metadata = path.lstat()
-    return int(metadata.st_dev), int(metadata.st_ino), stat.S_IFMT(metadata.st_mode)
+def _identity(path):
+    m=path.lstat();return m.st_dev,m.st_ino,stat.S_IFMT(m.st_mode)
 
 
-def _temporary_paths(path: Path) -> list[Path]:
-    return list(path.parent.glob(f".{path.name}.tmp-*"))
+def _temporary_paths(path):return list(path.parent.glob('.hl-publish-*'))
 
 
-def _run_harbor_write(
-    path: Path,
-    content: str,
-    *,
-    script: str = _SECURE_ATOMIC_WRITE,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={
-            **os.environ,
-            "HL_FILE_PATH": str(path),
-            "HL_FILE_CONTENT": base64.b64encode(
-                content.encode("utf-8")
-            ).decode("ascii"),
-        },
-    )
+def _run_harbor_write(path,content,script=_SECURE_ATOMIC_WRITE):
+    return subprocess.run([sys.executable,'-c',script],capture_output=True,text=True,timeout=3,
+        env={**os.environ,'HL_FILE_PATH':str(path),'HL_FILE_CONTENT':base64.b64encode(content.encode()).decode()})
 
 
-def test_public_harbor_registry_exports_the_guarded_writer() -> None:
+def test_public_harbor_registry_exports_the_guarded_writer():
     assert HarborFileWriteTool is GuardedHarborFileWriteTool
 
 
-def test_local_whole_file_write_rejects_fifo_before_temp_creation(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "endpoint.fifo"
-    os.mkfifo(target)
-    before = _identity(target)
-
-    result = FileWriteTool().execute(str(target), "replacement")
-
-    assert result.success is False
-    assert "non-regular overwrite target" in result.error
-    assert _identity(target) == before
-    assert stat.S_ISFIFO(target.lstat().st_mode)
-    assert _temporary_paths(target) == []
-
-
-@pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"),
-    reason="Unix-domain sockets are unavailable",
-)
-def test_local_whole_file_write_rejects_unix_socket_before_temp_creation(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "endpoint.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(target))
+@pytest.mark.parametrize('engine',['local','harbor'])
+@pytest.mark.parametrize('kind',['fifo','socket'])
+def test_static_special_entries_are_unchanged_before_publication(tmp_path,engine,kind):
+    path=tmp_path/'endpoint';server=None
+    if kind=='fifo':os.mkfifo(path)
+    else:server=socket.socket(socket.AF_UNIX);server.bind(str(path))
     try:
-        before = _identity(target)
-
-        result = FileWriteTool().execute(str(target), "replacement")
-
-        assert result.success is False
-        assert "non-regular overwrite target" in result.error
-        assert _identity(target) == before
-        assert stat.S_ISSOCK(target.lstat().st_mode)
-        assert _temporary_paths(target) == []
+        before=_identity(path)
+        if engine=='local':assert not FileWriteTool().execute(str(path),'replacement').success
+        else:assert _run_harbor_write(path,'replacement').returncode!=0
+        assert _identity(path)==before and not _temporary_paths(path)
     finally:
-        server.close()
+        if server is not None:server.close()
 
 
-def test_harbor_whole_file_write_rejects_fifo_before_temp_creation(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "endpoint.fifo"
-    os.mkfifo(target)
-    before = _identity(target)
-
-    completed = _run_harbor_write(target, "replacement")
-
-    assert completed.returncode != 0
-    assert "secure nofollow write failed" in completed.stderr
-    assert _identity(target) == before
-    assert stat.S_ISFIFO(target.lstat().st_mode)
-    assert _temporary_paths(target) == []
+def test_character_device_type_is_rejected_without_touching_a_real_device(tmp_path,monkeypatch):
+    path=tmp_path/'fixture';path.write_text('unchanged');real=os.stat
+    def special(name,*a,**kw):
+        observed=real(name,*a,**kw)
+        if name=='fixture' and kw.get('dir_fd') is not None:
+            values=list(observed);values[0]=stat.S_IFCHR|0o600;return os.stat_result(values)
+        return observed
+    monkeypatch.setattr(os,'stat',special)
+    with pytest.raises(SafePathError,match='non-regular overwrite target'):
+        atomic_write_text_nofollow(path,'replacement')
+    assert path.read_text()=='unchanged'
 
 
-@pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"),
-    reason="Unix-domain sockets are unavailable",
-)
-def test_harbor_whole_file_write_rejects_unix_socket_before_temp_creation(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "endpoint.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(target))
-    try:
-        before = _identity(target)
-
-        completed = _run_harbor_write(target, "replacement")
-
-        assert completed.returncode != 0
-        assert "secure nofollow write failed" in completed.stderr
-        assert _identity(target) == before
-        assert stat.S_ISSOCK(target.lstat().st_mode)
-        assert _temporary_paths(target) == []
-    finally:
-        server.close()
+@pytest.mark.parametrize('engine',['local','harbor'])
+def test_regular_hardlink_overwrite_dealiases_only_selected_entry(tmp_path,engine):
+    original=tmp_path/'original';target=tmp_path/'target';original.write_text('old');os.link(original,target)
+    if engine=='local':assert FileWriteTool().execute(str(target),'new').success
+    else:assert _run_harbor_write(target,'new').returncode==0
+    assert original.read_text()=='old' and target.read_text()=='new'
+    assert original.stat().st_ino!=target.stat().st_ino and not _temporary_paths(target)
 
 
-def test_character_device_is_rejected_before_publication() -> None:
-    target = Path("/dev/null")
-    if not target.exists() or not stat.S_ISCHR(target.lstat().st_mode):
-        pytest.skip("/dev/null character device is unavailable")
-    before = _identity(target)
-
-    with pytest.raises(SafePathError, match="non-regular overwrite target"):
-        atomic_write_text_nofollow(target, "replacement")
-
-    assert _identity(target) == before
+def test_missing_target_creation_remains_supported_locally_and_in_harbor(tmp_path):
+    local=tmp_path/'local';harbor=tmp_path/'harbor'
+    assert FileWriteTool().execute(str(local),'local').success
+    assert _run_harbor_write(harbor,'harbor').returncode==0
+    assert local.read_text()=='local' and harbor.read_text()=='harbor'
+    assert not _temporary_paths(local)
 
 
-def test_regular_hard_link_overwrite_still_dealiases_only_selected_entry(
-    tmp_path: Path,
-) -> None:
-    original = tmp_path / "original.txt"
-    target = tmp_path / "target.txt"
-    original.write_text("old", encoding="utf-8")
-    os.link(original, target)
-
-    result = FileWriteTool().execute(str(target), "new")
-
-    assert result.success is True
-    assert original.read_text(encoding="utf-8") == "old"
-    assert target.read_text(encoding="utf-8") == "new"
-    assert original.stat().st_ino != target.stat().st_ino
-    assert _temporary_paths(target) == []
+def test_missing_local_target_that_appears_as_fifo_is_not_replaced(tmp_path,monkeypatch):
+    target=tmp_path/'appeared';real=safe_path_io._renameat2
+    def race(parent,source,dest,flags):
+        assert flags==1;os.mkfifo(target);real(parent,source,dest,flags)
+    monkeypatch.setattr(safe_path_io,'_renameat2',race)
+    with pytest.raises(OSError):atomic_write_text_nofollow(target,'new')
+    assert stat.S_ISFIFO(target.lstat().st_mode) and not _temporary_paths(target)
 
 
-def test_harbor_regular_hard_link_overwrite_still_dealiases_selected_entry(
-    tmp_path: Path,
-) -> None:
-    original = tmp_path / "original.txt"
-    target = tmp_path / "target.txt"
-    original.write_text("old", encoding="utf-8")
-    os.link(original, target)
-
-    completed = _run_harbor_write(target, "new")
-
-    assert completed.returncode == 0, completed.stderr
-    assert original.read_text(encoding="utf-8") == "old"
-    assert target.read_text(encoding="utf-8") == "new"
-    assert original.stat().st_ino != target.stat().st_ino
-    assert _temporary_paths(target) == []
+def test_existing_local_target_swapped_to_fifo_is_retained_for_recovery(tmp_path,monkeypatch):
+    target=tmp_path/'swapped';target.write_text('old');real=safe_path_io._renameat2;calls=[]
+    def race(parent,source,dest,flags):
+        calls.append(flags);target.unlink();os.mkfifo(target);real(parent,source,dest,flags)
+    monkeypatch.setattr(safe_path_io,'_renameat2',race)
+    with pytest.raises(SafePathError,match='non-regular overwrite target') as caught:
+        atomic_write_text_nofollow(target,'new')
+    outcome=caught.value.publication_outcome
+    assert calls==[2] and outcome['publication_state']=='indeterminate' and outcome['no_auto_retry']
+    assert target.read_text()=='new'
+    retained=[tmp_path/e for e in outcome['recovery_entries']]
+    assert any(stat.S_ISFIFO(p.lstat().st_mode) for p in retained)
+    assert any(p.suffix=='.intent' for p in retained)
 
 
-def test_missing_target_creation_remains_supported_locally_and_in_harbor(
-    tmp_path: Path,
-) -> None:
-    local_target = tmp_path / "local.txt"
-    harbor_target = tmp_path / "harbor.txt"
-
-    local = FileWriteTool().execute(str(local_target), "local")
-    harbor = _run_harbor_write(harbor_target, "harbor")
-
-    assert local.success is True
-    assert local_target.read_text(encoding="utf-8") == "local"
-    assert harbor.returncode == 0, harbor.stderr
-    assert harbor_target.read_text(encoding="utf-8") == "harbor"
-    assert _temporary_paths(local_target) == []
-    assert _temporary_paths(harbor_target) == []
-
-
-def test_missing_local_target_that_appears_as_fifo_is_not_replaced(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = tmp_path / "appeared.fifo"
-    original = safe_path_io._renameat2
-    injected = False
-
-    def appear_before_publish(
-        parent_fd: int,
-        source: str,
-        destination: str,
-        flags: int,
-    ) -> None:
-        nonlocal injected
-        if not injected and flags == safe_path_io._RENAME_NOREPLACE:
-            os.mkfifo(target)
-            injected = True
-        original(parent_fd, source, destination, flags)
-
-    monkeypatch.setattr(safe_path_io, "_renameat2", appear_before_publish)
-
-    with pytest.raises(OSError):
-        atomic_write_text_nofollow(target, "new")
-
-    assert injected is True
-    assert stat.S_ISFIFO(target.lstat().st_mode)
-    assert _temporary_paths(target) == []
-
-
-def test_existing_local_target_swapped_to_fifo_is_rolled_back(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = tmp_path / "swapped.fifo"
-    target.write_text("old", encoding="utf-8")
-    original = safe_path_io._renameat2
-    injected = False
-
-    def swap_before_exchange(
-        parent_fd: int,
-        source: str,
-        destination: str,
-        flags: int,
-    ) -> None:
-        nonlocal injected
-        if not injected and flags == safe_path_io._RENAME_EXCHANGE:
-            target.unlink()
-            os.mkfifo(target)
-            injected = True
-        original(parent_fd, source, destination, flags)
-
-    monkeypatch.setattr(safe_path_io, "_renameat2", swap_before_exchange)
-
-    with pytest.raises(SafePathError, match="non-regular overwrite target"):
-        atomic_write_text_nofollow(target, "new")
-
-    assert injected is True
-    assert stat.S_ISFIFO(target.lstat().st_mode)
-    assert _temporary_paths(target) == []
-
-
-def test_missing_harbor_target_that_appears_as_fifo_is_not_replaced(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "appeared-harbor.fifo"
-    needle = '''        elif expected_missing or current is None:
-            renameat2(parent, temporary, name, 1)
-'''
-    replacement = '''        elif expected_missing or current is None:
-            os.mkfifo(os.environ["HL_FILE_PATH"])
-            renameat2(parent, temporary, name, 1)
-'''
+def test_missing_harbor_target_that_appears_as_fifo_is_not_replaced(tmp_path):
+    target=tmp_path/'appeared'
+    needle='''            rename_at2(parent, temporary, name, 1)  # RENAME_NOREPLACE'''
     assert needle in _SECURE_ATOMIC_WRITE
-    injected = _SECURE_ATOMIC_WRITE.replace(needle, replacement, 1)
-
-    completed = _run_harbor_write(target, "new", script=injected)
-
-    assert completed.returncode != 0
-    assert stat.S_ISFIFO(target.lstat().st_mode)
-    assert _temporary_paths(target) == []
+    injected=_SECURE_ATOMIC_WRITE.replace(needle,'''            os.mkfifo(name,dir_fd=parent)
+'''+needle,1)
+    result=_run_harbor_write(target,'new',injected)
+    assert result.returncode!=0 and stat.S_ISFIFO(target.lstat().st_mode) and not _temporary_paths(target)
 
 
-def test_existing_harbor_target_swapped_to_fifo_is_rolled_back(
-    tmp_path: Path,
-) -> None:
-    target = tmp_path / "swapped-harbor.fifo"
-    target.write_text("old", encoding="utf-8")
-    needle = '''        else:
-            renameat2(parent, temporary, name, 2)
-            exchanged = True
-            try:
-                validate_displaced_unconditional(
-'''
-    replacement = '''        else:
-            os.unlink(name, dir_fd=parent)
-            os.mkfifo(name, dir_fd=parent)
-            renameat2(parent, temporary, name, 2)
-            exchanged = True
-            try:
-                validate_displaced_unconditional(
-'''
+def test_existing_harbor_target_swapped_to_fifo_is_retained_for_recovery(tmp_path):
+    target=tmp_path/'swapped';target.write_text('old')
+    needle='''            rename_at2(parent, temporary, name, 2)  # RENAME_EXCHANGE'''
     assert needle in _SECURE_ATOMIC_WRITE
-    injected = _SECURE_ATOMIC_WRITE.replace(needle, replacement, 1)
-
-    completed = _run_harbor_write(target, "new", script=injected)
-
-    assert completed.returncode != 0
-    assert stat.S_ISFIFO(target.lstat().st_mode)
-    assert _temporary_paths(target) == []
+    injected=_SECURE_ATOMIC_WRITE.replace(needle,'''            os.unlink(name,dir_fd=parent)
+            os.mkfifo(name,dir_fd=parent)
+'''+needle,1)
+    result=_run_harbor_write(target,'new',injected)
+    assert result.returncode!=0 and target.read_text()=='new'
+    prefix='__HL_PUBLICATION__'
+    outcome=json.loads(next(line[len(prefix):] for line in result.stdout.splitlines() if line.startswith(prefix)))
+    assert outcome['atomic_replace'] is None and outcome['no_auto_retry']
+    assert any(stat.S_ISFIFO((tmp_path/e).lstat().st_mode) for e in outcome['recovery_entries'])

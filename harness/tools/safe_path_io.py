@@ -13,6 +13,9 @@ import stat
 import sys
 from typing import Callable, Iterator
 
+from harness.tools.descriptor_open import open_readonly_checked
+from harness.tools.publication import publish_bytes
+
 
 class SafePathError(OSError):
     """Raised when a path cannot be attributed to one safe regular-file entry."""
@@ -178,11 +181,10 @@ def _open_and_validate_expected(
     expected_identity: FileIdentity | None,
     expected_sha256: str | None,
 ) -> os.stat_result:
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        dir_fd=parent_fd,
-    )
+    try:
+        descriptor, _ = open_readonly_checked(parent_fd, name)
+    except ValueError as exc:
+        raise SafePathError(f"Cannot open regular target safely: {target}: {exc}") from exc
     try:
         metadata = os.fstat(descriptor)
         _validate_unique_regular_file(metadata, target)
@@ -243,19 +245,11 @@ def _assert_name_identity(
     expected: FileIdentity,
     target: Path,
 ) -> None:
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        dir_fd=parent_fd,
-    )
-    try:
-        actual = os.fstat(descriptor)
-        if file_identity(actual) != expected:
-            raise SafePathError(
-                f"Published target changed before rollback could complete: {target}"
-            )
-    finally:
-        os.close(descriptor)
+    actual = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(actual.st_mode) or file_identity(actual) != expected:
+        raise SafePathError(
+            f"Published target changed before rollback could complete: {target}"
+        )
 
 
 def read_text_nofollow(
@@ -266,11 +260,10 @@ def read_text_nofollow(
     """Read one uniquely linked regular file through stable descriptors."""
 
     with _open_parent_nofollow(path, create_parents=False) as (parent_fd, name, target):
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=parent_fd,
-        )
+        try:
+            descriptor, _ = open_readonly_checked(parent_fd, name)
+        except ValueError as exc:
+            raise SafePathError(f"Cannot open regular target safely: {target}: {exc}") from exc
         try:
             metadata = os.fstat(descriptor)
             _validate_unique_regular_file(metadata, target)
@@ -288,6 +281,41 @@ def read_text_nofollow(
             os.close(descriptor)
 
 
+def publish_text_nofollow(
+    path: str | os.PathLike[str],
+    content: str,
+    *,
+    mode: int | None = None,
+    expected_identity: FileIdentity | None = None,
+    expected_sha256: str | None = None,
+    expected_missing: bool = False,
+) -> dict:
+    """Return an explicit publication outcome; see docs/file_publication.md.
+
+    Cooperating writers serialize. External post-exchange races are
+    indeterminate and retain recovery data, never a destructive rollback.
+    """
+    payload = content.encode("utf-8")
+    outcome = None
+    try:
+        with _open_parent_nofollow(path, create_parents=True) as (parent_fd, name, target):
+            outcome = publish_bytes(
+                parent_fd, name, payload, _renameat2, mode=mode,
+                expected_identity=expected_identity, expected_sha256=expected_sha256,
+                expected_missing=expected_missing,
+            )
+            outcome["recovery_directory"] = str(target.parent)
+    except OSError as exc:
+        if outcome is None:
+            raise
+        # Even closing the parent descriptor is post-publication housekeeping.
+        # Preserve the known publication state if that final close reports an error.
+        outcome["cleanup_warning"] = True
+        outcome["publication_error"] = str(exc)
+        outcome["no_auto_retry"] = True
+    return outcome
+
+
 def atomic_write_text_nofollow(
     path: str | os.PathLike[str],
     content: str,
@@ -297,158 +325,25 @@ def atomic_write_text_nofollow(
     expected_sha256: str | None = None,
     expected_missing: bool = False,
 ) -> bool:
-    """Atomically replace a path through a stable parent descriptor.
+    """Compatibility API: bool durability on success, structured error otherwise.
 
-    Transform writes use ``RENAME_EXCHANGE``: the new inode and current target
-    are swapped atomically, then the displaced inode is validated against the
-    exact identity and digest consumed by the caller. A mismatch is exchanged
-    back before failure, so an ordinary-file replacement at the publication
-    boundary is not overwritten. Missing-target appends use ``RENAME_NOREPLACE``.
-
-    Pure overwrites use the same conditional-publication boundary. An initially
-    missing target is published with ``RENAME_NOREPLACE``. An existing regular
-    target is exchanged, then the displaced entry's type and identity are
-    verified before it is removed. A special entry or identity race is rolled
-    back atomically instead of being destroyed.
-
-    Returns whether the parent-directory fsync succeeded. Once publication is
-    complete, a later directory-fsync error is a durability warning rather than
-    a false pre-publication failure that callers might retry unsafely.
+    Public tools use publish_text_nofollow to expose cleanup/recovery metadata.
+    A legacy caller never receives a false uncommitted error after a confirmed
+    publication; retained cleanup artifacts are also reported as a warning.
     """
-
-    payload = content.encode("utf-8")
-    conditional_existing = expected_identity is not None or expected_sha256 is not None
-    if expected_missing and conditional_existing:
-        raise ValueError("expected_missing cannot be combined with existing-file expectations")
-
-    with _open_parent_nofollow(path, create_parents=True) as (parent_fd, name, target):
-        if conditional_existing:
-            current = _open_and_validate_expected(
-                parent_fd,
-                name,
-                target,
-                expected_identity=expected_identity,
-                expected_sha256=expected_sha256,
-            )
-        elif expected_missing:
-            if _stat_unconditional_target(parent_fd, name, target) is not None:
-                raise SafePathError(f"Target appeared before publication: {target}")
-            current = None
-        else:
-            current = _stat_unconditional_target(parent_fd, name, target)
-
-        unconditional_identity = (
-            file_identity(current)
-            if current is not None and not conditional_existing
-            else None
-        )
-
-        existing_mode = mode
-        if existing_mode is None and current is not None:
-            existing_mode = current.st_mode
-
-        temporary_name = f".{name}.tmp-{secrets.token_hex(8)}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-        descriptor = -1
-        temporary_exists = False
-        exchanged = False
-        published = False
-        try:
-            descriptor = os.open(
-                temporary_name,
-                flags,
-                0o666,
-                dir_fd=parent_fd,
-            )
-            temporary_exists = True
-            with os.fdopen(descriptor, "wb", closefd=False) as stream:
-                stream.write(payload)
-                stream.flush()
-                if existing_mode is not None:
-                    os.fchmod(descriptor, stat.S_IMODE(existing_mode) & 0o777)
-                os.fsync(descriptor)
-            new_identity = file_identity(os.fstat(descriptor))
-            os.close(descriptor)
-            descriptor = -1
-
-            if conditional_existing:
-                _renameat2(parent_fd, temporary_name, name, _RENAME_EXCHANGE)
-                exchanged = True
-                try:
-                    _open_and_validate_expected(
-                        parent_fd,
-                        temporary_name,
-                        target,
-                        expected_identity=expected_identity,
-                        expected_sha256=expected_sha256,
-                    )
-                except Exception as validation_error:
-                    try:
-                        _assert_name_identity(parent_fd, name, new_identity, target)
-                        _renameat2(parent_fd, temporary_name, name, _RENAME_EXCHANGE)
-                        exchanged = False
-                    except Exception as rollback_error:
-                        raise SafePathError(
-                            "Conditional publication validation failed and atomic "
-                            f"rollback could not complete; displaced target retained at "
-                            f"{temporary_name}"
-                        ) from rollback_error
-                    raise validation_error
-
-                os.unlink(temporary_name, dir_fd=parent_fd)
-                temporary_exists = False
-                exchanged = False
-                published = True
-            elif expected_missing or current is None:
-                _renameat2(parent_fd, temporary_name, name, _RENAME_NOREPLACE)
-                temporary_exists = False
-                published = True
-            else:
-                assert unconditional_identity is not None
-                _renameat2(parent_fd, temporary_name, name, _RENAME_EXCHANGE)
-                exchanged = True
-                try:
-                    _validate_displaced_unconditional_target(
-                        parent_fd,
-                        temporary_name,
-                        target,
-                        expected_identity=unconditional_identity,
-                    )
-                except Exception as validation_error:
-                    try:
-                        _assert_name_identity(parent_fd, name, new_identity, target)
-                        _renameat2(parent_fd, temporary_name, name, _RENAME_EXCHANGE)
-                        exchanged = False
-                    except Exception as rollback_error:
-                        raise SafePathError(
-                            "Unconditional overwrite validation failed and atomic "
-                            f"rollback could not complete; displaced target retained at "
-                            f"{temporary_name}"
-                        ) from rollback_error
-                    raise validation_error
-
-                os.unlink(temporary_name, dir_fd=parent_fd)
-                temporary_exists = False
-                exchanged = False
-                published = True
-
-            try:
-                os.fsync(parent_fd)
-            except OSError:
-                return False
-            return True
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if temporary_exists and not exchanged:
-                try:
-                    os.unlink(temporary_name, dir_fd=parent_fd)
-                except FileNotFoundError:
-                    pass
-            if not published and exchanged:
-                # Preserve the displaced inode as a recovery artifact rather
-                # than deleting data after an unsuccessful rollback.
-                pass
+    outcome = publish_text_nofollow(
+        path, content, mode=mode, expected_identity=expected_identity,
+        expected_sha256=expected_sha256, expected_missing=expected_missing,
+    )
+    if outcome["atomic_replace"] is not True:
+        error = SafePathError(outcome["publication_error"] or "publication indeterminate")
+        error.publication_outcome = outcome
+        raise error
+    if outcome["cleanup_warning"]:
+        import warnings
+        warnings.warn("Content published; cleanup/reconciliation is required: " +
+                      repr(outcome["recovery_entries"]), RuntimeWarning, stacklevel=2)
+    return bool(outcome["directory_fsync"])
 
 
 def edit_text_nofollow(

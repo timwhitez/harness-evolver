@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 from typing import BinaryIO, Iterator
 
+from harness.tools.descriptor_open import open_readonly_checked
 from harness.tools.safe_path_io import (
     SafePathError,
     _open_parent_nofollow,
@@ -110,12 +111,8 @@ def _walk_directory(
             )
 
         try:
-            file_fd = os.open(
-                entry.name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=directory_fd,
-            )
-        except OSError as exc:
+            file_fd, _ = open_readonly_checked(directory_fd, entry.name)
+        except (OSError, ValueError) as exc:
             raise StableTreeError(
                 f"Cannot open search file without following aliases: {child_relative}"
             ) from exc
@@ -155,11 +152,10 @@ def iter_stable_regular_files(
             name,
             target,
         ):
-            descriptor = os.open(
-                name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
-            )
+            try:
+                descriptor, _ = open_readonly_checked(parent_fd, name)
+            except (OSError, ValueError) as exc:
+                raise StableTreeError("Cannot acquire a regular search target") from exc
             try:
                 actual = os.fstat(descriptor)
                 _validate_unique_regular_file(actual, target)
