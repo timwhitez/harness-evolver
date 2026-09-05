@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from harness.tools.read_window import embedded_window_source
+
 from bench import _harbor_adapter_issue17_base as _base
 from bench import _canonical_harbor_paths_v4 as _v4
 
 
-_STREAMING_READ_PYTHON = _v4._v2._SAFE_PREAMBLE + r'''
+_STREAMING_READ_PYTHON = _v4._v2._SAFE_PREAMBLE + embedded_window_source() + r'''
 import io
 
 BINARY_SIGNATURES = (
@@ -105,57 +107,11 @@ try:
         newline=None,
     )
 
-    records = []
-    emitted_chars = 0
-    line_number = 0
-    eof = False
-    has_more = False
-    next_offset = None
-
-    while line_number < offset - 1:
-        if read_line(text_stream, max_line) is None:
-            eof = True
-            break
-        line_number += 1
-
-    if not eof:
-        while len(records) < limit:
-            item = read_line(text_stream, max_line)
-            if item is None:
-                eof = True
-                break
-            line_number += 1
-            text, truncated = item
-            suffix = " ... [line truncated at %d bytes]" % max_line if truncated else ""
-            formatted = "%d\t%s%s" % (line_number, text, suffix)
-            projected = emitted_chars + len(formatted) + (1 if records else 0)
-            if projected > max_output:
-                has_more = True
-                next_offset = line_number
-                break
-            records.append(formatted)
-            emitted_chars = projected
-
-        if not has_more and not eof and len(records) == limit:
-            if read_line(text_stream, max_line) is not None:
-                line_number += 1
-                has_more = True
-                next_offset = line_number
-            else:
-                eof = True
-
-    if has_more:
-        marker = "... (more lines, use offset=%d to continue)" % next_offset
-        if len(marker) >= max_output:
-            output = marker[:max_output]
-        else:
-            current = "\n".join(records)
-            available = max_output - len(marker) - 1
-            current = current[:available].rstrip()
-            output = "%s\n%s" % (current, marker) if current else marker
-    else:
-        output = "\n".join(records)
-    print(output, end="")
+    page = read_window(lambda: read_line(text_stream, max_line), offset=offset,
+                       limit=limit, max_line_bytes=max_line, max_output_chars=max_output)
+    if not page["success"]:
+        raise ValueError(page["error"])
+    print(page["output"], end="")
 except UnicodeDecodeError:
     raise SystemExit("invalid UTF-8 text")
 except ValueError as exc:
@@ -257,6 +213,9 @@ class HarborFileReadTool(_base.HarborFileReadTool):
             "encoding": "utf-8",
             "unsafe_shell_fallback_allowed": False,
         }
+        if result.error.startswith("Output limit too small"):
+            result.metadata.update(output_limit_too_small=True, lines_returned=0,
+                                   next_offset=None, retry_offset=validated_offset)
         lowered_error = result.error.lower()
         if "unsupported" in lowered_error and "file" in lowered_error:
             result.metadata["binary_file_unsupported"] = True

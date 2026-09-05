@@ -87,6 +87,9 @@ def test_tiny_output_limit_never_exceeds_configured_chars(tmp_path: Path) -> Non
 
     result = FileReadTool(max_output_chars=12).execute(str(target), limit=1)
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["output_limit_too_small"] is True
+    assert result.metadata["next_offset"] is None
+    assert result.metadata["retry_offset"] == 1
     assert len(result.output) <= 12
     assert result.metadata["output_truncated"] is True
