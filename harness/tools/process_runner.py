@@ -192,8 +192,6 @@ def _run_bounded_argv(
     process = None
     readers: list[tuple[PipeReader, object]] = []
     timed_out = cancelled = cleanup_confirmed = False
-    started = time.monotonic()
-
     def pump() -> bool:
         progress = False
         for reader, capture in list(readers):
@@ -217,6 +215,9 @@ def _run_bounded_argv(
             launched_argv, child_fds, challenge_write, proof_read, token = (
                 _prepare_supervised_launch(normalized_argv)
             )
+        # Keep the established timeout boundary: capability discovery/setup
+        # precedes the command's execution budget.
+        started = time.monotonic()
         process = subprocess.Popen(
             launched_argv, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=cwd, env=child_env, bufsize=0,
