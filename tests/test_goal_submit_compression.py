@@ -25,7 +25,12 @@ def write_uploadable_job(job_dir, *, trial_name="task-a__1", reward=1.0, traject
     )
     if trajectory:
         (trial_dir / "agent" / "trajectory.jsonl").write_text(
-            json.dumps({"type": "tool_call", "tool": "bash", "args": {"command": "true"}})
+            json.dumps({
+                "schema_version": "ATIF-v1.4",
+                "session_id": trial_name,
+                "agent": {"name": "fixture", "version": "1"},
+                "steps": [{"step_id": 1, "source": "agent", "message": "Visible check done."}],
+            })
             + "\n"
         )
 
@@ -81,14 +86,14 @@ def test_submit_once_is_idempotent_per_campaign(tmp_path):
         first = gate.submit_once(
             campaign_id="camp1",
             best_job_dir=job_dir,
-            score=0.9,
+            score=1.0,
             tasks_evaluated=1,
             full_regression_passed=True,
         )
         second = gate.submit_once(
             campaign_id="camp1",
             best_job_dir=job_dir,
-            score=0.9,
+            score=1.0,
             tasks_evaluated=1,
             full_regression_passed=True,
         )
@@ -533,7 +538,7 @@ def test_submit_once_reports_terminal_upload_failure(tmp_path):
     result = gate.submit_once(
         campaign_id="camp-fail",
         best_job_dir=job_dir,
-        score=0.9,
+        score=1.0,
         tasks_evaluated=1,
         full_regression_passed=True,
     )
