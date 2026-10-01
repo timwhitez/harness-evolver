@@ -174,6 +174,8 @@ struct LlmError {
     error_type: String,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    kind: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -382,7 +384,7 @@ struct ExactOutputReadbackTarget {
     expected_tokens: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct LocalExceptionObservation {
     turn: usize,
     tool: String,
@@ -390,7 +392,7 @@ struct LocalExceptionObservation {
     observation: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct FailedVerificationObservation {
     turn: usize,
     tool: String,
@@ -400,7 +402,7 @@ struct FailedVerificationObservation {
     semantic_contracts: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct LocalSemanticFailureObservation {
     turn: usize,
     tool: String,
@@ -410,7 +412,7 @@ struct LocalSemanticFailureObservation {
     semantic_contracts: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct SuccessfulVerificationObservation {
     turn: usize,
     tool: String,
@@ -1130,46 +1132,119 @@ impl WorkerState {
     }
 
     fn compact_if_needed(&mut self) {
-        let total_chars: usize = self
-            .messages
-            .iter()
-            .map(|message| {
-                message
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .len()
-            })
-            .sum();
-        if total_chars < self.thresholds.compaction_char_threshold {
-            return;
-        }
-        if self.messages.len() <= 14 {
-            return;
-        }
-        let omitted = self.messages.len().saturating_sub(14);
-        let mut compacted = Vec::new();
-        compacted.extend(self.messages.iter().take(2).cloned());
-        compacted.push(json!({
-            "role": "system",
-            "content": format!(
-                "Context compaction applied. {omitted} older messages were summarized into trajectory artifacts; preserve observed facts and avoid repeating failed tool calls."
-            ),
-        }));
-        compacted.extend(
-            self.messages
-                .iter()
-                .skip(self.messages.len().saturating_sub(12))
-                .cloned(),
-        );
-        self.messages = compacted;
-        self.append_trajectory(json!({"type": "context_compaction", "omitted_messages": omitted}));
+        self.compact_context(None);
     }
+
+    fn compact_context(&mut self, rejected_bytes: Option<usize>) -> bool {
+        let before = request_size_bytes(&self.messages, &self.tool_schemas);
+        let target = rejected_bytes.unwrap_or(self.thresholds.compaction_char_threshold);
+        if before < target {
+            return true;
+        }
+        let forced = rejected_bytes.is_some();
+        if !forced && self.messages.len() <= 14 {
+            return false;
+        }
+        let original = self.messages.clone();
+        // The first system/task messages and every other system instruction survive.
+        self.messages = original.iter().enumerate().filter(|(index, message)| {
+            *index < 2 || message.get("name").and_then(Value::as_str) != Some("worker_context_state")
+        }).map(|(_, message)| message.clone()).collect();
+        let mut work_state = json!({
+            "todos": self.todo_items,
+            "completion_blockers": self.completion_blockers,
+            "verification_command": self.verification_command,
+            "last_verification_turn": self.last_verification_turn,
+            "last_workspace_change_turn": self.last_workspace_change_turn,
+            "last_successful_verification": self.last_successful_verification,
+            "unresolved_failed_verification": self.unresolved_failed_verification,
+            "unresolved_local_exception": self.unresolved_local_exception,
+            "unresolved_local_semantic_failure": self.unresolved_local_semantic_failure,
+            "pending_completion_gate_repair_turn": self.pending_completion_gate_repair_turn,
+            "pending_post_verification_todo_finalization_turn": self.pending_post_verification_todo_finalization_turn,
+        });
+        if let Some(fields) = work_state.as_object_mut() {
+            fields.retain(|_, value| !value.is_null() && value.as_u64() != Some(0)
+                && value.as_str() != Some("") && !value.as_array().is_some_and(Vec::is_empty));
+            if !fields.is_empty() {
+                self.messages.insert(self.messages.len().min(2), json!({
+                    "role": "system", "name": "worker_context_state",
+                    "content": format!("Completed history omitted, not semantically summarized; exact history is in trajectory. Do not replay writes. Current work state: {work_state}"),
+                }));
+            }
+        }
+        let mut omitted = Vec::new();
+        // ponytail: reserialize per removed unit; incremental sizes if huge histories make this costly.
+        while request_size_bytes(&self.messages, &self.tool_schemas) >= target {
+            let unit = (2..self.messages.len()).find_map(|start| {
+                completed_message_unit_end(&self.messages, start).map(|end| (start, end))
+            });
+            let Some((start, end)) = unit else { break };
+            if !forced && self.messages.len().saturating_sub(end) < 12 {
+                break;
+            }
+            omitted.extend(self.messages.drain(start..end));
+        }
+        let after = request_size_bytes(&self.messages, &self.tool_schemas);
+        if omitted.is_empty() || after >= before || (forced && after >= target) {
+            self.messages = original;
+            return false;
+        }
+        self.append_trajectory(json!({
+            "type": "context_compaction", "reason": if forced { "context_overflow" } else { "payload_threshold" },
+            "estimate_unit": "serialized_request_bytes", "before_bytes": before, "after_bytes": after,
+            "omitted_messages": omitted.len(), "omitted_history": omitted,
+            "semantic_summary_generated": false,
+        }));
+        true
+    }
+}
+
+fn request_size_bytes(messages: &[Value], tools: &[Value]) -> usize {
+    // A UTF-8 JSON byte estimate, not a tokenizer or a provider's exact wire size.
+    serde_json::to_vec(&json!({"messages": messages, "tools": tools, "tool_choice": "auto"}))
+        .map_or(usize::MAX, |payload| payload.len())
+}
+
+fn completed_message_unit_end(messages: &[Value], start: usize) -> Option<usize> {
+    let message = messages.get(start)?;
+    match message.get("role").and_then(Value::as_str)? {
+        "user" => Some(start + 1),
+        "assistant" => {
+            let calls = match message.get("tool_calls") {
+                None | Some(Value::Null) => return Some(start + 1),
+                Some(Value::Array(calls)) if calls.is_empty() => return Some(start + 1),
+                Some(Value::Array(calls)) => calls,
+                _ => return None,
+            };
+            let mut ids = HashSet::new();
+            for call in calls {
+                if !ids.insert(call.get("id")?.as_str()?) { return None; }
+            }
+            let end = start + 1 + ids.len();
+            for result in messages.get(start + 1..end)? {
+                if result.get("role").and_then(Value::as_str) != Some("tool")
+                    || !ids.remove(result.get("tool_call_id")?.as_str()?) {
+                    return None;
+                }
+            }
+            ids.is_empty().then_some(end)
+        }
+        _ => None,
+    }
+}
+
+fn context_overflow_error(error: &LlmError) -> bool {
+    error.kind == "context_overflow" || error.error_type == "ContextWindowExceededError"
+        || ["context_length_exceeded", "context_window_exceeded"]
+            .iter().any(|code| error.message.contains(code))
 }
 
 fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
     initialize_worker_messages(stdin, state);
     loop {
+        state.compact_if_needed();
+        let request_bytes = request_size_bytes(&state.messages, &state.tool_schemas);
         state.turn_count += 1;
         send_event(&json!({
             "type": "llm_request",
@@ -1185,6 +1260,27 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
             }
         };
         if let Some(error) = response.error.as_ref() {
+            if context_overflow_error(error) {
+                state.prune_ephemeral_tool_outputs();
+                let reduced = state.compact_context(Some(request_bytes));
+                let next_bytes = request_size_bytes(&state.messages, &state.tool_schemas);
+                state.append_trajectory(json!({
+                    "type": "context_overflow_recovery", "turn": state.turn_count,
+                    "error_type": error.error_type, "error": truncate(&error.message, 1000),
+                    "estimate_unit": "serialized_request_bytes", "rejected_bytes": request_bytes,
+                    "next_bytes": next_bytes, "request_reduced": reduced && next_bytes < request_bytes,
+                    "loop_stop_condition": false, "time_round_token_limit_driven": false,
+                }));
+                if !reduced || next_bytes >= request_bytes {
+                    return WorkerExit::Final(state.error_result(
+                        "context_input_unfit: provider rejected the context and no strictly smaller protocol-valid request can preserve the system/task and current work state; reconfigure the model context or input.".into(),
+                        json!({"context_input_unfit": true, "provider_error_kind": "context_overflow",
+                            "rejected_request_bytes": request_bytes, "next_request_bytes": next_bytes,
+                            "loop_stop_condition": false, "time_round_token_limit_driven": false}),
+                    ));
+                }
+                continue;
+            }
             let completion_gate_recovered = maybe_recover_completion_gate_error(state, error);
             if !completion_gate_recovered {
                 record_non_transient_llm_error_checkpoint(state, error);
@@ -28245,6 +28341,48 @@ mod tests {
         assert!(invalid.reported_usage().is_empty());
     }
 
+    #[test]
+    fn payload_bytes_include_arguments_reasoning_schemas_and_utf8() {
+        let plain = vec![json!({"role": "assistant", "content": ""})];
+        let mut large = plain.clone();
+        large[0]["reasoning_content"] = json!("思考".repeat(100));
+        large[0]["tool_calls"] = json!([{"id":"a", "function": {
+            "name":"write", "arguments": "large code".repeat(100)}}]);
+        let tools = vec![json!({"description": "schema".repeat(100)})];
+        assert!(request_size_bytes(&large, &tools) > request_size_bytes(&plain, &[])+2000);
+        assert_eq!(request_size_bytes(&large, &tools),
+            serde_json::to_vec(&json!({"messages":large,"tools":tools,"tool_choice":"auto"})).unwrap().len());
+    }
+
+    #[test]
+    fn compaction_preserves_parallel_units_task_todos_and_failed_verification() {
+        let mut state = worker_state_for_unit_tests();
+        state.messages = vec![json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"original task"}),
+            json!({"role":"assistant","content":"", "reasoning_content":"思考".repeat(2000),
+                "tool_calls":[{"id":"a","function":{"name":"write","arguments":"{}"}},
+                    {"id":"b","function":{"name":"write","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"b","content":"done"}),
+            json!({"role":"tool","tool_call_id":"a","content":"done"})];
+        assert_eq!(completed_message_unit_end(&state.messages,2),Some(5));
+        let mut incomplete = state.messages.clone();
+        incomplete.pop();
+        assert_eq!(completed_message_unit_end(&incomplete,2),None);
+        state.todo_items.push(TodoItem{id:"todo".into(),content:"repair".into(),status:"pending".into()});
+        state.unresolved_failed_verification = Some(FailedVerificationObservation{
+            turn:1,tool:"verify".into(),command:"check".into(),observation:"failure".into(),
+            expected_artifacts:Vec::new(),semantic_contracts:Vec::new()});
+        let before = request_size_bytes(&state.messages,&state.tool_schemas);
+        assert!(state.compact_context(Some(before)));
+        assert_eq!(state.messages[1]["content"],"original task");
+        assert_eq!(state.messages.len(),3);
+        assert!(state.todos_block_completion());
+        assert!(state.unresolved_failed_verification.is_some());
+        assert!(state.messages[2]["content"].as_str().unwrap().contains("failure"));
+        assert_eq!(state.trajectory.last().unwrap()["omitted_messages"],3);
+        assert!(!state.compact_context(Some(request_size_bytes(&state.messages,&state.tool_schemas))));
+    }
+
     fn polyglot_worker_state(task_id: &str, expected_file: &str) -> WorkerState {
         WorkerState::new(WorkerRequest {
             task_instruction: format!(
@@ -46726,6 +46864,7 @@ E   AssertionError: Primer must contain inserted DNA.
         let error = LlmError {
             error_type: "BadRequestError".to_string(),
             message: "OpenAIException - Insufficient Balance".to_string(),
+            kind: String::new(),
         };
 
         let provider_error = terminal_provider_error(&error).expect("provider terminal error");

@@ -471,6 +471,11 @@ class HLAgent:
         }
 
     def _llm_error_response_payload(self, exc: Exception) -> dict[str, Any]:
+        context_overflow = isinstance(exc, litellm.ContextWindowExceededError) or getattr(
+            exc, "code", None
+        ) in ("context_length_exceeded", "context_window_exceeded")
+        transient = isinstance(exc, (TimeoutError, ConnectionError, litellm.Timeout,
+                                     litellm.RateLimitError, litellm.APIConnectionError))
         return {
             "message": {
                 "content": "",
@@ -481,6 +486,7 @@ class HLAgent:
             "error": {
                 "type": exc.__class__.__name__,
                 "message": _truncate(str(exc) or repr(exc), 1000),
+                "kind": "context_overflow" if context_overflow else "transient" if transient else "provider_error",
             },
         }
 

@@ -191,6 +191,19 @@ update leaves a falsifiable manifest and is compared against later evidence:
   active same-model solved-task regression command, preserving the current
   memory path, model/role, lane, and jobs directory before a patch is accepted.
 
+Worker context compaction uses the serialized UTF-8 JSON size of messages and
+tool schemas as a byte estimate, including tool arguments and retained reasoning;
+it does not claim an exact token count. The existing compaction threshold remains
+configurable. Normal compaction keeps recent complete interaction units. A
+structured provider context-overflow response forces reduction even in short
+histories: system/task instructions survive, assistant calls and their parallel
+tool results are removed together, and meaningful todo/verification state is
+retained. Omitted history is archived in trajectory events, without claiming a
+semantic summary. Recovery retries only after a strictly smaller estimated
+request; irreducible input returns `context_input_unfit` for external model/input
+reconfiguration. This diagnoses a rejected input, not a turn/time/token budget.
+Transient provider errors retain their existing recovery path.
+
 Trial reports also preserve efficiency evidence parsed from Harbor artifacts:
 token usage, cache tokens, cost when available, turns, API calls, provider
 latency, API error counts, and cache-hit ratio. Campaign reports aggregate
