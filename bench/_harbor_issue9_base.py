@@ -1008,6 +1008,9 @@ class HarborRunner:
             )
             or len(trial_results),
             "trial_metrics": trial_metrics,
+            "token_usage_observation": ((selected.get("agent_result") or {}).get("metadata") or {}).get(
+                "token_usage_observation", {"schema": "legacy", "status": "unknown"}
+            ),
         }
         metadata.update(
             self._environment_exception_evidence(exception, trial_dir=trial_dir)
@@ -2157,7 +2160,7 @@ class HarborRunner:
             "cache": agent_result.get("n_cache_tokens"),
             "output": agent_result.get("n_output_tokens"),
         }
-        return {key: int(value) for key, value in mapping.items() if isinstance(value, int)}
+        return {key: value for key, value in mapping.items() if type(value) is int and value >= 0}
 
     def _trial_metrics(
         self,
@@ -2180,7 +2183,7 @@ class HarborRunner:
         input_tokens = int(token_usage.get("input", 0) or 0)
         cache_tokens = int(token_usage.get("cache", 0) or 0)
         total_prompt_tokens = input_tokens + cache_tokens
-        if total_prompt_tokens > 0:
+        if total_prompt_tokens > 0 and {"input", "cache"} <= token_usage.keys():
             metrics["cache_hit_ratio"] = round(cache_tokens / total_prompt_tokens, 4)
         return metrics
 

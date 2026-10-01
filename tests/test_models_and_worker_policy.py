@@ -599,7 +599,7 @@ def test_prose_completion_phrases_do_not_finalize_run(monkeypatch):
         event["type"] == "auto_completion_detected" for event in result.trajectory
     )
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert not any("protocol recovery failure" in error for error in result.error_log)
     recovery_events = [
         event
@@ -1454,7 +1454,7 @@ def test_worker_recovers_from_blank_assistant_no_action_turn(monkeypatch):
         event["type"] == "empty_response_recovery_prompt"
         for event in result.trajectory
     )
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
 
 
 def test_worker_keeps_recovering_after_repeated_blank_assistant_no_action_turns(monkeypatch):
@@ -1474,7 +1474,7 @@ def test_worker_keeps_recovering_after_repeated_blank_assistant_no_action_turns(
 
     assert len(calls) == agent.empty_response_recovery_limit + 2
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert result.error_log == []
     assert len(
         [
@@ -1520,7 +1520,7 @@ def test_worker_recovers_from_llm_timeout_without_stopping(monkeypatch):
 
     assert len(calls) == 2
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert result.error_log == []
     assert any(
         event["type"] == "llm_error_recovery_prompt"
@@ -2958,7 +2958,7 @@ def test_worker_dependency_checkpoint_counts_successful_shell_dependency_output(
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert not any("protocol recovery failure" in error for error in result.error_log)
     checkpoint_messages = _observed_user_messages_containing(
         observed_messages, "Dependency recovery checkpoint"
@@ -3030,7 +3030,7 @@ def test_completion_gate_error_recovery_continues_without_loop_limit(monkeypatch
     result = agent.run("Fix the failing script.", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert not any("protocol recovery failure" in error for error in result.error_log)
     assert any(
         event["type"] == "completion_gate_repair_pending"
@@ -3082,7 +3082,7 @@ def test_completion_gate_no_tool_recovery_continues_without_loop_limit(monkeypat
     result = agent.run("Fix the failing script.", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert any(
         event["type"] == "completion_gate_protocol_recovery_checkpoint"
         and event["reason"]
@@ -3129,7 +3129,7 @@ def test_completion_gate_model_protocol_error_recovers_without_stopping(monkeypa
 
     assert len(calls) == 5
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert [call["tool"] for call in result.tool_calls][-2:] == ["verify", "done"]
     assert any(
         event["type"] == "model_provider_protocol_error"
@@ -3388,7 +3388,7 @@ def test_worker_dependency_checkpoint_pivots_ml_cv_heavy_dependency_failures(mon
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert not any("protocol recovery failure" in error for error in result.error_log)
     checkpoint = _observed_user_messages_containing(
         observed_messages, "Dependency recovery checkpoint"
@@ -3673,7 +3673,7 @@ def test_worker_checkpoint_resets_after_local_verification(monkeypatch, tmp_path
     result = agent.run("finish task", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.metadata == {}
+    _assert_only_incomplete_usage_metadata(result)
     assert not any(event["type"] == "verification_checkpoint" for event in result.trajectory)
 
 
@@ -13412,3 +13412,13 @@ def test_worker_prunes_old_large_tool_outputs(monkeypatch):
         and event["original_chars"] == len(big_output)
         for event in result.trajectory
     )
+
+
+def _assert_only_incomplete_usage_metadata(result):
+    # Scripted provider responses omit cache usage; recovery adds no terminal flags.
+    calls = sum(event.get("type") == "token_usage_observation" for event in result.trajectory)
+    assert result.metadata == {"token_usage_observation": {
+        "schema": "worker_usage_v1_exclusive_input", "status": "incomplete",
+        "calls": calls, "unknown_fields": ["cache", "input"],
+        "diagnostics": ["missing_cache"],
+    }}

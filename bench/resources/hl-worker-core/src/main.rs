@@ -161,7 +161,9 @@ struct LlmToolCall {
 struct LlmResponse {
     message: LlmMessage,
     #[serde(default)]
-    usage: HashMap<String, i64>,
+    usage: Value,
+    #[serde(default)]
+    usage_observation: Value,
     #[serde(default)]
     error: Option<LlmError>,
 }
@@ -207,6 +209,7 @@ struct WorkerState {
     trajectory: Vec<Value>,
     tool_call_history: Vec<Value>,
     token_usage: HashMap<String, i64>,
+    usage_unknown: HashSet<String>,
     completion_blockers: Vec<String>,
     memory_failure_summary_lines: Vec<String>,
     max_turns_audit: usize,
@@ -596,6 +599,7 @@ impl WorkerState {
             trajectory: request.initial_trajectory,
             tool_call_history: Vec::new(),
             token_usage: HashMap::new(),
+            usage_unknown: HashSet::new(),
             completion_blockers: Vec::new(),
             memory_failure_summary_lines: Vec::new(),
             max_turns_audit: request.max_turns_audit,
@@ -792,7 +796,7 @@ impl WorkerState {
             "tool_calls": self.tool_call_history,
             "trajectory": self.trajectory,
             "model_used": self.model_used,
-            "token_usage": self.token_usage,
+            "token_usage": self.reported_usage(),
             "error_log": self.completion_error_log(),
             "messages": self.messages,
             "turn_count": self.turn_count,
@@ -810,7 +814,7 @@ impl WorkerState {
             "tool_calls": self.tool_call_history,
             "trajectory": self.trajectory,
             "model_used": self.model_used,
-            "token_usage": self.token_usage,
+            "token_usage": self.reported_usage(),
             "error_log": [error],
             "metadata": metadata,
             "messages": self.messages,
@@ -842,7 +846,7 @@ impl WorkerState {
             "tool_calls": self.tool_call_history,
             "trajectory": self.trajectory,
             "model_used": self.model_used,
-            "token_usage": self.token_usage,
+            "token_usage": self.reported_usage(),
             "error_log": [error_log],
             "metadata": {
                 "provider_error": truncate(&message, 1000),
@@ -874,7 +878,7 @@ impl WorkerState {
             "tool_calls": self.tool_call_history,
             "trajectory": self.trajectory,
             "model_used": self.model_used,
-            "token_usage": self.token_usage,
+            "token_usage": self.reported_usage(),
             "error_log": [observation],
             "metadata": {
                 "terminal_environment_unavailable": true,
@@ -914,21 +918,85 @@ impl WorkerState {
         }
     }
 
-    fn accumulate_usage(&mut self, usage: &HashMap<String, i64>) {
-        for (src, dst) in [
-            ("input", "input"),
-            ("output", "output"),
-            ("cache", "cache"),
-            ("prompt_tokens", "input"),
-            ("input_tokens", "input"),
-            ("completion_tokens", "output"),
-            ("output_tokens", "output"),
-            ("cache_read_input_tokens", "cache"),
-        ] {
-            if let Some(value) = usage.get(src) {
-                *self.token_usage.entry(dst.to_string()).or_insert(0) += *value;
+    fn accumulate_usage(&mut self, usage: &Value, observation: &Value) {
+        let canonical = observation.get("schema").and_then(Value::as_str)
+            == Some("worker_usage_v1_exclusive_input")
+            || ["input", "cache", "output"].iter().any(|key| usage.get(key).is_some());
+        let mut diagnostics: Vec<String> = observation.get("diagnostics")
+            .and_then(Value::as_array).into_iter().flatten()
+            .filter_map(Value::as_str).map(str::to_string).collect();
+        let mut counts = HashMap::new();
+        let aliases: [(&str, &[&str]); 3] = if canonical {
+            [("input", &["input"]), ("cache", &["cache"]), ("output", &["output"])]
+        } else {
+            [("input", &["prompt_tokens", "input_tokens"]),
+             ("cache", &["cache_read_input_tokens"]),
+             ("output", &["completion_tokens", "output_tokens"])]
+        };
+        let mixed = canonical && ["prompt_tokens", "input_tokens", "cache_read_input_tokens",
+            "completion_tokens", "output_tokens"].iter().any(|key| usage.get(key).is_some());
+        for (key, names) in aliases {
+            let values: Vec<&Value> = names.iter().filter_map(|name| usage.get(name)).collect();
+            if mixed || values.iter().any(|value| value.as_i64().map_or(true, |n| n < 0))
+                || values.windows(2).any(|pair| pair[0] != pair[1]) {
+                diagnostics.push(format!("invalid_or_conflicting_{key}"));
+            } else if let Some(value) = values.first().and_then(|value| value.as_i64()) {
+                counts.insert(key.to_string(), value);
             }
         }
+        if !canonical {
+            let raw_anthropic = usage.get("prompt_tokens").is_none()
+                && usage.get("input_tokens").is_some()
+                && usage.get("cache_read_input_tokens").is_some();
+            match (counts.get("input").copied(), counts.get("cache").copied()) {
+                (Some(input), Some(_)) if raw_anthropic => {
+                    let creation = usage.get("cache_creation_input_tokens")
+                        .map_or(Some(0), Value::as_i64).filter(|value| *value >= 0);
+                    if let Some(total) = creation.and_then(|value| input.checked_add(value)) {
+                        counts.insert("input".into(), total);
+                    } else {
+                        counts.remove("input");
+                        counts.remove("cache");
+                        diagnostics.push("invalid_cache_creation_or_input_total".into());
+                    }
+                }
+                (Some(input), Some(cache)) if cache <= input => {
+                    counts.insert("input".into(), input - cache);
+                }
+                _ => {
+                    counts.remove("input");
+                    counts.remove("cache");
+                    diagnostics.push("legacy_input_cache_unknown_or_invalid".into());
+                }
+            }
+        }
+        let mut unknown = Vec::new();
+        for key in ["input", "cache", "output"] {
+            if let Some(value) = counts.get(key) {
+                let total = self.token_usage.entry(key.to_string()).or_insert(0);
+                if let Some(sum) = total.checked_add(*value) {
+                    *total = sum;
+                } else {
+                    self.usage_unknown.insert(key.into());
+                    diagnostics.push(format!("aggregate_overflow_{key}"));
+                }
+            } else {
+                self.usage_unknown.insert(key.into());
+                unknown.push(key);
+            }
+        }
+        self.append_trajectory(json!({
+            "type": "token_usage_observation", "turn": self.turn_count,
+            "schema": if canonical { "worker_usage_v1_exclusive_input" } else { "legacy_bridge_inclusive_input" },
+            "status": if diagnostics.iter().any(|reason| !reason.starts_with("missing_")) { "invalid" }
+                else if unknown.is_empty() { "complete" } else { "incomplete" },
+            "unknown_fields": unknown, "diagnostics": diagnostics,
+        }));
+    }
+
+    fn reported_usage(&self) -> HashMap<String, i64> {
+        self.token_usage.iter().filter(|(key, _)| !self.usage_unknown.contains(*key))
+            .map(|(key, value)| (key.clone(), *value)).collect()
     }
 
     fn todos_block_completion(&self) -> bool {
@@ -1131,7 +1199,7 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
             state.compact_if_needed();
             continue;
         }
-        state.accumulate_usage(&response.usage);
+        state.accumulate_usage(&response.usage, &response.usage_observation);
         let content = response.message.content.clone();
         if !response.message.tool_calls.is_empty() {
             state.pending_prose_completion_without_done_turn = 0;
@@ -28146,6 +28214,35 @@ mod tests {
             },
             prompt_policy: PromptPolicy::default(),
         })
+    }
+
+    #[test]
+    fn usage_counts_once_and_unknown_calls_cannot_become_exact_totals() {
+        let mut state = worker_state_for_unit_tests();
+        let legacy = json!({"prompt_tokens": 2006, "input_tokens": 2006,
+            "completion_tokens": 300, "output_tokens": 300, "cache_read_input_tokens": 1920});
+        state.accumulate_usage(&legacy, &Value::Null);
+        assert_eq!(state.reported_usage(), HashMap::from([
+            ("input".into(), 86), ("cache".into(), 1920), ("output".into(), 300)]));
+        state.accumulate_usage(&json!({"input": 86, "cache": 1920, "output": 300}), &Value::Null);
+        assert_eq!(state.reported_usage()["input"], 172);
+        state.accumulate_usage(&json!({"prompt_tokens": 10, "input_tokens": 11,
+            "completion_tokens": 2, "cache_read_input_tokens": 0}), &Value::Null);
+        assert_eq!(state.reported_usage(), HashMap::from([("output".into(), 602)]));
+        assert_eq!(state.trajectory.last().unwrap()["status"], "invalid");
+        let mut raw = worker_state_for_unit_tests();
+        raw.accumulate_usage(&json!({"input_tokens": 86, "cache_read_input_tokens": 1920,
+            "output_tokens": 300}), &Value::Null);
+        assert_eq!(raw.reported_usage()["input"], 86);
+        assert_eq!(raw.reported_usage()["cache"], 1920);
+        let mut written = worker_state_for_unit_tests();
+        written.accumulate_usage(&json!({"input_tokens": 86, "cache_read_input_tokens": 1920,
+            "cache_creation_input_tokens": 100, "output_tokens": 300}), &Value::Null);
+        assert_eq!(written.reported_usage()["input"], 186);
+        let mut invalid = worker_state_for_unit_tests();
+        invalid.accumulate_usage(&json!({"input": true, "cache": -1, "output": 2,
+            "prompt_tokens": 10}), &Value::Null);
+        assert!(invalid.reported_usage().is_empty());
     }
 
     fn polyglot_worker_state(task_id: &str, expected_file: &str) -> WorkerState {
