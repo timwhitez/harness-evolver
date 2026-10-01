@@ -21,6 +21,7 @@ from threading import Lock
 from typing import Any, Callable
 
 import litellm
+from bench.usage import normalize_worker_usage, USAGE_SCHEMA
 
 from harness.config import HarnessConfig, RoleModelConfig
 from harness.tools.registry import ToolRegistry
@@ -455,13 +456,18 @@ class HLAgent:
                     "arguments": tool_call.function.arguments,
                 }
             )
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage")
+        counts, observation = normalize_worker_usage(usage)
         return {
             "message": {
                 "content": getattr(message, "content", None) or "",
                 "reasoning_content": self._message_reasoning_content(message),
                 "tool_calls": tool_calls,
             },
-            "usage": self._usage_payload(response),
+            "usage": counts,
+            "usage_observation": observation,
         }
 
     def _llm_error_response_payload(self, exc: Exception) -> dict[str, Any]:
@@ -482,20 +488,7 @@ class HLAgent:
         usage = getattr(response, "usage", None)
         if usage is None and isinstance(response, dict):
             usage = response.get("usage")
-        if usage is None:
-            return {}
-        payload: dict[str, int] = {}
-        for key in (
-            "prompt_tokens",
-            "input_tokens",
-            "completion_tokens",
-            "output_tokens",
-            "cache_read_input_tokens",
-        ):
-            value = self._usage_value(usage, key)
-            if value is not None:
-                payload[key] = value
-        return payload
+        return normalize_worker_usage(usage)[0]
 
     def _execute_bridge_tool(self, event: dict[str, Any]) -> dict[str, Any]:
         tool_name = str(event.get("tool") or "")
@@ -575,6 +568,21 @@ class HLAgent:
             if isinstance(item, str)
         ]
         status = self._trial_status(payload.get("status"))
+        observations = [event for event in self.trajectory
+                        if event.get("type") == "token_usage_observation"]
+        metadata = dict(payload.get("metadata") or {})
+        metadata["token_usage_observation"] = {
+            "schema": USAGE_SCHEMA if observations and all(
+                event.get("schema") == USAGE_SCHEMA for event in observations
+            ) else "legacy",
+            "status": "invalid" if any(event.get("status") == "invalid" for event in observations)
+                else "complete" if set(self.token_usage) >= {"input", "cache", "output"}
+                else "incomplete",
+            "calls": len(observations),
+            "unknown_fields": sorted({"input", "cache", "output"} - self.token_usage.keys()),
+            "diagnostics": sorted({reason for event in observations
+                                   for reason in event.get("diagnostics", [])}),
+        }
         return TrialResult(
             trial_id=payload.get("trial_id") or task_context.get("task_id", "unknown"),
             task_id=payload.get("task_id") or task_context.get("task_id", "unknown"),
@@ -593,7 +601,7 @@ class HLAgent:
                 for item in list(payload.get("error_log") or [])
                 if isinstance(item, str)
             ],
-            metadata=dict(payload.get("metadata") or {}),
+            metadata=metadata,
         )
 
     def _trial_status(self, raw: Any) -> TrialStatus:

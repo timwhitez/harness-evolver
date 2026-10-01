@@ -197,6 +197,22 @@ latency, API error counts, and cache-hit ratio. Campaign reports aggregate
 these metrics by domain, difficulty, task type, and whole campaign so future
 updates can optimize reliability and cost, not only pass/fail.
 
+Worker usage schema `worker_usage_v1_exclusive_input` defines `input` as
+non-cache-hit input, `cache` as cache-hit input, and `output` as generated
+tokens. The Python/LiteLLM boundary subtracts the known cached subset from
+inclusive `prompt_tokens`; matching aliases count once. Raw Anthropic-shaped
+`input_tokens` plus top-level `cache_read_input_tokens` (without LiteLLM prompt
+fields) retain exclusive input semantics and include observed cache-creation
+tokens in non-cache-hit input. Missing, invalid, or conflicting
+counters stay unknown, and a missing call prevents an exact aggregate counter.
+Harbor metadata retains the schema and diagnostics; attempt/campaign reports
+label coverage and observed subtotals. Cache ratios require known input and
+cache. Campaign means use v1 observations and report their sample count. Legacy
+and v1 input counters cannot be combined under one denominator. Existing files
+without the schema remain readable and labelled `legacy`; they are not silently
+recalculated without original usage evidence. The inclusive LiteLLM contract is
+documented in its [prompt caching guide](https://docs.litellm.ai/docs/completion/prompt_caching).
+
 The campaign runner also writes a durable analysis layer:
 
 - `trials/analysis/<campaign>/<summary>/overview.md` summarizes failure buckets,

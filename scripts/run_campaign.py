@@ -20,6 +20,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from bench.usage import usage_coverage, compatible_usage_totals, USAGE_SCHEMA  # noqa: E402
+
 from scripts.run_trial import (  # noqa: E402
     _network_preflight_argv,
     add_docker_resource_args,
@@ -11371,8 +11373,10 @@ def _aggregate_task_types(trials: list[Any]) -> dict[str, Any]:
                 "wall_time_seconds": 0.0,
                 "token_usage": {"input": 0, "cache": 0, "output": 0},
                 "trial_metrics": _empty_metric_totals(),
+                "usage_trials": [],
             },
         )
+        bucket["usage_trials"].append(trial)
         bucket["tasks"] += 1
         bucket["passed"] += 1 if trial.status.value == "passed" else 0
         bucket["score_sum"] += float(trial.score)
@@ -11386,7 +11390,8 @@ def _aggregate_task_types(trials: list[Any]) -> dict[str, Any]:
             "passed": value["passed"],
             "score": round(value["score_sum"] / value["tasks"], 4),
             "wall_time_seconds": round(value["wall_time_seconds"], 3),
-            "token_usage": value["token_usage"],
+            "token_usage": compatible_usage_totals(value["usage_trials"], value["token_usage"]),
+            "token_usage_coverage": usage_coverage(value["usage_trials"]),
             "trial_metrics": _finalize_metric_totals(value["trial_metrics"], value["tasks"]),
         }
         for task_type, value in sorted(buckets.items())
@@ -11406,8 +11411,10 @@ def _aggregate_by(trials: list[Any], attr: str) -> dict[str, Any]:
                 "wall_time_seconds": 0.0,
                 "token_usage": {"input": 0, "cache": 0, "output": 0},
                 "trial_metrics": _empty_metric_totals(),
+                "usage_trials": [],
             },
         )
+        bucket["usage_trials"].append(trial)
         bucket["tasks"] += 1
         bucket["passed"] += 1 if trial.status.value == "passed" else 0
         bucket["score_sum"] += float(trial.score)
@@ -11422,7 +11429,8 @@ def _aggregate_by(trials: list[Any], attr: str) -> dict[str, Any]:
             "passed": value["passed"],
             "score": round(value["score_sum"] / value["tasks"], 4),
             "wall_time_seconds": round(value["wall_time_seconds"], 3),
-            "token_usage": value["token_usage"],
+            "token_usage": compatible_usage_totals(value["usage_trials"], value["token_usage"]),
+            "token_usage_coverage": usage_coverage(value["usage_trials"]),
             "trial_metrics": _finalize_metric_totals(value["trial_metrics"], value["tasks"]),
         }
         for key, value in sorted(buckets.items())
@@ -11441,7 +11449,8 @@ def _aggregate_efficiency(trials: list[Any]) -> dict[str, Any]:
     return {
         "tasks": len(trials),
         "wall_time_seconds": round(wall_time, 3),
-        "token_usage": token_usage,
+        "token_usage": compatible_usage_totals(trials, token_usage),
+        "token_usage_coverage": usage_coverage(trials),
         "trial_metrics": _finalize_metric_totals(totals, len(trials)),
     }
 
@@ -11454,6 +11463,7 @@ def _empty_metric_totals() -> dict[str, float]:
         "api_error_count": 0.0,
         "provider_latency_ms": 0.0,
         "cache_hit_ratio": 0.0,
+        "cache_hit_ratio_samples": 0.0,
     }
 
 
@@ -11461,7 +11471,15 @@ def _add_trial_metrics(totals: dict[str, float], trial: Any) -> None:
     metrics = getattr(trial, "metadata", {}).get("trial_metrics") or {}
     if not isinstance(metrics, dict):
         return
+    known_ratio = (
+        trial.metadata.get("token_usage_observation", {}).get("schema") == USAGE_SCHEMA
+        and type(metrics.get("cache_hit_ratio")) in (int, float)
+    )
+    if known_ratio:
+        totals["cache_hit_ratio_samples"] += 1
     for key in totals:
+        if key == "cache_hit_ratio_samples" or (key == "cache_hit_ratio" and not known_ratio):
+            continue
         try:
             totals[key] += float(metrics.get(key) or 0.0)
         except (TypeError, ValueError):
@@ -11476,7 +11494,10 @@ def _finalize_metric_totals(totals: dict[str, float], count: int) -> dict[str, f
         "n_api_calls": int(totals["n_api_calls"]),
         "api_error_count": int(totals["api_error_count"]),
         "provider_latency_ms_mean": round(totals["provider_latency_ms"] / count, 3),
-        "cache_hit_ratio_mean": round(totals["cache_hit_ratio"] / count, 4),
+        "cache_hit_ratio_mean": round(totals["cache_hit_ratio"] / totals["cache_hit_ratio_samples"], 4)
+            if totals["cache_hit_ratio_samples"] else None,
+        "cache_hit_ratio_samples": int(totals["cache_hit_ratio_samples"]),
+        "cache_hit_ratio_schema": USAGE_SCHEMA,
     }
 
 

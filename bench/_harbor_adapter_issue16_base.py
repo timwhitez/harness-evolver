@@ -1531,9 +1531,9 @@ class HLWorkerHarborAgent(BaseAgent):
             raise
         self._write_trajectory(result.tool_calls, result.trajectory)
 
-        context.n_input_tokens = result.token_usage.get("input") or None
-        context.n_cache_tokens = result.token_usage.get("cache") or None
-        context.n_output_tokens = result.token_usage.get("output") or None
+        context.n_input_tokens = result.token_usage.get("input")
+        context.n_cache_tokens = result.token_usage.get("cache")
+        context.n_output_tokens = result.token_usage.get("output")
         context.metadata = {
             "worker_status": result.status.value,
             "worker_verified": result.verified,
@@ -1543,6 +1543,9 @@ class HLWorkerHarborAgent(BaseAgent):
             "max_turns_audit_only": self.max_turns_audit,
             "tool_timeout_seconds": self.tool_timeout_seconds,
             "error_log": result.error_log[:5],
+            "token_usage_observation": result.metadata.get("token_usage_observation", {
+                "schema": "legacy", "status": "unknown",
+            }),
         }
 
     def _build_agent(self, registry: ToolRegistry) -> HLAgent:

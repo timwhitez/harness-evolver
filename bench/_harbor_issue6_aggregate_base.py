@@ -8,6 +8,8 @@ arithmetic-mean policy instead of silently selecting the first result.
 
 from __future__ import annotations
 
+from bench.usage import usage_coverage, compatible_usage_totals, USAGE_SCHEMA
+
 from collections import Counter
 from contextvars import ContextVar
 import json
@@ -189,6 +191,11 @@ class HarborRunner(_base.HarborRunner):
                 if isinstance(value, int):
                     token_usage[key] = token_usage.get(key, 0) + value
 
+        token_usage = {key: value for key, value in token_usage.items()
+                       if all(key in attempt.token_usage for attempt in attempts)}
+
+        token_usage = compatible_usage_totals(attempts, token_usage)
+
         metric_totals: dict[str, int | float] = {}
         for attempt in attempts:
             metrics = attempt.metadata.get("trial_metrics") or {}
@@ -203,7 +210,7 @@ class HarborRunner(_base.HarborRunner):
             if isinstance(value, float):
                 metric_totals[key] = round(value, 6)
         prompt_tokens = token_usage.get("input", 0) + token_usage.get("cache", 0)
-        if prompt_tokens:
+        if prompt_tokens and {"input", "cache"} <= token_usage.keys():
             metric_totals["cache_hit_ratio"] = round(
                 token_usage.get("cache", 0) / prompt_tokens,
                 4,
@@ -320,6 +327,14 @@ class HarborRunner(_base.HarborRunner):
             "verifier_infra_error": all_verifier_infra,
             "timeout_phase": aggregate_timeout_phase,
             "trial_metrics": metric_totals,
+            "token_usage_coverage": usage_coverage(attempts),
+            "token_usage_observation": {
+                "schema": usage_coverage(attempts)["schema"],
+                "status": "legacy_or_mixed" if usage_coverage(attempts)["schema"] != USAGE_SCHEMA
+                else "complete" if all(
+                    {"input", "cache", "output"} <= attempt.token_usage.keys() for attempt in attempts
+                ) else "incomplete",
+            },
             "attempt_metric_totals": metric_totals,
             "attempt_models": unique_models,
             "attempt_domains": unique_domains,
