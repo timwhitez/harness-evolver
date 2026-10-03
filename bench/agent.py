@@ -223,8 +223,10 @@ class HLAgent(_base.HLAgent):
             )
 
             try:
+                command = self._rust_worker_command()
+                self._raise_if_cancelled()
                 process = subprocess.Popen(
-                    self._rust_worker_command(),
+                    command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=worker_stderr_fd,
@@ -300,6 +302,7 @@ class HLAgent(_base.HLAgent):
             self._active_process = process
 
         try:
+            self._raise_if_cancelled()
             self._write_bridge_event(
                 process,
                 {
@@ -315,10 +318,12 @@ class HLAgent(_base.HLAgent):
                 if not line.strip():
                     continue
                 event = json.loads(line)
+                self._raise_if_cancelled()
                 if not isinstance(event, dict):
                     raise WorkerProtocolError("Rust Worker event must be a JSON object")
                 event_type = event.get("type")
                 if event_type == "llm_request":
+                    self.turn_count += 1
                     self.messages = list(event.get("messages") or [])
                     try:
                         response = _base.litellm.completion(

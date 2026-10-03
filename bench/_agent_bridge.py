@@ -17,11 +17,12 @@ import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Callable
 
 import litellm
 from bench.usage import normalize_worker_usage, USAGE_SCHEMA
+from bench.worker_metrics import valid_turn_count, worker_metrics_metadata
 
 from harness.config import HarnessConfig, RoleModelConfig
 from harness.tools.registry import ToolRegistry
@@ -53,6 +54,7 @@ class HLAgent:
     max_turns_audit: int = 0
     messages: list[dict[str, Any]] = field(default_factory=list)
     turn_count: int = 0
+    _model_requests_observed: bool = field(default=False, init=False, repr=False)
     tool_call_history: list[dict[str, Any]] = field(default_factory=list)
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     token_usage: dict[str, int] = field(default_factory=dict)
@@ -65,6 +67,7 @@ class HLAgent:
         repr=False,
     )
     _process_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _run_cancellation: Event | None = field(default=None, init=False, repr=False)
 
     # Policy knobs forwarded to the Rust core. They remain configurable from
     # Python/Harbor while Rust owns the Worker loop decisions.
@@ -142,8 +145,13 @@ class HLAgent:
     def run(self, task_instruction: str, task_context: dict[str, Any]) -> TrialResult:
         """Execute a TerminalBench task through the Rust Worker core."""
 
+        with self._process_lock:
+            if self._run_cancellation is None:
+                self._run_cancellation = Event()
+            cancellation = self._run_cancellation
         self._initialize_run_state(task_instruction, task_context)
         try:
+            self._raise_if_cancelled()
             return self._run_rust_core(task_instruction, task_context)
         except Exception as exc:
             self._append_trajectory(
@@ -164,17 +172,36 @@ class HLAgent:
                     "Rust Worker core failed before reliable Harbor verification."
                 ),
                 tool_calls=self.tool_call_history,
+                turn_count=self.turn_count,
                 trajectory=self.trajectory,
                 model_used=self._model_name(),
                 token_usage=self.token_usage,
                 error_log=[f"Rust Worker core failed: {exc}"],
-                metadata={"rust_worker_core_error": True},
+                metadata={"rust_worker_core_error": True, **worker_metrics_metadata(
+                    self.turn_count, "partial")},
             )
+        finally:
+            with self._process_lock:
+                if self._run_cancellation is cancellation:
+                    self._run_cancellation = None
+
+    def _prepare_run_cancellation(self) -> None:
+        """Arm Harbor cancellation before its executor thread can start."""
+        with self._process_lock:
+            self._run_cancellation = Event()
+
+    def _raise_if_cancelled(self) -> None:
+        with self._process_lock:
+            cancelled = self._run_cancellation is not None and self._run_cancellation.is_set()
+        if cancelled:
+            raise RuntimeError("Rust Worker run was cancelled")
 
     def cancel_current_run(self, reason: str = "cancelled") -> None:
         """Terminate the active Rust Worker process after Harbor cancels a trial."""
 
         with self._process_lock:
+            if self._run_cancellation is not None:
+                self._run_cancellation.set()
             process = self._active_process
         if process is None:
             return
@@ -194,6 +221,7 @@ class HLAgent:
         task_context: dict[str, Any],
     ) -> None:
         self.turn_count = 0
+        self._model_requests_observed = True
         self.messages = []
         self.tool_call_history = []
         self.trajectory = []
@@ -206,8 +234,10 @@ class HLAgent:
         task_instruction: str,
         task_context: dict[str, Any],
     ) -> TrialResult:
+        command = self._rust_worker_command()
+        self._raise_if_cancelled()
         process = subprocess.Popen(
-            self._rust_worker_command(),
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -221,6 +251,7 @@ class HLAgent:
             self._active_process = process
 
         try:
+            self._raise_if_cancelled()
             self._write_bridge_event(
                 process,
                 {
@@ -234,8 +265,10 @@ class HLAgent:
                 if not line.strip():
                     continue
                 event = json.loads(line)
+                self._raise_if_cancelled()
                 event_type = event.get("type")
                 if event_type == "llm_request":
+                    self.turn_count += 1
                     self.messages = list(event.get("messages") or [])
                     try:
                         response = litellm.completion(
@@ -560,9 +593,14 @@ class HLAgent:
         task_context: dict[str, Any],
     ) -> TrialResult:
         self.messages = list(payload.get("messages") or self.messages)
-        self.turn_count = int(payload.get("turn_count") or self.turn_count)
-        self.tool_call_history = list(payload.get("tool_calls") or [])
-        self.trajectory = list(payload.get("trajectory") or self.trajectory)
+        turn_count = (valid_turn_count(payload["turn_count"]) if "turn_count" in payload
+                      else self.turn_count if self._model_requests_observed else None)
+        if turn_count is not None:
+            self.turn_count = turn_count
+        if "tool_calls" in payload:
+            self.tool_call_history = list(payload.get("tool_calls") or [])
+        if "trajectory" in payload:
+            self.trajectory = list(payload.get("trajectory") or [])
         self.token_usage = {
             str(key): int(value)
             for key, value in dict(payload.get("token_usage") or {}).items()
@@ -577,6 +615,11 @@ class HLAgent:
         observations = [event for event in self.trajectory
                         if event.get("type") == "token_usage_observation"]
         metadata = dict(payload.get("metadata") or {})
+        native_metrics = payload.get("worker_metrics_schema") == "worker_metrics_v1"
+        metadata.update(worker_metrics_metadata(turn_count,
+            ("complete" if turn_count is not None and isinstance(payload.get("tool_calls"), list)
+             else "partial") if native_metrics else "legacy" if turn_count is not None else "unknown",
+            "worker_metrics_v1" if native_metrics else "legacy"))
         metadata["token_usage_observation"] = {
             "schema": USAGE_SCHEMA if observations and all(
                 event.get("schema") == USAGE_SCHEMA for event in observations
@@ -599,6 +642,7 @@ class HLAgent:
             verified=bool(payload.get("verified", False)),
             verifier_output=str(payload.get("verifier_output") or ""),
             tool_calls=self.tool_call_history,
+            turn_count=turn_count,
             trajectory=self.trajectory,
             model_used=str(payload.get("model_used") or self._model_name()),
             token_usage=self.token_usage,
@@ -758,6 +802,11 @@ class HLAgent:
     def _append_trajectory(self, event: dict[str, Any]) -> None:
         """Record one trajectory event and opportunistically persist it live."""
         self.trajectory.append(event)
+        if event.get("type") in {"tool_call", "completion_verification", "entrypoint_scan"} \
+                and {"tool", "args", "success"} <= event.keys():
+            outcome = {key: value for key, value in event.items() if key != "type"}
+            outcome["output"] = _truncate(str(outcome.get("output") or ""), 2000)
+            self.tool_call_history.append(outcome)
         if self.trajectory_event_sink is None:
             return
         try:

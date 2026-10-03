@@ -20,12 +20,15 @@ import time
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 
 from bench.agent import HLAgent
+from bench.worker_metrics import valid_turn_count, worker_metrics_metadata
+from hl.types import TrialResult
 from harness.config import HarnessConfig, ReasoningConfig, RoleModelConfig
 from harness.tools.base import (
     ToolDef,
@@ -1488,6 +1491,8 @@ class HLWorkerHarborAgent(BaseAgent):
         self.harness_config = harness_config
         self.goal_path = goal_path
         self.memory_path = memory_path
+        self._trajectory_lock = Lock()
+        self._active_run_id: str | None = None
 
     @staticmethod
     def name() -> str:
@@ -1508,8 +1513,12 @@ class HLWorkerHarborAgent(BaseAgent):
         loop = asyncio.get_running_loop()
         registry = self._build_environment_registry(environment, loop)
         agent = self._build_agent(registry)
-        live_trajectory_path = self._reset_live_trajectory()
-        agent.trajectory_event_sink = self._live_trajectory_sink(live_trajectory_path)
+        prepare_cancellation = getattr(agent, "_prepare_run_cancellation", None)
+        if prepare_cancellation is not None:
+            prepare_cancellation()
+        run_id = uuid4().hex
+        live_trajectory_path = self._reset_live_trajectory(run_id)
+        agent.trajectory_event_sink = self._live_trajectory_sink(live_trajectory_path, run_id)
         task_context = {
             "task_id": getattr(environment, "environment_name", "unknown"),
             "domain": "unknown",
@@ -1525,19 +1534,72 @@ class HLWorkerHarborAgent(BaseAgent):
             asyncio.to_thread(agent.run, instruction, task_context)
         )
         try:
-            result = await worker_task
+            # Cancellation must leave the underlying thread's result available
+            # for a guarded late observation, without waiting for that thread.
+            result = await asyncio.shield(worker_task)
         except asyncio.CancelledError:
-            agent.cancel_current_run("harbor_agent_cancelled")
+            try:
+                agent.cancel_current_run("harbor_agent_cancelled")
+            except Exception:
+                # Cleanup failure must not replace Harbor's cancellation.
+                pass
+            try:
+                self._snapshot_cancelled_metrics(agent, context, run_id, task_context["task_id"])
+            except Exception:
+                # Metric persistence is best effort; keep the cancellation.
+                pass
+            def publish_late_result(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return
+                try:
+                    late_result = task.result()
+                    if late_result.task_id == task_context["task_id"]:
+                        self._publish_worker_result(late_result, context, run_id, partial=True)
+                except Exception:
+                    return
+            worker_task.add_done_callback(publish_late_result)
             raise
-        self._write_trajectory(result.tool_calls, result.trajectory)
+        self._publish_worker_result(result, context, run_id)
 
+    def _publish_worker_result(self, result: TrialResult, context: AgentContext, run_id: str,
+                               *, partial: bool = False) -> None:
+        with self._trajectory_lock:
+            if self._active_run_id != run_id:
+                return
+            if partial:
+                previous = context.metadata
+                count = result.turn_count if result.turn_count is not None \
+                    else valid_turn_count(previous.get("turn_count"))
+                result_observation = result.metadata.get("worker_metrics_observation") or {}
+                observation = result_observation or \
+                    previous.get("worker_metrics_observation", {})
+                schema = observation.get("schema", "legacy")
+                context.metadata.update(worker_metrics_metadata(count,
+                    "partial" if count is not None else "unknown", schema))
+                if result_observation.get("schema") == "worker_metrics_v1" \
+                        or "tool_calls" in result.model_fields_set:
+                    context.metadata["tool_calls"] = len(result.tool_calls)
+                for key, attribute in (("input", "n_input_tokens"), ("cache", "n_cache_tokens"),
+                                       ("output", "n_output_tokens")):
+                    if key in result.token_usage:
+                        setattr(context, attribute, result.token_usage[key])
+                context.metadata.update(worker_status="cancelled", worker_verified=False)
+                self._append_metrics_snapshot(context, run_id, result.task_id)
+            else:
+                self._set_result_context(result, context)
+                self._write_trajectory_unlocked(result.tool_calls, result.trajectory)
+
+    def _set_result_context(self, result: TrialResult, context: AgentContext) -> None:
         context.n_input_tokens = result.token_usage.get("input")
         context.n_cache_tokens = result.token_usage.get("cache")
         context.n_output_tokens = result.token_usage.get("output")
         context.metadata = {
             "worker_status": result.status.value,
             "worker_verified": result.verified,
-            "turn_count": agent.turn_count,
+            "turn_count": result.turn_count,
+            "worker_metrics_observation": result.metadata.get("worker_metrics_observation", {
+                "schema": "legacy", "status": "unknown",
+            }),
             "tool_calls": len(result.tool_calls),
             "model": result.model_used,
             "max_turns_audit_only": self.max_turns_audit,
@@ -1547,6 +1609,33 @@ class HLWorkerHarborAgent(BaseAgent):
                 "schema": "legacy", "status": "unknown",
             }),
         }
+
+    def _snapshot_cancelled_metrics(self, agent: HLAgent, context: AgentContext,
+                                    run_id: str, task_id: str) -> None:
+        observed = getattr(agent, "_model_requests_observed", False)
+        count = valid_turn_count(getattr(agent, "turn_count", None)) if observed else None
+        usage = dict(getattr(agent, "token_usage", {}) or {})
+        history = getattr(agent, "tool_call_history", None)
+        outcomes = list(history) if isinstance(history, list) else None
+        with self._trajectory_lock:
+            if self._active_run_id != run_id:
+                return
+            context.n_input_tokens = usage.get("input")
+            context.n_cache_tokens = usage.get("cache")
+            context.n_output_tokens = usage.get("output")
+            context.metadata = {
+                "worker_status": "cancelled", "worker_verified": False,
+                **worker_metrics_metadata(count, "partial" if observed else "unknown",
+                                          "worker_metrics_v1" if observed else "legacy"),
+                "tool_calls": len(outcomes) if outcomes is not None else None,
+            }
+            self._append_metrics_snapshot(context, run_id, task_id)
+
+    def _append_metrics_snapshot(self, context: AgentContext, run_id: str, task_id: str) -> None:
+        event = {"type": "worker_metrics_snapshot", "run_id": run_id, "task_id": task_id,
+                 **context.metadata}
+        with (self.logs_dir / "trajectory.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
 
     def _build_agent(self, registry: ToolRegistry) -> HLAgent:
         config = (
@@ -1618,22 +1707,30 @@ class HLWorkerHarborAgent(BaseAgent):
         tool_calls: list[dict[str, Any]],
         trajectory: list[dict[str, Any]],
     ) -> None:
+        with self._trajectory_lock:
+            self._write_trajectory_unlocked(tool_calls, trajectory)
+
+    def _write_trajectory_unlocked(self, tool_calls: list[dict[str, Any]],
+                                   trajectory: list[dict[str, Any]]) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         events = trajectory or tool_calls
         path = self.logs_dir / "trajectory.jsonl"
         path.write_text("\n".join(json.dumps(event) for event in events))
 
-    def _reset_live_trajectory(self) -> Path:
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        path = self.logs_dir / "trajectory.jsonl"
-        path.write_text("")
-        return path
+    def _reset_live_trajectory(self, run_id: str | None = None) -> Path:
+        with self._trajectory_lock:
+            self._active_run_id = run_id
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            path = self.logs_dir / "trajectory.jsonl"
+            path.write_text("")
+            return path
 
-    def _live_trajectory_sink(self, path: Path):
-        lock = Lock()
+    def _live_trajectory_sink(self, path: Path, run_id: str | None = None):
 
         def append_event(event: dict[str, Any]) -> None:
-            with lock:
+            with self._trajectory_lock:
+                if run_id is not None and self._active_run_id != run_id:
+                    return
                 with path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(event) + "\n")
 

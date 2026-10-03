@@ -210,6 +210,44 @@ latency, API error counts, and cache-hit ratio. Campaign reports aggregate
 these metrics by domain, difficulty, task type, and whole campaign so future
 updates can optimize reliability and cost, not only pass/fail.
 
+Worker metrics schema `worker_metrics_v1` preserves optional `TrialResult.turn_count`
+and `metadata.turn_count`: the number of Rust model-request attempts, including
+failed requests and Worker recovery retries. Bootstrap is turn 0 and does not
+increment this counter. This is separate from Harbor's generic `n_turns` and
+provider API-call counts: LiteLLM's internal HTTP retries are not measured here.
+Missing historical counters remain `null`; explicit zero remains known zero.
+Harbor parsing and attempt aggregation retain the Worker counter; an aggregate
+with a missing attempt stays unknown. Existing `n_turns` campaign metrics keep
+their previous meaning.
+
+`TrialResult.tool_calls` contains logical tool outcomes, including failures,
+local argument/policy rejections, internal completion verification, and one
+actual bounded entrypoint scan when bash is available. It is not a physical
+dispatch count. The scan has `phase=bootstrap` and is reported separately from
+the model-loop policy history, preserving checkpoint and completion behavior.
+It still has one `entrypoint_scan` trajectory event. Valid final results replace
+the bridge's live mirror, avoiding duplicate outcomes. Interrupted runs preserve
+only observed request attempts and completed outcomes with
+`metadata.worker_metrics_observation.status=partial`; an in-flight tool can be
+absent. The Rust final payload explicitly declares `worker_metrics_schema=worker_metrics_v1`;
+older payloads without that declaration keep legacy tool coverage even when
+their turn counter is known. Harbor retains the counter/observation and the
+existing trajectory format; it does not reconstruct a missing tool history. Token
+usage remains independently optional, and none of these counters changes
+score, verified status, or Harbor/verifier evidence requirements.
+
+Harbor coroutine cancellation saves the bridge's observed counter and completed
+outcomes immediately in context metadata and a `worker_metrics_snapshot` trajectory
+event, marked `partial`. It does not await an in-flight Python model/tool call.
+A late result can refine this observation only for the same adapter run UUID and
+exact task ID, still as partial; stale callbacks and trajectory sinks cannot
+overwrite a subsequent run. Missing or malformed top-level job JSON with one
+exact surviving trial enriches only Worker metrics while keeping the inherited
+score, status, and verifier decision. Cross-record task identity rules still apply.
+Cancellation intent is armed before the executor starts and checked after command
+resolution, after process registration, and before processing further bridge events;
+an early cancellation cannot resume model/tool dispatch when setup later finishes.
+
 Worker usage schema `worker_usage_v1_exclusive_input` defines `input` as
 non-cache-hit input, `cache` as cache-hit input, and `output` as generated
 tokens. The Python/LiteLLM boundary subtracts the known cached subset from

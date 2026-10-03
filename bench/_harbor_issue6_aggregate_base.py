@@ -9,6 +9,7 @@ arithmetic-mean policy instead of silently selecting the first result.
 from __future__ import annotations
 
 from bench.usage import usage_coverage, compatible_usage_totals, USAGE_SCHEMA
+from bench.worker_metrics import aggregate_worker_metrics
 
 from collections import Counter
 from contextvars import ContextVar
@@ -343,8 +344,11 @@ class HarborRunner(_base.HarborRunner):
         }
         metadata = self._with_verifier_runtime_prepare_timeout_metadata(metadata)
 
+        metadata.update(aggregate_worker_metrics(attempts))
+
         return _base.TrialResult(
             trial_id=f"{job_path.name}__{safe_task_id}__aggregate",
+            turn_count=metadata["turn_count"],
             task_id=task_id,
             task_domain=attempts[0].task_domain,
             task_difficulty=attempts[0].task_difficulty,

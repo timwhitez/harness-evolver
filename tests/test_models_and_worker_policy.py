@@ -16,6 +16,15 @@ from harness.tools.todo import TodoReadTool, TodoStore, TodoWriteTool
 from hl.types import TrialStatus
 
 
+def _model_loop_tool_calls(result):
+    # These assertions exercise model-loop policy; bootstrap is now separately reported.
+    bootstrap = [call for call in result.tool_calls if call.get("phase") == "bootstrap"]
+    assert len(bootstrap) <= 1
+    if bootstrap:
+        assert bootstrap[0]["tool"] == "bash" and bootstrap[0]["turn"] == 0
+    return [call for call in result.tool_calls if call.get("phase") != "bootstrap"]
+
+
 def _observed_user_messages_containing(observed_messages, needle: str):
     return [
         message["content"]
@@ -633,7 +642,7 @@ def test_worker_recovers_from_prose_completion_without_done_tool(monkeypatch):
     result = agent.run("finish task", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == ["done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["done"]
     assert any(
         message.get("role") == "user"
         and "did not call the done tool" in message.get("content", "")
@@ -675,8 +684,8 @@ def test_rust_worker_core_executes_python_tool_bridge(monkeypatch):
     result = agent.run("finish task", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert result.tool_calls[0]["tool"] == "bash"
-    assert result.tool_calls[0]["success"] is True
+    assert _model_loop_tool_calls(result)[0]["tool"] == "bash"
+    assert _model_loop_tool_calls(result)[0]["success"] is True
     assert result.tool_calls[-1]["tool"] == "done"
 
 
@@ -1268,8 +1277,8 @@ def test_worker_records_terminal_environment_unavailable_as_hard_environment_evi
     assert "stopping instead" not in result.error_log[0]
     assert result.metadata["terminal_environment_unavailable"] is True
     assert result.metadata["terminal_environment_failure_tool"] == "grep"
-    assert result.tool_calls[0]["success"] is False
-    assert "Harbor/outer-loop handling" in result.tool_calls[0]["error"]
+    assert _model_loop_tool_calls(result)[0]["success"] is False
+    assert "Harbor/outer-loop handling" in _model_loop_tool_calls(result)[0]["error"]
     assert any(
         event["type"] == "terminal_environment_unavailable"
         for event in result.trajectory
@@ -1810,7 +1819,7 @@ def test_worker_injects_single_file_deliverable_hygiene_checkpoint(monkeypatch):
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == ["bash", "done", "bash", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["bash", "done", "bash", "done"]
     checkpoint_messages = _observed_user_messages_containing(
         observed_messages, "Single-file deliverable hygiene checkpoint"
     )
@@ -1907,7 +1916,7 @@ def test_worker_requires_single_file_deliverable_preflight_before_done(monkeypat
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == ["done", "bash", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["done", "bash", "done"]
     gate = next(
         event
         for event in result.trajectory
@@ -2211,7 +2220,7 @@ def test_worker_requires_expected_artifact_preflight_before_done(monkeypatch):
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "bash",
         "done",
         "verify",
@@ -2333,7 +2342,7 @@ def test_worker_requires_expected_artifact_check_after_direct_write_before_done(
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "write",
         "done",
         "verify",
@@ -2630,7 +2639,7 @@ def test_worker_injects_hazardous_dependency_artifact_first_after_guard(monkeypa
 
     _assert_scripted_worker_closed(result)
     assert requested_commands == ["apt-get install -y g++"]
-    assert [call["tool"] for call in result.tool_calls] == ["bash", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["bash", "done"]
     tool_call = next(
         event
         for event in result.trajectory
@@ -3296,7 +3305,7 @@ PY"""
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "write",
         "done",
         "verify",
@@ -3914,7 +3923,7 @@ def test_worker_injects_verifier_mismatch_recovery_after_failed_check(monkeypatc
     result = agent.run("finish task", {"task_id": "regex-chess"})
 
     _assert_scripted_worker_closed(result)
-    assert [call["tool"] for call in result.tool_calls] == ["verify", "verify", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["verify", "verify", "done"]
     event = next(
         event
         for event in result.trajectory
@@ -4130,7 +4139,7 @@ def test_worker_requires_regex_rule_artifact_preflight_before_done(monkeypatch):
     result = agent.run("repair regex chess rules", {"task_id": "regex-chess"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "bash",
         "done",
         "verify",
@@ -4285,7 +4294,7 @@ def test_worker_requires_regex_backreference_contract_preflight_before_artifact_
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "write",
         "done",
         "verify",
@@ -4603,7 +4612,7 @@ PY"""
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "bash",
         "done",
         "verify",
@@ -4806,7 +4815,7 @@ PY"""
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "write",
         "done",
         "verify",
@@ -4958,7 +4967,7 @@ def test_worker_requires_arithmetic_reference_preflight_before_done(monkeypatch)
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "write",
         "done",
         "verify",
@@ -5207,7 +5216,7 @@ PY"""
     result = agent.run("repair demo metadata csv", {"task_id": "sam-cell-seg"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "bash",
         "done",
         "verify",
@@ -5385,7 +5394,7 @@ PY"""
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "write",
         "done",
         "verify",
@@ -5571,7 +5580,7 @@ PY"""
 
     assert result.status == TrialStatus.UNVERIFIED
     assert not any("importlib.import_module('cv2')" in call.get("command", "") for call in bash_calls)
-    assert [call["tool"] for call in result.tool_calls] == ["bash", "verify", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["bash", "verify", "done"]
     blocked = next(
         event
         for event in result.trajectory
@@ -5845,7 +5854,7 @@ PY"""
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == ["bash", "verify", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["bash", "verify", "done"]
     assert not any("from convert_masks import" in call.get("command", "") for call in bash_calls)
     blocked = next(
         event
@@ -5965,7 +5974,7 @@ PY'''
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "bash",
         "done",
         "verify",
@@ -6139,7 +6148,7 @@ PY'''
     )
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "bash",
         "done",
         "verify",
@@ -7332,7 +7341,7 @@ def test_worker_promotes_live_missing_verifier_artifact_to_deliverable(monkeypat
     result = agent.run("Create the required Core War warrior.", {"task_id": "corewars"})
 
     _assert_scripted_worker_closed(result)
-    assert [call["tool"] for call in result.tool_calls] == ["verify", "verify", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["verify", "verify", "done"]
     observed = next(
         event for event in result.trajectory if event["type"] == "failed_verification_observed"
     )
@@ -7749,7 +7758,7 @@ def test_worker_pivots_after_repeated_failed_probe_checks(monkeypatch):
     result = agent.run("finish task", {"task_id": "count-dataset-tokens"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "verify",
         "verify",
         "verify",
@@ -7966,7 +7975,7 @@ def test_worker_treats_successful_verify_traceback_as_failed_verification(monkey
     result = agent.run("finish task", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == ["verify", "done", "verify", "done"]
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == ["verify", "done", "verify", "done"]
     first_verify = next(call for call in result.tool_calls if call["tool"] == "verify")
     assert first_verify["success"] is False
     assert "local verification output contains an exception" in first_verify["error"]
@@ -8053,7 +8062,7 @@ def test_worker_steers_pending_todos_after_successful_verification(monkeypatch):
     result = agent.run("finish task", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "todo_write",
         "verify",
         "done",
@@ -8279,7 +8288,7 @@ def test_worker_keeps_import_exception_gate_after_syntax_only_check(monkeypatch,
     result = agent.run("finish task", {"task_id": "task-a"})
 
     assert result.status == TrialStatus.UNVERIFIED
-    assert [call["tool"] for call in result.tool_calls] == [
+    assert [call["tool"] for call in _model_loop_tool_calls(result)] == [
         "bash",
         "write",
         "verify",
@@ -13417,7 +13426,11 @@ def test_worker_prunes_old_large_tool_outputs(monkeypatch):
 def _assert_only_incomplete_usage_metadata(result):
     # Scripted provider responses omit cache usage; recovery adds no terminal flags.
     calls = sum(event.get("type") == "token_usage_observation" for event in result.trajectory)
-    assert result.metadata == {"token_usage_observation": {
+    assert result.metadata == {"turn_count": result.turn_count,
+        "worker_metrics_observation": {"schema": "worker_metrics_v1", "status": "complete",
+            "turn_count_semantics": "rust_model_request_attempts",
+            "tool_calls_semantics": "logical_outcomes_including_bootstrap"},
+        "token_usage_observation": {
         "schema": "worker_usage_v1_exclusive_input", "status": "incomplete",
         "calls": calls, "unknown_fields": ["cache", "input"],
         "diagnostics": ["missing_cache"],
