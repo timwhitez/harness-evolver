@@ -1570,12 +1570,14 @@ class HLWorkerHarborAgent(BaseAgent):
                 previous = context.metadata
                 count = result.turn_count if result.turn_count is not None \
                     else valid_turn_count(previous.get("turn_count"))
-                observation = result.metadata.get("worker_metrics_observation") or \
+                result_observation = result.metadata.get("worker_metrics_observation") or {}
+                observation = result_observation or \
                     previous.get("worker_metrics_observation", {})
                 schema = observation.get("schema", "legacy")
                 context.metadata.update(worker_metrics_metadata(count,
                     "partial" if count is not None else "unknown", schema))
-                if schema == "worker_metrics_v1" or "tool_calls" in result.model_fields_set:
+                if result_observation.get("schema") == "worker_metrics_v1" \
+                        or "tool_calls" in result.model_fields_set:
                     context.metadata["tool_calls"] = len(result.tool_calls)
                 for key, attribute in (("input", "n_input_tokens"), ("cache", "n_cache_tokens"),
                                        ("output", "n_output_tokens")):

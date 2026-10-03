@@ -450,6 +450,20 @@ def test_harbor_cancel_legacy_worker_missing_metrics_stays_unknown(tmp_path, per
     asyncio.run(scenario())
 
 
+def test_late_legacy_result_does_not_erase_observed_partial_metrics(tmp_path):
+    adapter = HLWorkerHarborAgent(logs_dir=tmp_path / "agent", model_name="test")
+    adapter._reset_live_trajectory("current")
+    context = SimpleNamespace(n_input_tokens=7, n_cache_tokens=None, n_output_tokens=None,
+        metadata={"turn_count": 2, "tool_calls": 2,
+            "worker_metrics_observation": {"schema": "worker_metrics_v1", "status": "partial"}})
+    legacy = TrialResult(trial_id="old", task_id="fixture", status=TrialStatus.ERROR,
+                         task_domain="software_engineering", task_difficulty="easy")
+    adapter._publish_worker_result(legacy, context, "current", partial=True)
+    assert context.metadata["turn_count"] == context.metadata["tool_calls"] == 2
+    assert context.metadata["worker_metrics_observation"]["status"] == "partial"
+    assert context.n_input_tokens == 7
+
+
 @pytest.mark.parametrize("metadata", [{}, {"turn_count": True}, {"turn_count": -1}, {"turn_count": "2"}])
 def test_single_surviving_legacy_invalid_counters_stay_unknown(tmp_path, metadata):
     trial = tmp_path / "job" / "attempt"
