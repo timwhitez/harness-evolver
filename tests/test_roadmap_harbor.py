@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.static_guard_support import no_dispatch_write_tool
+
 import bench.harbor as harbor_module
 from bench.harbor_adapter import (
     HarborGlobTool,
@@ -4548,83 +4550,29 @@ def test_harbor_write_tool_uses_target_python_for_nofollow(tmp_path):
 
 
 def test_harbor_write_tool_blocks_staged_dependency_script_before_exec(tmp_path):
-    class FakeEnvironment:
-        def __init__(self):
-            self.calls = []
-
-        async def exec(self, command, cwd=None, env=None, timeout_sec=None):
-            self.calls.append(
-                {
-                    "command": command,
-                    "cwd": cwd,
-                    "env": env,
-                    "timeout_sec": timeout_sec,
-                }
-            )
-            return SimpleNamespace(return_code=0, stdout="should not run", stderr="")
-
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever)
-    thread.start()
-    try:
-        environment = FakeEnvironment()
-        tool = HarborFileWriteTool(
-            environment=environment,
-            loop=loop,
-            timeout_seconds=5,
-        )
-        result = tool.execute(
-            str(tmp_path / "download_httpstan.py"),
-            (
-                "import urllib.request\n"
-                "import ssl\n"
-                "ctx = ssl._create_unverified_context()\n"
-                "urllib.request.urlopen('https://pypi.org/pypi/httpstan/4.13.0/json', context=ctx)\n"
-            ),
-        )
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5)
-        loop.close()
+    tool, environment, loop = no_dispatch_write_tool()
+    result = tool.execute(
+        str(tmp_path / "download_httpstan.py"),
+        (
+            "import urllib.request\n"
+            "import ssl\n"
+            "ctx = ssl._create_unverified_context()\n"
+            "urllib.request.urlopen('https://pypi.org/pypi/httpstan/4.13.0/json', context=ctx)\n"
+        ),
+    )
 
     assert result.success is False
     assert result.metadata["blocked_by"] == "staged_dependency_script_guard"
     _assert_policy_guard_is_non_terminal(result.metadata)
     assert "staged script" in result.error
-    assert environment.calls == []
+    environment.exec.assert_not_called()
+    assert loop.mock_calls == []
+    assert tool.timeout_seconds == 5
 
 
 def test_harbor_write_tool_blocks_oversized_gpt2_codegolf_before_exec(tmp_path):
-    class FakeEnvironment:
-        def __init__(self):
-            self.calls = []
-
-        async def exec(self, command, cwd=None, env=None, timeout_sec=None):
-            self.calls.append(
-                {
-                    "command": command,
-                    "cwd": cwd,
-                    "env": env,
-                    "timeout_sec": timeout_sec,
-                }
-            )
-            return SimpleNamespace(return_code=0, stdout="should not run", stderr="")
-
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever)
-    thread.start()
-    try:
-        environment = FakeEnvironment()
-        tool = HarborFileWriteTool(
-            environment=environment,
-            loop=loop,
-            timeout_seconds=5,
-        )
-        result = tool.execute(str(tmp_path / "app" / "gpt2.c"), "x" * 5000)
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5)
-        loop.close()
+    tool, environment, loop = no_dispatch_write_tool()
+    result = tool.execute(str(tmp_path / "app" / "gpt2.c"), "x" * 5000)
 
     assert result.success is False
     assert result.metadata["blocked_by"] == "deliverable_size_cap_write_guard"
@@ -4632,7 +4580,9 @@ def test_harbor_write_tool_blocks_oversized_gpt2_codegolf_before_exec(tmp_path):
     assert result.metadata["content_bytes"] == 5000
     assert result.metadata["limit_bytes"] == 5000
     assert "under 5000 bytes" in result.error
-    assert environment.calls == []
+    environment.exec.assert_not_called()
+    assert loop.mock_calls == []
+    assert tool.timeout_seconds == 5
 
 
 def test_harbor_write_tool_blocks_staged_dependency_script_after_append(tmp_path):
@@ -5091,45 +5041,19 @@ def test_harbor_edit_tool_blocks_staged_dependency_script_before_exec(tmp_path):
 
 
 def test_harbor_write_tool_blocks_staged_nested_agent_script_before_exec(tmp_path):
-    class FakeEnvironment:
-        def __init__(self):
-            self.calls = []
-
-        async def exec(self, command, cwd=None, env=None, timeout_sec=None):
-            self.calls.append(
-                {
-                    "command": command,
-                    "cwd": cwd,
-                    "env": env,
-                    "timeout_sec": timeout_sec,
-                }
-            )
-            return SimpleNamespace(return_code=0, stdout="should not run", stderr="")
-
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever)
-    thread.start()
-    try:
-        environment = FakeEnvironment()
-        tool = HarborFileWriteTool(
-            environment=environment,
-            loop=loop,
-            timeout_seconds=5,
-        )
-        result = tool.execute(
-            str(tmp_path / "delegate.js"),
-            "import {spawnSync} from 'child_process'; spawnSync('codex', ['exec', 'fix'])\n",
-        )
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5)
-        loop.close()
+    tool, environment, loop = no_dispatch_write_tool()
+    result = tool.execute(
+        str(tmp_path / "delegate.js"),
+        "import {spawnSync} from 'child_process'; spawnSync('codex', ['exec', 'fix'])\n",
+    )
 
     assert result.success is False
     assert result.metadata["blocked_by"] == "staged_dependency_script_guard"
     _assert_policy_guard_is_non_terminal(result.metadata)
     assert "only the master HL orchestrator may create sub-agents" in result.error
-    assert environment.calls == []
+    environment.exec.assert_not_called()
+    assert loop.mock_calls == []
+    assert tool.timeout_seconds == 5
 
 
 def test_harbor_edit_tool_blocks_staged_dependency_script_after_composed_edit(tmp_path):
