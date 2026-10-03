@@ -865,6 +865,21 @@ class HarborRunner:
                 metadata={"model_config": self._model_config_metadata(agent_config)},
             )
 
+        if not isinstance(job_result, dict):
+            return TrialResult(
+                trial_id=job_path.name,
+                task_id=task_id,
+                task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                task_difficulty=TaskDifficulty.MEDIUM,
+                status=TrialStatus.ERROR,
+                error_log=["Could not parse Harbor result.json: expected a JSON object"],
+                wall_time_seconds=wall_time,
+                harbor_job_dir=str(job_path),
+                harbor_stdout=stdout,
+                harbor_stderr=stderr,
+                metadata={"model_config": self._model_config_metadata(agent_config)},
+            )
+
         trial_results = job_result.get("trial_results") or []
         if not trial_results:
             trial_results = self._load_trial_results_from_subdirs(job_path)

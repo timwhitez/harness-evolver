@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -104,8 +105,11 @@ def test_guard_convergence_audit_discovers_fixed_eval_state_reports(tmp_path):
 
 
 def test_guard_convergence_cli_json_is_machine_readable(tmp_path):
-    report_path = tmp_path / "fixed-eval-report.json"
-    report_path.write_text(json.dumps({"score_history": [{"score": 0.5}]}))
+    fixture_root = tmp_path / "task-13"
+    fixture_root.mkdir()
+    report_path = fixture_root / "fixed-eval-report.json"
+    fake_key = "sk-" + "fixtureSecretForCliOutput12345"
+    report_path.write_text(json.dumps({"score_history": [{"score": 0.5}], "api_key": fake_key}))
 
     completed = subprocess.run(
         [
@@ -124,7 +128,9 @@ def test_guard_convergence_cli_json_is_machine_readable(tmp_path):
     assert payload["schema_version"] == 1
     assert payload["fixed_eval"]["valid"] is True
     assert payload["guard_budget"]["valid"] is True
-    assert "sk-" not in completed.stdout
+    assert "task-13" in completed.stdout
+    assert fake_key not in completed.stdout
+    assert re.search(r"sk-[A-Za-z0-9]{16,}", completed.stdout) is None
 
 
 def test_run_campaign_guard_convergence_dry_run_uses_fixed_eval(tmp_path):

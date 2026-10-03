@@ -7,6 +7,7 @@ from types import MethodType
 
 from bench.harbor_adapter import HarborFileEditTool, HarborFileWriteTool
 from harness.tools.base import ToolResult
+from tests.test_harbor_identity_publication import _response
 
 
 def _guard(self: object, *args: object, **kwargs: object) -> tuple[str, None]:
@@ -109,7 +110,7 @@ def test_valid_utf8_append_builds_one_complete_atomic_payload() -> None:
             return _success_with_snapshot("旧内容".encode("utf-8"))
         return ToolResult(
             success=True,
-            output="write complete\ndirectory_synced=1\n",
+            output=_response(),
             error="",
             metadata={"exit_code": 0},
         )

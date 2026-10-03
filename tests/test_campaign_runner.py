@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
+
 from tests.infra_fixtures import finalized_infra_metadata
 
 from hl.goals import GoalStore
@@ -1210,7 +1212,7 @@ def test_master_and_codex_loop_limit_values_are_not_runtime_timeouts():
     assert "infra_retry_delay_runtime_wait_condition\"] = False" in harbor_source
     assert "infra_retry_delay_wait_executed\"] = False" in harbor_source
 
-    assert "process.wait(timeout=" not in agent_source
+    assert_worker_waits_are_cleanup_only(agent_source)
     assert '"max_turns_audit": self.max_turns_audit' in agent_source
     assert '"max_turns": self.max_turns' not in agent_source
 
@@ -1330,7 +1332,7 @@ def test_worker_master_and_sub_agent_sources_have_no_time_round_attempt_caps():
         (REPO_ROOT / path).read_text()
         for path in ("bench/agent.py", "bench/_agent_bridge.py")
     )
-    assert "process.wait(timeout=" not in agent_source
+    assert_worker_waits_are_cleanup_only(agent_source)
     assert '"max_turns_audit": self.max_turns_audit' in agent_source
     assert '"max_turns": self.max_turns' not in agent_source
 
@@ -1452,7 +1454,6 @@ def test_agent_loop_sources_have_no_time_round_attempt_or_cap_stop_paths():
             "def _cap(",
         ),
         "worker_python": (
-            "process.wait(timeout=",
             '"max_turns": self.max_turns',
         ),
         "worker_rust": (
@@ -1464,6 +1465,8 @@ def test_agent_loop_sources_have_no_time_round_attempt_or_cap_stop_paths():
             "round_limit",
         ),
     }
+    assert_worker_waits_are_cleanup_only(sources["worker_python"])
+
     for scope, forbidden in forbidden_by_scope.items():
         source = sources[scope]
         if scope == "worker_rust":
@@ -2403,16 +2406,20 @@ roles:
             )
 
     monkeypatch.setattr("bench.harbor.HarborRunner", FakeHarborRunner)
-    monkeypatch.setattr(
-        run_trial,
-        "_run_network_preflight",
-        lambda args, *, blocking=False: run_trial.NetworkPreflightResult(
-            returncode=124,
-            stdout='{"ok": false}',
-            stderr="timed out",
+    # main is re-exported by the facade: patch the function's defining module.
+    owner = sys.modules[run_trial.main.__module__]
+    preflight_calls = []
+    def fake_preflight(args, *, blocking=False):
+        preflight_calls.append(blocking)
+        return run_trial.NetworkPreflightResult(
+            returncode=124, stdout='{"ok": false}', stderr="timed out",
             command=[sys.executable, "scripts/network_preflight.py"],
-        ),
-    )
+        )
+    monkeypatch.setattr(owner, "_run_network_preflight", fake_preflight)
+    def unexpected_subprocess(*args, **kwargs):
+        pytest.fail("this preflight fixture must not start a real subprocess")
+    monkeypatch.setattr(owner.subprocess, "run", unexpected_subprocess)
+    monkeypatch.setenv("TEST_API_KEY", "test-secret")
     monkeypatch.setattr(
         sys,
         "argv",
@@ -2430,7 +2437,8 @@ roles:
     )
 
     assert run_trial.main() == 0
-    assert run_calls and run_calls[0]["task_id"] == "fix-git"
+    assert len(run_calls) == 1 and run_calls[0]["task_id"] == "fix-git"
+    assert preflight_calls == [False]
 
 
 def test_run_campaign_dry_run_exposes_learning_speed_policies(tmp_path):
