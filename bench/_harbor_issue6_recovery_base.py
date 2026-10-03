@@ -14,6 +14,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from bench.worker_metrics import harbor_worker_metrics
+
 from bench import _harbor_issue6_aggregate_base as _base
 
 for _name, _value in vars(_base).items():
@@ -238,8 +240,11 @@ class HarborRunner(_base.HarborRunner):
         )
         metadata = self._with_verifier_runtime_prepare_timeout_metadata(metadata)
 
+        metadata.update(harbor_worker_metrics(raw_attempt))
+
         return _base.TrialResult(
             trial_id=trial_name,
+            turn_count=metadata["turn_count"],
             task_id=task_name,
             task_domain=self._coerce_domain(raw_attempt),
             task_difficulty=self._coerce_difficulty(raw_attempt),

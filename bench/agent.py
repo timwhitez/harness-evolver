@@ -319,6 +319,7 @@ class HLAgent(_base.HLAgent):
                     raise WorkerProtocolError("Rust Worker event must be a JSON object")
                 event_type = event.get("type")
                 if event_type == "llm_request":
+                    self.turn_count += 1
                     self.messages = list(event.get("messages") or [])
                     try:
                         response = _base.litellm.completion(

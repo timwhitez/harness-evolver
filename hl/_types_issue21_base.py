@@ -126,6 +126,8 @@ class TrialResult(BaseModel):
     trajectory: list[dict[str, Any]] = Field(default_factory=list)
     error_log: list[str] = Field(default_factory=list)
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    # Rust model-request attempts; missing historical observations stay unknown.
+    turn_count: int | None = Field(default=None, ge=0, strict=True)
     wall_time_seconds: float = 0.0
     model_used: str = ""
     token_usage: dict[str, int] = Field(default_factory=dict)

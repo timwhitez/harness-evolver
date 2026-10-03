@@ -20,6 +20,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from bench.worker_metrics import harbor_worker_metrics
 from urllib.parse import urlparse
 
 from bench.trajectory import TrajectoryReader
@@ -1031,8 +1033,11 @@ class HarborRunner:
         )
         metadata = self._with_verifier_runtime_prepare_timeout_metadata(metadata)
 
+        metadata.update(harbor_worker_metrics(selected))
+
         return TrialResult(
             trial_id=trial_name,
+            turn_count=metadata["turn_count"],
             task_id=task_name,
             task_domain=self._coerce_domain(selected),
             task_difficulty=self._coerce_difficulty(selected),

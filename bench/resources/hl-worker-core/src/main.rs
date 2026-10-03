@@ -210,6 +210,8 @@ struct WorkerState {
     tool_schemas: Vec<Value>,
     trajectory: Vec<Value>,
     tool_call_history: Vec<Value>,
+    // Bootstrap is reported, but must not change model-loop policy history.
+    entrypoint_scan_tool_call: Option<Value>,
     token_usage: HashMap<String, i64>,
     usage_unknown: HashSet<String>,
     completion_blockers: Vec<String>,
@@ -600,6 +602,7 @@ impl WorkerState {
             tool_schemas: request.tool_schemas,
             trajectory: request.initial_trajectory,
             tool_call_history: Vec::new(),
+            entrypoint_scan_tool_call: None,
             token_usage: HashMap::new(),
             usage_unknown: HashSet::new(),
             completion_blockers: Vec::new(),
@@ -787,6 +790,11 @@ impl WorkerState {
             .to_string()
     }
 
+    fn reported_tool_calls(&self) -> Vec<Value> {
+        self.entrypoint_scan_tool_call.iter().cloned()
+            .chain(self.tool_call_history.iter().cloned()).collect()
+    }
+
     fn final_unverified_result(&self) -> Value {
         json!({
             "trial_id": self.task_id(),
@@ -795,7 +803,8 @@ impl WorkerState {
             "score": 0.0,
             "verified": false,
             "verifier_output": "Worker finished; Harbor/verifier evidence is still required.",
-            "tool_calls": self.tool_call_history,
+            "tool_calls": self.reported_tool_calls(),
+            "worker_metrics_schema": "worker_metrics_v1",
             "trajectory": self.trajectory,
             "model_used": self.model_used,
             "token_usage": self.reported_usage(),
@@ -813,7 +822,8 @@ impl WorkerState {
             "score": 0.0,
             "verified": false,
             "verifier_output": "Worker stopped before reliable Harbor verification.",
-            "tool_calls": self.tool_call_history,
+            "tool_calls": self.reported_tool_calls(),
+            "worker_metrics_schema": "worker_metrics_v1",
             "trajectory": self.trajectory,
             "model_used": self.model_used,
             "token_usage": self.reported_usage(),
@@ -845,7 +855,8 @@ impl WorkerState {
             "score": 0.0,
             "verified": false,
             "verifier_output": "Worker stopped before reliable Harbor verification because the model provider returned a terminal account-state error.",
-            "tool_calls": self.tool_call_history,
+            "tool_calls": self.reported_tool_calls(),
+            "worker_metrics_schema": "worker_metrics_v1",
             "trajectory": self.trajectory,
             "model_used": self.model_used,
             "token_usage": self.reported_usage(),
@@ -877,7 +888,8 @@ impl WorkerState {
             "score": 0.0,
             "verified": false,
             "verifier_output": "Worker returned a TerminalBench environment-unavailable error before reliable local verification; Harbor/outer-loop handling owns final classification.",
-            "tool_calls": self.tool_call_history,
+            "tool_calls": self.reported_tool_calls(),
+            "worker_metrics_schema": "worker_metrics_v1",
             "trajectory": self.trajectory,
             "model_used": self.model_used,
             "token_usage": self.reported_usage(),
@@ -2104,11 +2116,30 @@ fn bounded_entrypoint_scan(stdin: &mut impl BufRead, state: &mut WorkerState) ->
             metadata: json!({}),
         },
     };
+    state.entrypoint_scan_tool_call = Some(json!({
+        "id": "entrypoint-scan",
+        "phase": "bootstrap",
+        "turn": 0,
+        "tool": "bash",
+        "args": args,
+        "success": result.success,
+        "output": truncate(&result.output, 2000),
+        "error": result.error,
+        "duration_ms": result.duration_ms,
+        "metadata": result.metadata,
+    }));
     state.append_trajectory(json!({
         "type": "entrypoint_scan",
+        "id": "entrypoint-scan",
+        "phase": "bootstrap",
+        "turn": 0,
+        "tool": "bash",
+        "args": args,
         "success": result.success,
         "output": truncate(&result.output, 4000),
         "error": result.error,
+        "duration_ms": result.duration_ms,
+        "metadata": result.metadata,
         "operation_timeout_seconds_audit_only": 15,
         "entrypoint_scan_loop_stop_condition": false,
         "master_loop_stop_condition": false,
@@ -28310,6 +28341,38 @@ mod tests {
             },
             prompt_policy: PromptPolicy::default(),
         })
+    }
+
+    #[test]
+    fn bootstrap_reporting_preserves_policy_history_and_all_final_paths() {
+        let mut state = worker_state_for_unit_tests();
+        state.tool_schemas = vec![json!({"function": {"name": "bash"}})];
+        let mut stdin = io::Cursor::new(b"{\"type\":\"tool_response\",\"payload\":{\"success\":true,\"output\":\"fixture\",\"duration_ms\":3,\"metadata\":{\"spy\":true}}}\n");
+        bounded_entrypoint_scan(&mut stdin, &mut state);
+        assert!(state.tool_call_history.is_empty());
+        assert_eq!(state.turn_count, 0);
+        assert_eq!(state.reported_tool_calls().len(), 1);
+        assert_eq!(state.reported_tool_calls()[0]["phase"], "bootstrap");
+        let error = LlmError { error_type: "AuthenticationError".into(),
+            message: "Invalid API key".into(), kind: "provider_error".into() };
+        let terminal = terminal_provider_error(&error).unwrap();
+        for final_result in [state.final_unverified_result(),
+            state.error_result("fixture".into(), json!({})),
+            state.terminal_provider_error_result(&error, &terminal),
+            state.terminal_environment_unavailable_result("bash", "fixture")] {
+            assert_eq!(final_result["tool_calls"].as_array().unwrap().len(), 1);
+            assert_eq!(final_result["turn_count"], 0);
+            assert_eq!(final_result["score"], 0.0);
+            assert_eq!(final_result["verified"], false);
+        }
+        let mut invalid = worker_state_for_unit_tests();
+        invalid.tool_schemas = state.tool_schemas.clone();
+        bounded_entrypoint_scan(&mut io::Cursor::new(b"invalid\n"), &mut invalid);
+        assert_eq!(invalid.reported_tool_calls()[0]["success"], false);
+        assert!(invalid.tool_call_history.is_empty());
+        let mut absent = worker_state_for_unit_tests();
+        bounded_entrypoint_scan(&mut io::Cursor::new(b""), &mut absent);
+        assert!(absent.reported_tool_calls().is_empty());
     }
 
     #[test]

@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import litellm
 from bench.usage import normalize_worker_usage, USAGE_SCHEMA
+from bench.worker_metrics import valid_turn_count, worker_metrics_metadata
 
 from harness.config import HarnessConfig, RoleModelConfig
 from harness.tools.registry import ToolRegistry
@@ -53,6 +54,7 @@ class HLAgent:
     max_turns_audit: int = 0
     messages: list[dict[str, Any]] = field(default_factory=list)
     turn_count: int = 0
+    _model_requests_observed: bool = field(default=False, init=False, repr=False)
     tool_call_history: list[dict[str, Any]] = field(default_factory=list)
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     token_usage: dict[str, int] = field(default_factory=dict)
@@ -164,11 +166,13 @@ class HLAgent:
                     "Rust Worker core failed before reliable Harbor verification."
                 ),
                 tool_calls=self.tool_call_history,
+                turn_count=self.turn_count,
                 trajectory=self.trajectory,
                 model_used=self._model_name(),
                 token_usage=self.token_usage,
                 error_log=[f"Rust Worker core failed: {exc}"],
-                metadata={"rust_worker_core_error": True},
+                metadata={"rust_worker_core_error": True, **worker_metrics_metadata(
+                    self.turn_count, "partial")},
             )
 
     def cancel_current_run(self, reason: str = "cancelled") -> None:
@@ -194,6 +198,7 @@ class HLAgent:
         task_context: dict[str, Any],
     ) -> None:
         self.turn_count = 0
+        self._model_requests_observed = True
         self.messages = []
         self.tool_call_history = []
         self.trajectory = []
@@ -236,6 +241,7 @@ class HLAgent:
                 event = json.loads(line)
                 event_type = event.get("type")
                 if event_type == "llm_request":
+                    self.turn_count += 1
                     self.messages = list(event.get("messages") or [])
                     try:
                         response = litellm.completion(
@@ -560,9 +566,14 @@ class HLAgent:
         task_context: dict[str, Any],
     ) -> TrialResult:
         self.messages = list(payload.get("messages") or self.messages)
-        self.turn_count = int(payload.get("turn_count") or self.turn_count)
-        self.tool_call_history = list(payload.get("tool_calls") or [])
-        self.trajectory = list(payload.get("trajectory") or self.trajectory)
+        turn_count = (valid_turn_count(payload["turn_count"]) if "turn_count" in payload
+                      else self.turn_count if self._model_requests_observed else None)
+        if turn_count is not None:
+            self.turn_count = turn_count
+        if "tool_calls" in payload:
+            self.tool_call_history = list(payload.get("tool_calls") or [])
+        if "trajectory" in payload:
+            self.trajectory = list(payload.get("trajectory") or [])
         self.token_usage = {
             str(key): int(value)
             for key, value in dict(payload.get("token_usage") or {}).items()
@@ -577,6 +588,11 @@ class HLAgent:
         observations = [event for event in self.trajectory
                         if event.get("type") == "token_usage_observation"]
         metadata = dict(payload.get("metadata") or {})
+        native_metrics = payload.get("worker_metrics_schema") == "worker_metrics_v1"
+        metadata.update(worker_metrics_metadata(turn_count,
+            ("complete" if turn_count is not None and isinstance(payload.get("tool_calls"), list)
+             else "partial") if native_metrics else "legacy" if turn_count is not None else "unknown",
+            "worker_metrics_v1" if native_metrics else "legacy"))
         metadata["token_usage_observation"] = {
             "schema": USAGE_SCHEMA if observations and all(
                 event.get("schema") == USAGE_SCHEMA for event in observations
@@ -599,6 +615,7 @@ class HLAgent:
             verified=bool(payload.get("verified", False)),
             verifier_output=str(payload.get("verifier_output") or ""),
             tool_calls=self.tool_call_history,
+            turn_count=turn_count,
             trajectory=self.trajectory,
             model_used=str(payload.get("model_used") or self._model_name()),
             token_usage=self.token_usage,
@@ -758,6 +775,11 @@ class HLAgent:
     def _append_trajectory(self, event: dict[str, Any]) -> None:
         """Record one trajectory event and opportunistically persist it live."""
         self.trajectory.append(event)
+        if event.get("type") in {"tool_call", "completion_verification", "entrypoint_scan"} \
+                and {"tool", "args", "success"} <= event.keys():
+            outcome = {key: value for key, value in event.items() if key != "type"}
+            outcome["output"] = _truncate(str(outcome.get("output") or ""), 2000)
+            self.tool_call_history.append(outcome)
         if self.trajectory_event_sink is None:
             return
         try:

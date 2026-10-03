@@ -1537,7 +1537,10 @@ class HLWorkerHarborAgent(BaseAgent):
         context.metadata = {
             "worker_status": result.status.value,
             "worker_verified": result.verified,
-            "turn_count": agent.turn_count,
+            "turn_count": result.turn_count,
+            "worker_metrics_observation": result.metadata.get("worker_metrics_observation", {
+                "schema": "legacy", "status": "unknown",
+            }),
             "tool_calls": len(result.tool_calls),
             "model": result.model_used,
             "max_turns_audit_only": self.max_turns_audit,
