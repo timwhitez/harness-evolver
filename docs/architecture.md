@@ -236,6 +236,18 @@ existing trajectory format; it does not reconstruct a missing tool history. Toke
 usage remains independently optional, and none of these counters changes
 score, verified status, or Harbor/verifier evidence requirements.
 
+Harbor coroutine cancellation saves the bridge's observed counter and completed
+outcomes immediately in context metadata and a `worker_metrics_snapshot` trajectory
+event, marked `partial`. It does not await an in-flight Python model/tool call.
+A late result can refine this observation only for the same adapter run UUID and
+exact task ID, still as partial; stale callbacks and trajectory sinks cannot
+overwrite a subsequent run. Missing or malformed top-level job JSON with one
+exact surviving trial enriches only Worker metrics while keeping the inherited
+score, status, and verifier decision. Cross-record task identity rules still apply.
+Cancellation intent is armed before the executor starts and checked after command
+resolution, after process registration, and before processing further bridge events;
+an early cancellation cannot resume model/tool dispatch when setup later finishes.
+
 Worker usage schema `worker_usage_v1_exclusive_input` defines `input` as
 non-cache-hit input, `cache` as cache-hit input, and `output` as generated
 tokens. The Python/LiteLLM boundary subtracts the known cached subset from

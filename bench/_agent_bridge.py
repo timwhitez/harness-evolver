@@ -17,7 +17,7 @@ import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Callable
 
 import litellm
@@ -67,6 +67,7 @@ class HLAgent:
         repr=False,
     )
     _process_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _run_cancellation: Event | None = field(default=None, init=False, repr=False)
 
     # Policy knobs forwarded to the Rust core. They remain configurable from
     # Python/Harbor while Rust owns the Worker loop decisions.
@@ -144,8 +145,13 @@ class HLAgent:
     def run(self, task_instruction: str, task_context: dict[str, Any]) -> TrialResult:
         """Execute a TerminalBench task through the Rust Worker core."""
 
+        with self._process_lock:
+            if self._run_cancellation is None:
+                self._run_cancellation = Event()
+            cancellation = self._run_cancellation
         self._initialize_run_state(task_instruction, task_context)
         try:
+            self._raise_if_cancelled()
             return self._run_rust_core(task_instruction, task_context)
         except Exception as exc:
             self._append_trajectory(
@@ -174,11 +180,28 @@ class HLAgent:
                 metadata={"rust_worker_core_error": True, **worker_metrics_metadata(
                     self.turn_count, "partial")},
             )
+        finally:
+            with self._process_lock:
+                if self._run_cancellation is cancellation:
+                    self._run_cancellation = None
+
+    def _prepare_run_cancellation(self) -> None:
+        """Arm Harbor cancellation before its executor thread can start."""
+        with self._process_lock:
+            self._run_cancellation = Event()
+
+    def _raise_if_cancelled(self) -> None:
+        with self._process_lock:
+            cancelled = self._run_cancellation is not None and self._run_cancellation.is_set()
+        if cancelled:
+            raise RuntimeError("Rust Worker run was cancelled")
 
     def cancel_current_run(self, reason: str = "cancelled") -> None:
         """Terminate the active Rust Worker process after Harbor cancels a trial."""
 
         with self._process_lock:
+            if self._run_cancellation is not None:
+                self._run_cancellation.set()
             process = self._active_process
         if process is None:
             return
@@ -211,8 +234,10 @@ class HLAgent:
         task_instruction: str,
         task_context: dict[str, Any],
     ) -> TrialResult:
+        command = self._rust_worker_command()
+        self._raise_if_cancelled()
         process = subprocess.Popen(
-            self._rust_worker_command(),
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -226,6 +251,7 @@ class HLAgent:
             self._active_process = process
 
         try:
+            self._raise_if_cancelled()
             self._write_bridge_event(
                 process,
                 {
@@ -239,6 +265,7 @@ class HLAgent:
                 if not line.strip():
                     continue
                 event = json.loads(line)
+                self._raise_if_cancelled()
                 event_type = event.get("type")
                 if event_type == "llm_request":
                     self.turn_count += 1

@@ -68,9 +68,9 @@ class HarborRunner(_base.HarborRunner):
             and self._trial_result_matches_task(result, task_id)
         ]
         if len(matching) <= 1:
-            # Preserve the inherited single-attempt/error behavior. This PR only
-            # changes the multi-attempt data-loss case from Issue #6.
-            return super().parse_job_dir(
+            # Keep inherited evidence/status decisions; enrich only the Worker
+            # observation when one surviving artifact has an exact identity.
+            result = super().parse_job_dir(
                 job_path,
                 task_id=task_id,
                 returncode=returncode,
@@ -79,6 +79,11 @@ class HarborRunner(_base.HarborRunner):
                 wall_time=wall_time,
                 agent_config=agent_config,
             )
+            exact = self._matching_trial_results(trial_results, task_id)
+            if len(exact) == 1:
+                result.metadata.update(harbor_worker_metrics(exact[0]))
+                result.turn_count = result.metadata["turn_count"]
+            return result
 
         ordered_raw = sorted(matching, key=self._attempt_sort_key)
         status_counts = self._job_status_counts({}, trial_results)
