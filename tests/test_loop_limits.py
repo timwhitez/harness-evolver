@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from pathlib import Path
 
+from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
+
 from hl.loop_limits import (
     disallowed_limit_terminal_reasons,
     is_limit_terminal_reason,
@@ -1271,7 +1273,6 @@ def test_loop_owner_sources_do_not_reintroduce_limit_control_flow() -> None:
             "snapshots[:cap]",
         ),
         "worker_python": (
-            "process.wait(timeout=",
             '"max_turns": self.max_turns',
         ),
         "worker_rust_loop": (
@@ -1329,6 +1330,8 @@ def test_loop_owner_sources_do_not_reintroduce_limit_control_flow() -> None:
         "retry_strategy": retry_source,
         "task_catalog": task_catalog_source,
     }
+
+    assert_worker_waits_are_cleanup_only(agent_source)
 
     for scope, snippets in forbidden_by_scope.items():
         source = sources[scope]

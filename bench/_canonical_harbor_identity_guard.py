@@ -225,6 +225,18 @@ class HarborFileWriteTool(_base.HarborFileWriteTool):
         return _Snapshot(present, text, dev, ino, digest), None
 
     def execute(self, file_path: str, content: str, append: bool = False, **kwargs: Any) -> _v2.ToolResult:
+        # Content-only overwrite denials need no environment execution. Keep
+        # canonical and composed-content checks below for permitted writes.
+        if not append:
+            staged_reason = _v2.staged_dependency_script_reason(file_path, content)
+            if staged_reason:
+                return _v2.ToolResult(success=False, output="", error=f"Worker file policy blocked write: {staged_reason}",
+                    metadata=_v2.policy_guard_metadata("staged_dependency_script_guard"))
+            size_reason = _v2.deliverable_size_cap_write_reason(file_path, content)
+            if size_reason:
+                return _v2.ToolResult(success=False, output="", error=f"Worker file policy blocked write: {size_reason}",
+                    metadata=_v2.policy_guard_metadata("deliverable_size_cap_write_guard", path=file_path,
+                        content_bytes=len(content.encode("utf-8")), limit_bytes=5000))
         resolved, failure = self._guard_environment_path(file_path, operation="write", must_exist=False)
         if failure is not None:
             return failure

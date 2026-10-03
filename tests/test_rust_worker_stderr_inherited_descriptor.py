@@ -55,6 +55,8 @@ def test_worker_exit_does_not_wait_for_descendant_to_close_stderr(
                 "sys.stdin.readline()",
                 "child = os.fork()",
                 "if child == 0:",
+                "    os.close(0)",
+                "    os.close(1)",
                 "    time.sleep(30)",
                 "    os._exit(0)",
                 f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(child))",
@@ -79,20 +81,20 @@ def test_worker_exit_does_not_wait_for_descendant_to_close_stderr(
     )
     thread.start()
 
-    deadline = time.monotonic() + 5
-    while not descendant_pid_path.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert descendant_pid_path.exists(), "worker did not create its descendant"
-
-    thread.join(timeout=3)
-    completed_without_descendant_eof = not thread.is_alive()
-
-    descendant_pid = int(descendant_pid_path.read_text())
     try:
-        os.kill(descendant_pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    thread.join(timeout=5)
+        deadline = time.monotonic() + 5
+        while not descendant_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert descendant_pid_path.exists(), "worker did not create its descendant"
+        thread.join(timeout=3)
+        completed_without_descendant_eof = not thread.is_alive()
+    finally:
+        if descendant_pid_path.exists():
+            try:
+                os.kill(int(descendant_pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        thread.join(timeout=5)
 
     assert completed_without_descendant_eof, (
         "bridge remained blocked until the inherited stderr descriptor reached EOF"

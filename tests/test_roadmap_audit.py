@@ -1,16 +1,20 @@
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 
 def test_roadmap_audit_reports_real_evidence_without_claiming_complete(tmp_path):
+    tmp_path = tmp_path / "task-13"
+    fake_key = "sk-" + "fixtureSecretForCliOutput12345"
     memory = tmp_path / "trials"
     trial_dir = memory / "runs" / "fix-git__pass"
     trial_dir.mkdir(parents=True)
     (trial_dir / "result.json").write_text(
         json.dumps(
             {
+                "api_key": fake_key,
                 "trial_id": "fix-git__pass",
                 "task_id": "fix-git",
                 "status": "passed",
@@ -68,7 +72,9 @@ def test_roadmap_audit_reports_real_evidence_without_claiming_complete(tmp_path)
     assert by_id["phase3.real_codex_update"]["status"] == "missing"
     assert by_id["phase7.campaign_scale_evidence"]["status"] == "missing"
     assert payload["roadmap_complete"] is False
-    assert "sk-" not in completed.stdout
+    assert "task-13" in completed.stdout
+    assert fake_key not in completed.stdout
+    assert re.search(r"sk-[A-Za-z0-9]{16,}", completed.stdout) is None
 
 
 def test_roadmap_audit_strict_fails_when_runtime_evidence_is_missing(tmp_path):

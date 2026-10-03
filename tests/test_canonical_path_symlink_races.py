@@ -68,9 +68,11 @@ def test_local_atomic_write_fails_closed_on_exchange_symlink_race(
     secret.write_text("classified\n", encoding="utf-8")
     real_renameat2 = safe_path_io._renameat2
     swapped = False
+    exchanges = []
 
     def racing_renameat2(parent_fd, source, destination, flags):
         nonlocal swapped
+        exchanges.append(flags)
         if (
             not swapped
             and destination == target.name
@@ -87,9 +89,18 @@ def test_local_atomic_write_fails_closed_on_exchange_symlink_race(
 
     assert swapped is True
     assert result.success is False
-    assert target.is_symlink() is True
+    # RENAME_EXCHANGE is not inode-CAS: candidate bytes can be visible, and
+    # exchange-back could erase a newer writer. Preserve recovery evidence.
+    assert exchanges == [safe_path_io._RENAME_EXCHANGE]
+    assert result.metadata["publication_state"] == "indeterminate"
+    assert result.metadata["atomic_replace"] is None
+    assert result.metadata["no_auto_retry"] is True
+    assert target.read_text(encoding="utf-8") == "new\n"
     assert secret.read_text(encoding="utf-8") == "classified\n"
-    assert list(workspace.glob(".victim.txt.tmp-*")) == []
+    recovery = [workspace / name for name in result.metadata["recovery_entries"]]
+    assert len(recovery) == 2 and all(path.exists() for path in recovery)
+    assert any(path.is_symlink() and path.resolve() == secret for path in recovery)
+    assert any(path.suffix == ".intent" for path in recovery)
 
 
 def test_harbor_secure_read_rejects_post_authorization_symlink(tmp_path: Path) -> None:

@@ -58,15 +58,23 @@ def test_secure_harbor_new_file_uses_process_umask(tmp_path: Path) -> None:
 def test_secure_harbor_fsync_failure_keeps_old_target(tmp_path: Path) -> None:
     target = tmp_path / "target.txt"
     target.write_text("old", encoding="utf-8")
-    failing = hardlink._v3._SECURE_ATOMIC_WRITE.replace(
-        "            os.fsync(descriptor)",
-        "            raise OSError('injected fsync failure')",
-        1,
-    )
-    assert failing != hardlink._v3._SECURE_ATOMIC_WRITE
+    # Fault the real syscall at the candidate-payload stage; do not depend on
+    # indentation/text of the old pre-consolidation atomic implementation.
+    failing = """import os,sys
+_real_fsync = os.fsync
+def fail_payload_sync(descriptor):
+    if os.readlink(f'/proc/self/fd/{descriptor}').endswith('.data'):
+        print('FIXTURE_PAYLOAD_FSYNC_REACHED', file=sys.stderr)
+        raise OSError('injected fsync failure')
+    return _real_fsync(descriptor)
+os.fsync = fail_payload_sync
+""" + hardlink._v3._SECURE_ATOMIC_WRITE
 
     completed = _run(failing, target, b"new")
 
     assert completed.returncode != 0
+    assert "FIXTURE_PAYLOAD_FSYNC_REACHED" in completed.stderr
+    assert '"publication_error": "injected fsync failure"' in completed.stdout
+    assert '"publication_state": "not_published"' in completed.stdout
     assert target.read_text(encoding="utf-8") == "old"
-    assert list(tmp_path.glob(".target.txt.tmp-*")) == []
+    assert list(tmp_path.glob(".hl-publish-*")) == []

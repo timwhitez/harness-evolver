@@ -34,6 +34,23 @@ downloaded reference material.
 6. Commit one coherent, validated change. Keep unrelated cleanup and generated
    files out of the commit.
 
+## Offline test contracts
+
+Patch a re-exported entry point in its defining module (for example,
+`sys.modules[main.__module__]`), and fail unexpected subprocess calls in network
+fixtures. A timeout result can be simulated without launching a real preflight.
+
+Worker task loops have no time, round, or attempt budget. Bounded process waits
+are permitted for cancellation/error cleanup, and terminal stdout EOF handling
+has its own bounded protocol deadline. Test those scopes separately; a descendant
+holding stderr must not accidentally also hold stdout in a stderr-only fixture.
+
+Publication tests should inject faults at actual syscall boundaries and provide
+versioned publication receipts. After an exchange race, preserve indeterminate
+recovery evidence rather than requiring destructive rollback. Non-object Harbor
+job JSON is a structured error; singleton metric recovery cannot verify a pass.
+Existing multi-attempt recovery still requires independent verifier evidence.
+
 ## Configuration and artifacts
 
 Use .env.local and config/local.yaml for credentials, private endpoints,

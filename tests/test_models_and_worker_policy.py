@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
+
 from bench.agent import HLAgent
 from harness.config import ModelsConfig, RoleModelConfig
 from harness.context.isolation import ContextIsolation
@@ -294,8 +296,8 @@ def test_python_agent_boundary_does_not_timeout_rust_worker_shutdown():
     agent_source = Path(__file__).resolve().parents[1] / "bench" / "agent.py"
     text = agent_source.read_text()
 
-    assert "process.wait(timeout=" not in text
-    assert "return_code = process.wait()" in text
+    assert_worker_waits_are_cleanup_only(text)
+    assert "return_code = stdout.finish()" in text
 
 
 def test_python_agent_cancel_current_run_terminates_active_rust_worker(
