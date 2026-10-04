@@ -222,7 +222,7 @@ their previous meaning.
 
 `TrialResult.tool_calls` contains logical tool outcomes, including failures,
 local argument/policy rejections, internal completion verification, and one
-actual bounded entrypoint scan when bash is available. It is not a physical
+bootstrap scan request outcome when bash is available. It is not a physical
 dispatch count. The scan has `phase=bootstrap` and is reported separately from
 the model-loop policy history, preserving checkpoint and completion behavior.
 It still has one `entrypoint_scan` trajectory event. Valid final results replace
@@ -235,6 +235,12 @@ their turn counter is known. Harbor retains the counter/observation and the
 existing trajectory format; it does not reconstruct a missing tool history. Token
 usage remains independently optional, and none of these counters changes
 score, verified status, or Harbor/verifier evidence requirements.
+
+The bootstrap producer requests bounded `pwd`, `ls`, and `find . -maxdepth 2`
+discovery in the current task workspace. It does not request discovery of hidden
+verifier paths. Default and Harbor shell tools authorize the entire command
+before execution. A denied bootstrap request remains one failed logical outcome
+with its policy error; its presence in history does not prove execution.
 
 Harbor coroutine cancellation saves the bridge's observed counter and completed
 outcomes immediately in context metadata and a `worker_metrics_snapshot` trajectory
