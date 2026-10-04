@@ -791,8 +791,11 @@ impl WorkerState {
     }
 
     fn reported_tool_calls(&self) -> Vec<Value> {
-        self.entrypoint_scan_tool_call.iter().cloned()
-            .chain(self.tool_call_history.iter().cloned()).collect()
+        self.entrypoint_scan_tool_call
+            .iter()
+            .cloned()
+            .chain(self.tool_call_history.iter().cloned())
+            .collect()
     }
 
     fn final_unverified_result(&self) -> Value {
@@ -935,24 +938,49 @@ impl WorkerState {
     fn accumulate_usage(&mut self, usage: &Value, observation: &Value) {
         let canonical = observation.get("schema").and_then(Value::as_str)
             == Some("worker_usage_v1_exclusive_input")
-            || ["input", "cache", "output"].iter().any(|key| usage.get(key).is_some());
-        let mut diagnostics: Vec<String> = observation.get("diagnostics")
-            .and_then(Value::as_array).into_iter().flatten()
-            .filter_map(Value::as_str).map(str::to_string).collect();
+            || ["input", "cache", "output"]
+                .iter()
+                .any(|key| usage.get(key).is_some());
+        let mut diagnostics: Vec<String> = observation
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
         let mut counts = HashMap::new();
         let aliases: [(&str, &[&str]); 3] = if canonical {
-            [("input", &["input"]), ("cache", &["cache"]), ("output", &["output"])]
+            [
+                ("input", &["input"]),
+                ("cache", &["cache"]),
+                ("output", &["output"]),
+            ]
         } else {
-            [("input", &["prompt_tokens", "input_tokens"]),
-             ("cache", &["cache_read_input_tokens"]),
-             ("output", &["completion_tokens", "output_tokens"])]
+            [
+                ("input", &["prompt_tokens", "input_tokens"]),
+                ("cache", &["cache_read_input_tokens"]),
+                ("output", &["completion_tokens", "output_tokens"]),
+            ]
         };
-        let mixed = canonical && ["prompt_tokens", "input_tokens", "cache_read_input_tokens",
-            "completion_tokens", "output_tokens"].iter().any(|key| usage.get(key).is_some());
+        let mixed = canonical
+            && [
+                "prompt_tokens",
+                "input_tokens",
+                "cache_read_input_tokens",
+                "completion_tokens",
+                "output_tokens",
+            ]
+            .iter()
+            .any(|key| usage.get(key).is_some());
         for (key, names) in aliases {
             let values: Vec<&Value> = names.iter().filter_map(|name| usage.get(name)).collect();
-            if mixed || values.iter().any(|value| value.as_i64().map_or(true, |n| n < 0))
-                || values.windows(2).any(|pair| pair[0] != pair[1]) {
+            if mixed
+                || values
+                    .iter()
+                    .any(|value| value.as_i64().map_or(true, |n| n < 0))
+                || values.windows(2).any(|pair| pair[0] != pair[1])
+            {
                 diagnostics.push(format!("invalid_or_conflicting_{key}"));
             } else if let Some(value) = values.first().and_then(|value| value.as_i64()) {
                 counts.insert(key.to_string(), value);
@@ -964,8 +992,10 @@ impl WorkerState {
                 && usage.get("cache_read_input_tokens").is_some();
             match (counts.get("input").copied(), counts.get("cache").copied()) {
                 (Some(input), Some(_)) if raw_anthropic => {
-                    let creation = usage.get("cache_creation_input_tokens")
-                        .map_or(Some(0), Value::as_i64).filter(|value| *value >= 0);
+                    let creation = usage
+                        .get("cache_creation_input_tokens")
+                        .map_or(Some(0), Value::as_i64)
+                        .filter(|value| *value >= 0);
                     if let Some(total) = creation.and_then(|value| input.checked_add(value)) {
                         counts.insert("input".into(), total);
                     } else {
@@ -1009,8 +1039,11 @@ impl WorkerState {
     }
 
     fn reported_usage(&self) -> HashMap<String, i64> {
-        self.token_usage.iter().filter(|(key, _)| !self.usage_unknown.contains(*key))
-            .map(|(key, value)| (key.clone(), *value)).collect()
+        self.token_usage
+            .iter()
+            .filter(|(key, _)| !self.usage_unknown.contains(*key))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
     }
 
     fn todos_block_completion(&self) -> bool {
@@ -1159,9 +1192,15 @@ impl WorkerState {
         }
         let original = self.messages.clone();
         // The first system/task messages and every other system instruction survive.
-        self.messages = original.iter().enumerate().filter(|(index, message)| {
-            *index < 2 || message.get("name").and_then(Value::as_str) != Some("worker_context_state")
-        }).map(|(_, message)| message.clone()).collect();
+        self.messages = original
+            .iter()
+            .enumerate()
+            .filter(|(index, message)| {
+                *index < 2
+                    || message.get("name").and_then(Value::as_str) != Some("worker_context_state")
+            })
+            .map(|(_, message)| message.clone())
+            .collect();
         let mut work_state = json!({
             "todos": self.todo_items,
             "completion_blockers": self.completion_blockers,
@@ -1176,8 +1215,12 @@ impl WorkerState {
             "pending_post_verification_todo_finalization_turn": self.pending_post_verification_todo_finalization_turn,
         });
         if let Some(fields) = work_state.as_object_mut() {
-            fields.retain(|_, value| !value.is_null() && value.as_u64() != Some(0)
-                && value.as_str() != Some("") && !value.as_array().is_some_and(Vec::is_empty));
+            fields.retain(|_, value| {
+                !value.is_null()
+                    && value.as_u64() != Some(0)
+                    && value.as_str() != Some("")
+                    && !value.as_array().is_some_and(Vec::is_empty)
+            });
             if !fields.is_empty() {
                 self.messages.insert(self.messages.len().min(2), json!({
                     "role": "system", "name": "worker_context_state",
@@ -1231,12 +1274,15 @@ fn completed_message_unit_end(messages: &[Value], start: usize) -> Option<usize>
             };
             let mut ids = HashSet::new();
             for call in calls {
-                if !ids.insert(call.get("id")?.as_str()?) { return None; }
+                if !ids.insert(call.get("id")?.as_str()?) {
+                    return None;
+                }
             }
             let end = start + 1 + ids.len();
             for result in messages.get(start + 1..end)? {
                 if result.get("role").and_then(Value::as_str) != Some("tool")
-                    || !ids.remove(result.get("tool_call_id")?.as_str()?) {
+                    || !ids.remove(result.get("tool_call_id")?.as_str()?)
+                {
                     return None;
                 }
             }
@@ -1247,9 +1293,11 @@ fn completed_message_unit_end(messages: &[Value], start: usize) -> Option<usize>
 }
 
 fn context_overflow_error(error: &LlmError) -> bool {
-    error.kind == "context_overflow" || error.error_type == "ContextWindowExceededError"
+    error.kind == "context_overflow"
+        || error.error_type == "ContextWindowExceededError"
         || ["context_length_exceeded", "context_window_exceeded"]
-            .iter().any(|code| error.message.contains(code))
+            .iter()
+            .any(|code| error.message.contains(code))
 }
 
 fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
@@ -28341,13 +28389,18 @@ mod tests {
         assert_eq!(state.turn_count, 0);
         assert_eq!(state.reported_tool_calls().len(), 1);
         assert_eq!(state.reported_tool_calls()[0]["phase"], "bootstrap");
-        let error = LlmError { error_type: "AuthenticationError".into(),
-            message: "Invalid API key".into(), kind: "provider_error".into() };
+        let error = LlmError {
+            error_type: "AuthenticationError".into(),
+            message: "Invalid API key".into(),
+            kind: "provider_error".into(),
+        };
         let terminal = terminal_provider_error(&error).unwrap();
-        for final_result in [state.final_unverified_result(),
+        for final_result in [
+            state.final_unverified_result(),
             state.error_result("fixture".into(), json!({})),
             state.terminal_provider_error_result(&error, &terminal),
-            state.terminal_environment_unavailable_result("bash", "fixture")] {
+            state.terminal_environment_unavailable_result("bash", "fixture"),
+        ] {
             assert_eq!(final_result["tool_calls"].as_array().unwrap().len(), 1);
             assert_eq!(final_result["turn_count"], 0);
             assert_eq!(final_result["score"], 0.0);
@@ -28369,26 +28422,50 @@ mod tests {
         let legacy = json!({"prompt_tokens": 2006, "input_tokens": 2006,
             "completion_tokens": 300, "output_tokens": 300, "cache_read_input_tokens": 1920});
         state.accumulate_usage(&legacy, &Value::Null);
-        assert_eq!(state.reported_usage(), HashMap::from([
-            ("input".into(), 86), ("cache".into(), 1920), ("output".into(), 300)]));
-        state.accumulate_usage(&json!({"input": 86, "cache": 1920, "output": 300}), &Value::Null);
+        assert_eq!(
+            state.reported_usage(),
+            HashMap::from([
+                ("input".into(), 86),
+                ("cache".into(), 1920),
+                ("output".into(), 300)
+            ])
+        );
+        state.accumulate_usage(
+            &json!({"input": 86, "cache": 1920, "output": 300}),
+            &Value::Null,
+        );
         assert_eq!(state.reported_usage()["input"], 172);
-        state.accumulate_usage(&json!({"prompt_tokens": 10, "input_tokens": 11,
-            "completion_tokens": 2, "cache_read_input_tokens": 0}), &Value::Null);
-        assert_eq!(state.reported_usage(), HashMap::from([("output".into(), 602)]));
+        state.accumulate_usage(
+            &json!({"prompt_tokens": 10, "input_tokens": 11,
+            "completion_tokens": 2, "cache_read_input_tokens": 0}),
+            &Value::Null,
+        );
+        assert_eq!(
+            state.reported_usage(),
+            HashMap::from([("output".into(), 602)])
+        );
         assert_eq!(state.trajectory.last().unwrap()["status"], "invalid");
         let mut raw = worker_state_for_unit_tests();
-        raw.accumulate_usage(&json!({"input_tokens": 86, "cache_read_input_tokens": 1920,
-            "output_tokens": 300}), &Value::Null);
+        raw.accumulate_usage(
+            &json!({"input_tokens": 86, "cache_read_input_tokens": 1920,
+            "output_tokens": 300}),
+            &Value::Null,
+        );
         assert_eq!(raw.reported_usage()["input"], 86);
         assert_eq!(raw.reported_usage()["cache"], 1920);
         let mut written = worker_state_for_unit_tests();
-        written.accumulate_usage(&json!({"input_tokens": 86, "cache_read_input_tokens": 1920,
-            "cache_creation_input_tokens": 100, "output_tokens": 300}), &Value::Null);
+        written.accumulate_usage(
+            &json!({"input_tokens": 86, "cache_read_input_tokens": 1920,
+            "cache_creation_input_tokens": 100, "output_tokens": 300}),
+            &Value::Null,
+        );
         assert_eq!(written.reported_usage()["input"], 186);
         let mut invalid = worker_state_for_unit_tests();
-        invalid.accumulate_usage(&json!({"input": true, "cache": -1, "output": 2,
-            "prompt_tokens": 10}), &Value::Null);
+        invalid.accumulate_usage(
+            &json!({"input": true, "cache": -1, "output": 2,
+            "prompt_tokens": 10}),
+            &Value::Null,
+        );
         assert!(invalid.reported_usage().is_empty());
     }
 
@@ -28400,38 +28477,59 @@ mod tests {
         large[0]["tool_calls"] = json!([{"id":"a", "function": {
             "name":"write", "arguments": "large code".repeat(100)}}]);
         let tools = vec![json!({"description": "schema".repeat(100)})];
-        assert!(request_size_bytes(&large, &tools) > request_size_bytes(&plain, &[])+2000);
-        assert_eq!(request_size_bytes(&large, &tools),
-            serde_json::to_vec(&json!({"messages":large,"tools":tools,"tool_choice":"auto"})).unwrap().len());
+        assert!(request_size_bytes(&large, &tools) > request_size_bytes(&plain, &[]) + 2000);
+        assert_eq!(
+            request_size_bytes(&large, &tools),
+            serde_json::to_vec(&json!({"messages":large,"tools":tools,"tool_choice":"auto"}))
+                .unwrap()
+                .len()
+        );
     }
 
     #[test]
     fn compaction_preserves_parallel_units_task_todos_and_failed_verification() {
         let mut state = worker_state_for_unit_tests();
-        state.messages = vec![json!({"role":"system","content":"rules"}),
+        state.messages = vec![
+            json!({"role":"system","content":"rules"}),
             json!({"role":"user","content":"original task"}),
             json!({"role":"assistant","content":"", "reasoning_content":"思考".repeat(2000),
                 "tool_calls":[{"id":"a","function":{"name":"write","arguments":"{}"}},
                     {"id":"b","function":{"name":"write","arguments":"{}"}}]}),
             json!({"role":"tool","tool_call_id":"b","content":"done"}),
-            json!({"role":"tool","tool_call_id":"a","content":"done"})];
-        assert_eq!(completed_message_unit_end(&state.messages,2),Some(5));
+            json!({"role":"tool","tool_call_id":"a","content":"done"}),
+        ];
+        assert_eq!(completed_message_unit_end(&state.messages, 2), Some(5));
         let mut incomplete = state.messages.clone();
         incomplete.pop();
-        assert_eq!(completed_message_unit_end(&incomplete,2),None);
-        state.todo_items.push(TodoItem{id:"todo".into(),content:"repair".into(),status:"pending".into()});
-        state.unresolved_failed_verification = Some(FailedVerificationObservation{
-            turn:1,tool:"verify".into(),command:"check".into(),observation:"failure".into(),
-            expected_artifacts:Vec::new(),semantic_contracts:Vec::new()});
-        let before = request_size_bytes(&state.messages,&state.tool_schemas);
+        assert_eq!(completed_message_unit_end(&incomplete, 2), None);
+        state.todo_items.push(TodoItem {
+            id: "todo".into(),
+            content: "repair".into(),
+            status: "pending".into(),
+        });
+        state.unresolved_failed_verification = Some(FailedVerificationObservation {
+            turn: 1,
+            tool: "verify".into(),
+            command: "check".into(),
+            observation: "failure".into(),
+            expected_artifacts: Vec::new(),
+            semantic_contracts: Vec::new(),
+        });
+        let before = request_size_bytes(&state.messages, &state.tool_schemas);
         assert!(state.compact_context(Some(before)));
-        assert_eq!(state.messages[1]["content"],"original task");
-        assert_eq!(state.messages.len(),3);
+        assert_eq!(state.messages[1]["content"], "original task");
+        assert_eq!(state.messages.len(), 3);
         assert!(state.todos_block_completion());
         assert!(state.unresolved_failed_verification.is_some());
-        assert!(state.messages[2]["content"].as_str().unwrap().contains("failure"));
-        assert_eq!(state.trajectory.last().unwrap()["omitted_messages"],3);
-        assert!(!state.compact_context(Some(request_size_bytes(&state.messages,&state.tool_schemas))));
+        assert!(state.messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("failure"));
+        assert_eq!(state.trajectory.last().unwrap()["omitted_messages"], 3);
+        assert!(!state.compact_context(Some(request_size_bytes(
+            &state.messages,
+            &state.tool_schemas
+        ))));
     }
 
     fn polyglot_worker_state(task_id: &str, expected_file: &str) -> WorkerState {

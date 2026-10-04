@@ -7,10 +7,10 @@ of performing a destructive exchange-back. This is not an inode-CAS primitive.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
-from pathlib import PurePosixPath
 import json
 import re
+from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 from bench import _canonical_harbor_hardlink as _base
@@ -173,12 +173,12 @@ def _publication_metadata(result: _v2.ToolResult, *, identity_verified: bool) ->
             raise ValueError("invalid publication state")
         for flag in ("directory_fsync", "durability_warning", "cleanup_warning", "no_auto_retry"):
             if not isinstance(outcome.get(flag), bool):
-                raise ValueError("invalid publication flag")
+                raise TypeError("invalid publication flag")
         entries = outcome.get("recovery_entries")
         if not isinstance(entries, list) or any(not isinstance(e, str) or '/' in e or e in ('', '.', '..') for e in entries):
             raise ValueError("invalid recovery entries")
         if not isinstance(outcome.get("publication_error"), str):
-            raise ValueError("invalid publication diagnostic")
+            raise TypeError("invalid publication diagnostic")
     except (TypeError, ValueError, KeyError) as exc:
         result.success = False
         result.error = f"Secure publication outcome unknown; reconcile before retry: {exc}"
@@ -290,4 +290,4 @@ class HarborFileEditTool(_base.HarborFileEditTool):
 
 HarborFileReadTool = _base.HarborFileReadTool
 ToolResult = _v2.ToolResult
-__all__ = ["HarborFileReadTool", "HarborFileEditTool", "HarborFileWriteTool", "ToolResult", "_SECURE_SNAPSHOT"]
+__all__ = ["_SECURE_SNAPSHOT", "HarborFileEditTool", "HarborFileReadTool", "HarborFileWriteTool", "ToolResult"]

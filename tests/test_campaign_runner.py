@@ -1,19 +1,21 @@
+import argparse
 import json
 import os
 import subprocess
 import sys
-import argparse
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
-
-from tests.infra_fixtures import finalized_infra_metadata
-
+from hl.failure_mechanisms import (
+    GENERAL_FAILURE_MECHANISM_COMPONENTS,
+    affected_components_for_failure_mechanism,
+    failure_mechanisms_for_trial,
+)
 from hl.goals import GoalStore
 from hl.loop import HLLoop
+from hl.loop_limits import unbounded_scope_flags
 from hl.types import (
     TaskDifficulty,
     TaskDomain,
@@ -21,77 +23,72 @@ from hl.types import (
     TrialStatus,
     TrialSummary,
 )
-from hl.failure_mechanisms import (
-    GENERAL_FAILURE_MECHANISM_COMPONENTS,
-    affected_components_for_failure_mechanism,
-    failure_mechanisms_for_trial,
-)
+from scripts import run_trial
 from scripts.run_campaign import (
+    _ANALYSIS_FAILURE_MECHANISM_COMPONENTS,
     RegressionRunResult,
     _advance_task_rotation,
     _analysis_failure_buckets,
     _analysis_failure_buckets_with_mechanisms,
-    _analysis_mechanism_update_entries,
     _analysis_mechanism_update_classes,
+    _analysis_mechanism_update_entries,
     _analysis_policy_coverage,
     _analysis_trajectory_evidence,
-    _ANALYSIS_FAILURE_MECHANISM_COMPONENTS,
+    _campaign_goal_terminal_reason,
+    _candidate_update_classes,
     _checkpoint_pending_tasks,
     _checkpoint_task_counts,
-    _candidate_update_classes,
-    _codex_update_packet_id_for_summary,
+    _codex_host_validation_commands,
     _codex_update_api_failure_reason,
+    _codex_update_decision,
+    _codex_update_packet_id_for_summary,
     _codex_update_provider_failure,
     _codex_update_should_run,
-    _campaign_goal_terminal_reason,
     _configure_loop,
-    _codex_update_decision,
-    _codex_host_validation_commands,
     _duration_balanced_order,
     _ensure_task_rotation_state,
     _explicit_requested_iteration_target_complete,
     _fixed_iteration_task_slice,
-    _iteration_tasks,
     _guard_convergence_fixed_eval_artifact_complete,
+    _invalidate_pending_regression_snapshots,
+    _iteration_tasks,
     _last_accepted_codex_update_summary,
+    _loop_limit_contract,
     _mark_codex_update_rolled_back,
-    _maybe_reduce_round_task_concurrency,
     _maybe_record_provider_fail_fast,
+    _maybe_reduce_round_task_concurrency,
+    _network_preflight_plan,
     _new_campaign_state,
     _normalized_state_analysis_reports,
     _parse_regression_failed_tasks,
+    _partial_pass_diagnostic_hook,
     _pending_campaign_tasks,
     _pending_regression_validation_commands,
-    _partial_pass_diagnostic_hook,
+    _policy_matches_for_event,
     _pre_regression_should_run,
     _provider_fail_fast_stop_reason,
     _quarantine_known_failed_baseline_snapshots,
-    _record_campaign_trial,
     _record_campaign_summary,
+    _record_campaign_trial,
     _record_codex_update_run_event,
     _record_network_preflight_event,
-    _network_preflight_plan,
-    _resume_current_rotation_tasks,
-    _resume_loop_iteration_index,
     _record_task_epoch_rollover_event,
     _recover_from_baseline_pre_regression_failure,
     _recover_from_codex_validation_failure,
-    _rollback_codex_update_after_failed_validation,
     _regression_plan,
+    _resume_current_rotation_tasks,
+    _resume_loop_iteration_index,
+    _rollback_codex_update_after_failed_validation,
     _run_regression,
     _should_replace_next_eval_result,
-    _trial_has_terminal_environment_signal,
     _trial_has_provider_billing_quota_error,
     _trial_has_rate_limit_error,
-    _invalidate_pending_regression_snapshots,
-    _loop_limit_contract,
-    _policy_matches_for_event,
+    _trial_has_terminal_environment_signal,
 )
-from hl.loop_limits import unbounded_scope_flags
-from scripts import run_trial
 from scripts.run_trial import _apply_execution_defaults as _apply_trial_execution_defaults
 from scripts.run_trial import _load_dotenv, _require_worker_api_key
-
+from tests.infra_fixtures import finalized_infra_metadata
+from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -2927,6 +2924,7 @@ execution:
             "--memory-path",
             str(tmp_path / "trials"),
         ],
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -2946,6 +2944,7 @@ execution:
             "--memory-path",
             str(tmp_path / "trials-cli"),
         ],
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -4329,9 +4328,9 @@ def test_rate_limit_detection_reads_harbor_agent_error_log(tmp_path):
                 "agent_result": {
                     "metadata": {
                         "error_log": [
-                            "LLM call failed: litellm.RateLimitError: "
+                            ("LLM call failed: litellm.RateLimitError: "
                             "OpenAIException - Request was rejected due to "
-                            "rate limiting. Details: TPM limit reached."
+                            "rate limiting. Details: TPM limit reached.")
                         ]
                     }
                 }
@@ -4361,8 +4360,8 @@ def test_provider_fail_fast_reads_harbor_agent_budget_error(tmp_path):
                 "agent_result": {
                     "metadata": {
                         "error_log": [
-                            "LLM call failed: LiteLLM BudgetExceededError: "
-                            "DeepSeek account balance is not enough"
+                            ("LLM call failed: LiteLLM BudgetExceededError: "
+                            "DeepSeek account balance is not enough")
                         ]
                     }
                 }
@@ -4440,8 +4439,8 @@ def test_provider_fail_fast_detects_real_http_402_payment_required():
         status=TrialStatus.ERROR,
         score=0.0,
         error_log=[
-            "LLM call failed: LiteLLM APIError: OpenAIException - "
-            "HTTP 402 Payment Required"
+            ("LLM call failed: LiteLLM APIError: OpenAIException - "
+            "HTTP 402 Payment Required")
         ],
     )
 
@@ -4579,8 +4578,8 @@ def test_analysis_infrastructure_phase_does_not_inherit_worker_dependency_mechan
         }
     ]
     assert _candidate_update_classes(buckets) == [
-        "infrastructure environment_start_timeout -> "
-        "bench/harbor, bench/network_environment (1 trial(s))"
+        ("infrastructure environment_start_timeout -> "
+        "bench/harbor, bench/network_environment (1 trial(s))")
     ]
 
     from scripts.run_campaign import _trial_report
@@ -4781,10 +4780,10 @@ def test_state_analysis_reports_normalize_legacy_candidate_classes_from_summary_
     reports = _normalized_state_analysis_reports(state)
 
     assert reports[0]["candidate_update_classes"] == [
-        "stan_dependency_stack_pivot_mechanism -> "
-        "bench/agent, crates/hl-worker-core, recovery/patterns (2 trial(s))",
-        "cross_arch_toolchain_pivot_mechanism -> "
-        "bench/agent, crates/hl-worker-core, recovery/patterns (1 trial(s))",
+        ("stan_dependency_stack_pivot_mechanism -> "
+        "bench/agent, crates/hl-worker-core, recovery/patterns (2 trial(s))"),
+        ("cross_arch_toolchain_pivot_mechanism -> "
+        "bench/agent, crates/hl-worker-core, recovery/patterns (1 trial(s))"),
     ]
     assert reports[0]["raw_candidate_update_classes"] == [
         "agent_execution_timeout -> bench/agent, context/compaction (4 trial(s))"
@@ -4809,12 +4808,12 @@ def test_state_analysis_reports_normalize_legacy_infra_phase_buckets(tmp_path):
             {
                 "summary_id": "summary_009",
                 "candidate_update_classes": [
-                    "infrastructure image_similarity_contract -> "
+                    ("infrastructure image_similarity_contract -> "
                     "bench/agent, bench/harbor, bench/network_environment, "
                     "harness/tools/verify, recovery/patterns, "
-                    "verification/checks (1 trial(s))",
-                    "infrastructure verifier_runtime_prepare_timeout -> "
-                    "bench/harbor, bench/network_environment (1 trial(s))",
+                    "verification/checks (1 trial(s))"),
+                    ("infrastructure verifier_runtime_prepare_timeout -> "
+                    "bench/harbor, bench/network_environment (1 trial(s))"),
                 ],
                 "failure_buckets": [
                     {
@@ -4856,10 +4855,10 @@ def test_state_analysis_reports_normalize_legacy_infra_phase_buckets(tmp_path):
         {
             "overview_path": str(overview_path),
             "candidate_update_classes": [
-                "infrastructure image_similarity_contract -> "
+                ("infrastructure image_similarity_contract -> "
                 "bench/agent, bench/harbor, bench/network_environment, "
                 "harness/tools/verify, recovery/patterns, verification/checks "
-                "(1 trial(s))"
+                "(1 trial(s))")
             ],
         }
     ]
@@ -4880,13 +4879,13 @@ def test_state_analysis_reports_normalize_legacy_infra_phase_buckets(tmp_path):
     ]
     assert "failure_mechanisms" not in reports[0]["failure_buckets"][0]
     assert reports[0]["candidate_update_classes"] == [
-        "infrastructure verifier_runtime_prepare_timeout -> "
-        "bench/harbor, bench/network_environment (2 trial(s))"
+        ("infrastructure verifier_runtime_prepare_timeout -> "
+        "bench/harbor, bench/network_environment (2 trial(s))")
     ]
     assert reports[0]["raw_candidate_update_classes"] == [
-        "infrastructure image_similarity_contract -> "
+        ("infrastructure image_similarity_contract -> "
         "bench/agent, bench/harbor, bench/network_environment, "
-        "harness/tools/verify, recovery/patterns, verification/checks (1 trial(s))"
+        "harness/tools/verify, recovery/patterns, verification/checks (1 trial(s))")
     ]
     assert reports[0]["candidate_update_classes_normalized_from"] == (
         "summary_json_failure_buckets"
@@ -4978,9 +4977,9 @@ def test_analysis_buckets_do_not_treat_verifier_timeout_source_as_timeout():
         verified=True,
         verifier_output='{"reward": 0.0}',
         error_log=[
-            "## ctrf.json\n"
+            ("## ctrf.json\n"
             "trace: stdout, stderr = proc.communicate(timeout=5)\n"
-            "message: expected two cleanup lines, got zero"
+            "message: expected two cleanup lines, got zero")
         ],
         metadata={"verifier_infra_error": False},
     )
@@ -5326,9 +5325,9 @@ def test_analysis_buckets_preserve_verifier_mismatch_over_dependency_noise():
             "fen = re.sub(pattern, repl, fen)"
         ),
         error_log=[
-            "## ctrf.json\n"
+            ("## ctrf.json\n"
             "message: re.PatternError: invalid group reference 10 at position 19\n"
-            "trace: fen = re.sub(pattern, repl, fen)"
+            "trace: fen = re.sub(pattern, repl, fen)")
         ],
         trajectory=[
             {
@@ -5703,7 +5702,7 @@ def test_analysis_policy_coverage_extracts_high_signal_fallback_contracts():
         (
             "git_sanitization_scope_contract",
             "sanitize-git-repo",
-            "def test_no_other_files_changed():\n"
+            ("def test_no_other_files_changed():\n"
             "    # Check that no files other than CONTAMINATED_PATHS have been changed\n"
             "    repo = git.Repo(\"/app/dclm\")\n"
             "    commit = repo.commit(\"d6987af002b122fef54bc0be402062c76488a4d9\")\n"
@@ -5713,7 +5712,7 @@ def test_analysis_policy_coverage_extracts_high_signal_fallback_contracts():
             ">       raise ValueError(f\"File {path} has been changed\")\n"
             "E       ValueError: File rust_processing/tokshuf-rs/README.md has been changed\n"
             "test_removal_of_secret_information passed\n"
-            "test_correct_replacement_of_secret_information passed",
+            "test_correct_replacement_of_secret_information passed"),
             (
                 "baseline commit d6987af002b122fef54bc0be402062c76488a4d9",
                 "CONTAMINATED_PATHS",
@@ -5725,44 +5724,44 @@ def test_analysis_policy_coverage_extracts_high_signal_fallback_contracts():
         (
             "native_crash_contract",
             "decompress-native",
-            "cat /app/data.comp | /app/decomp2\n"
+            ("cat /app/data.comp | /app/decomp2\n"
             "Decompression failed with error: Segmentation fault (core dumped)\n"
             "E       assert 139 == 0\n"
             "CompletedProcess(args='cat /app/data.comp | /app/decomp2', "
-            "returncode=139, stdout='', stderr='Segmentation fault (core dumped)\\n')",
+            "returncode=139, stdout='', stderr='Segmentation fault (core dumped)\\n')"),
             ("SIGSEGV/core dump", "bounds", "EOF", "allocation-size"),
             "Decompression failed with error: Segmentation fault (core dumped)",
         ),
         (
             "state_transition_set_contract",
             "chess-state-transition",
-            "E       AssertionError: Our move "
+            ("E       AssertionError: Our move "
             "rnbqkbnr/pppp1ppp/8/8/4PpP1/8/PPPP3P/RNBQKBNR b KQkq - "
-            "not found in Python-chess moves",
+            "not found in Python-chess moves"),
             ("legal-transition set", "castling rights", "en-passant target"),
             "E       AssertionError: Our move rnbqkbnr/pppp1ppp/8/8/4PpP1/8/PPPP3P/RNBQKBNR b KQkq - not found in Python-chess moves",
         ),
         (
             "text_output_contract",
             "binary-text-output",
-            "E       UnicodeDecodeError: 'utf-8' codec can't decode byte 0xf0 "
-            "in position 0: unexpected end of data",
+            ("E       UnicodeDecodeError: 'utf-8' codec can't decode byte 0xf0 "
+            "in position 0: unexpected end of data"),
             ("UTF-8", "not arbitrary binary bytes"),
             "E       UnicodeDecodeError: 'utf-8' codec can't decode byte 0xf0 in position 0: unexpected end of data",
         ),
         (
             "image_similarity_contract",
             "render-reference-image",
-            "E       AssertionError: Image similarity is only 0.917228497301676, "
-            "not >0.995",
+            ("E       AssertionError: Image similarity is only 0.917228497301676, "
+            "not >0.995"),
             ("cosine/SSIM threshold", "dimensions", "camera", "output path"),
             "E       AssertionError: Image similarity is only 0.917228497301676, not >0.995",
         ),
         (
             "token_substitution_contract",
             "synonym-substitution",
-            "E       AssertionError: modified input.tex must only modify words in synonyms.txt\n"
-            "E       assert ('Middle' == 'Hub')",
+            ("E       AssertionError: modified input.tex must only modify words in synonyms.txt\n"
+            "E       assert ('Middle' == 'Hub')"),
             ("synonyms.txt family", "token count", "punctuation"),
             "E       AssertionError: modified input.tex must only modify words in synonyms.txt",
         ),
@@ -7443,10 +7442,10 @@ def test_analysis_buckets_terminal_environment_after_dependency_loop():
         }
     ]
     assert _candidate_update_classes(buckets) == [
-        "stan_dependency_stack_pivot_mechanism -> "
+        ("stan_dependency_stack_pivot_mechanism -> "
         "bench/agent, bench/harbor_adapter, crates/hl-worker-core, "
         "harness/tools/shell, recovery/patterns "
-        "(1 trial(s))"
+        "(1 trial(s))")
     ]
     assert "harness/tools/verify" not in buckets[0]["affected_components"]
     assert "verification/checks" not in buckets[0]["affected_components"]
@@ -7750,10 +7749,10 @@ def test_analysis_buckets_dependency_loop_without_deliverable_progress():
         }
     ]
     assert _candidate_update_classes(buckets) == [
-        "fasttext_artifact_pivot_mechanism -> "
+        ("fasttext_artifact_pivot_mechanism -> "
         "bench/agent, bench/harbor_adapter, crates/hl-worker-core, "
         "harness/tools/shell, recovery/patterns "
-        "(1 trial(s))"
+        "(1 trial(s))")
     ]
     assert "harness/tools/verify" not in buckets[0]["affected_components"]
     assert "verification/checks" not in buckets[0]["affected_components"]
@@ -8010,8 +8009,8 @@ def test_terminal_environment_dependency_category_replaces_broad_timeout_compone
         }
     ]
     assert _candidate_update_classes(buckets) == [
-        "infrastructure terminal_environment_unavailable_after_dependency_loop -> "
-        "bench/harbor, bench/network_environment (1 trial(s))"
+        ("infrastructure terminal_environment_unavailable_after_dependency_loop -> "
+        "bench/harbor, bench/network_environment (1 trial(s))")
     ]
     assert "context/compaction" not in buckets[0]["affected_components"]
     assert "harness/tools/verify" not in buckets[0]["affected_components"]
@@ -8276,10 +8275,10 @@ def test_analysis_buckets_prioritize_structured_csv_contract_over_dependency_noi
         }
     ]
     assert _candidate_update_classes(buckets) == [
-        "structured_csv_table_contract -> "
+        ("structured_csv_table_contract -> "
         "bench/agent, bench/harbor_adapter, crates/hl-worker-core, "
         "harness/tools/shell, harness/tools/verify, recovery/patterns, "
-        "verification/checks (1 trial(s))"
+        "verification/checks (1 trial(s))")
     ]
     evidence = _analysis_trajectory_evidence(trial)
     assert evidence["policy_counts"]["structured_csv_table_contract"] == 1
@@ -9473,15 +9472,7 @@ def test_mark_codex_update_rolled_back_removes_active_accepted_marker():
 
 
 def test_parse_regression_failed_tasks_from_cli_output():
-    stdout = "\n".join(
-        [
-            "Regression lane smoke passed for 3 snapshot(s).",
-            "Regressions detected:",
-            "- fix-code-vulnerability",
-            "- build-pov-ray",
-            "",
-        ]
-    )
+    stdout = 'Regression lane smoke passed for 3 snapshot(s).\nRegressions detected:\n- fix-code-vulnerability\n- build-pov-ray\n'
 
     assert _parse_regression_failed_tasks(stdout) == [
         "fix-code-vulnerability",
@@ -11176,9 +11167,9 @@ def test_campaign_state_checkpoint_report_tracks_resume_completion(tmp_path):
 
 
 def test_campaign_checkpoint_report_uses_lightweight_task_results(tmp_path, monkeypatch):
-    import scripts.run_campaign as run_campaign
     from hl.memory import FileSystemMemory
     from hl.types import TaskDifficulty, TaskDomain, TrialResult, TrialStatus
+    from scripts import run_campaign
     from scripts.run_campaign import (
         _build_campaign_report_from_state,
         _new_campaign_state,
@@ -11590,8 +11581,8 @@ def test_campaign_report_promotes_latest_analysis_digest(tmp_path):
             }
         ]
         assert container["candidate_update_classes"] == [
-            "infrastructure verifier_runtime_prepare_timeout -> "
-            "bench/harbor, bench/network_environment (1 trial(s))"
+            ("infrastructure verifier_runtime_prepare_timeout -> "
+            "bench/harbor, bench/network_environment (1 trial(s))")
         ]
         assert container["weakness_signatures"][0]["failure_category"] == (
             "verifier_runtime_prepare_timeout"
@@ -11971,8 +11962,8 @@ def test_change_manifest_matches_natural_language_prediction_classes():
             "packet_id": "codex_packet_timeout_prediction",
             "prediction": {
                 "expected_fixed_task_classes": [
-                    "agent execution timeout tasks whose trajectories show long "
-                    "non-mutating exploration before required artifacts are written"
+                    ("agent execution timeout tasks whose trajectories show long "
+                    "non-mutating exploration before required artifacts are written")
                 ],
                 "risk_task_classes": [],
             },
@@ -11984,12 +11975,12 @@ def test_change_manifest_matches_natural_language_prediction_classes():
 
     assert evaluation["evaluated_trials"][0]["expected_match"] is True
     assert evaluation["evaluated_trials"][0]["expected_matched_classes"] == [
-        "agent execution timeout tasks whose trajectories show long "
-        "non-mutating exploration before required artifacts are written"
+        ("agent execution timeout tasks whose trajectories show long "
+        "non-mutating exploration before required artifacts are written")
     ]
     assert evaluation["prediction_misses"][0]["matched_classes"] == [
-        "agent execution timeout tasks whose trajectories show long "
-        "non-mutating exploration before required artifacts are written"
+        ("agent execution timeout tasks whose trajectories show long "
+        "non-mutating exploration before required artifacts are written")
     ]
     assert evaluation["outcome"] == "prediction_missed"
 
@@ -13023,8 +13014,8 @@ def test_iteration_analysis_report_writes_overview_and_details(tmp_path):
 def test_policy_matches_cover_historical_uncovered_timeout_examples():
     cases = {
         "fix-ocaml-gc": (
-            "cd /app/ocaml && cat "
-            "testsuite/tests/basic/_ocamltest/tests/basic/float/float.log",
+            ("cd /app/ocaml && cat "
+            "testsuite/tests/basic/_ocamltest/tests/basic/float/float.log"),
             "log_file_read_timeout_phase",
         ),
         "mcmc-sampling-stan": (
@@ -13032,14 +13023,14 @@ def test_policy_matches_cover_historical_uncovered_timeout_examples():
             "long_compute_timeout_phase",
         ),
         "train-fasttext": (
-            "head -20000 /app/train.txt > /app/train_20k.txt; "
-            "wc -l /app/train_20k.txt",
+            ("head -20000 /app/train.txt > /app/train_20k.txt; "
+            "wc -l /app/train_20k.txt"),
             "long_compute_timeout_phase",
         ),
         "git-multibranch": (
-            "timeout 5 ssh -o StrictHostKeyChecking=no "
+            ("timeout 5 ssh -o StrictHostKeyChecking=no "
             "-o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes "
-            "root@localhost true",
+            "root@localhost true"),
             "service_inventory_probe_timeout_phase",
         ),
         "reshard-c4-data": (
@@ -13051,8 +13042,8 @@ def test_policy_matches_cover_historical_uncovered_timeout_examples():
             "long_compute_timeout_phase",
         ),
         "llm-inference-batching-scheduler": (
-            "cd /app/task_file && timeout 120 "
-            "python3 scripts/optimized_packer.py 2>&1",
+            ("cd /app/task_file && timeout 120 "
+            "python3 scripts/optimized_packer.py 2>&1"),
             "long_compute_timeout_phase",
         ),
         "mailman": (
@@ -13060,9 +13051,9 @@ def test_policy_matches_cover_historical_uncovered_timeout_examples():
             "service_inventory_probe_timeout_phase",
         ),
         "query-optimize": (
-            "cd /app && sqlite3 oewn.sqlite \".headers on\" \".mode list\" "
+            ("cd /app && sqlite3 oewn.sqlite \".headers on\" \".mode list\" "
             "\".output /tmp/out_orig.txt\" \"$(cat my-sql-query.sql)\" "
-            "\".output stdout\"",
+            "\".output stdout\""),
             "database_query_validation_timeout_phase",
         ),
         "circuit-fibsqrt-direct": (
@@ -13070,8 +13061,8 @@ def test_policy_matches_cover_historical_uncovered_timeout_examples():
             "simulation_validation_timeout_phase",
         ),
         "circuit-fibsqrt-loop": (
-            "cd /app && for n in 10000 20000 1000000; do "
-            "echo -n \"n=$n: \"; timeout 60 ./sim $n; done",
+            ("cd /app && for n in 10000 20000 1000000; do "
+            "echo -n \"n=$n: \"; timeout 60 ./sim $n; done"),
             "simulation_validation_timeout_phase",
         ),
         "fix-code-vulnerability": (
@@ -13079,10 +13070,10 @@ def test_policy_matches_cover_historical_uncovered_timeout_examples():
             "local_validation_timeout_phase",
         ),
         "large-scale-text-editing": (
-            "# Test on full input echo \"Copying input.csv (this may take a moment)...\"; "
+            ("# Test on full input echo \"Copying input.csv (this may take a moment)...\"; "
             "cp /app/input.csv /app/test_output.csv; echo \"Running Vim script "
             "on full 1M rows...\"; timeout 120 vim -Nu NONE -n -es "
-            "/app/test_output.csv -S /app/script.vim",
+            "/app/test_output.csv -S /app/script.vim"),
             "long_compute_timeout_phase",
         ),
     }
@@ -13487,8 +13478,8 @@ def test_rebuild_analysis_sync_only_refreshes_derived_campaign_fields(
                     }
                 ],
                 "candidate_update_classes": [
-                    "infrastructure verifier_runtime_prepare_timeout -> "
-                    "bench/harbor, bench/network_environment (2 trial(s))"
+                    ("infrastructure verifier_runtime_prepare_timeout -> "
+                    "bench/harbor, bench/network_environment (2 trial(s))")
                 ],
                 "weakness_signatures": [
                     {

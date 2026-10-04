@@ -107,7 +107,7 @@ def test_valid_utf8_append_builds_one_complete_atomic_payload() -> None:
     ) -> ToolResult:
         calls.append((script, env))
         if len(calls) == 1:
-            return _success_with_snapshot("旧内容".encode("utf-8"))
+            return _success_with_snapshot("旧内容".encode())
         return ToolResult(
             success=True,
             output=_response(),
