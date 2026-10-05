@@ -2164,18 +2164,6 @@ fn bounded_entrypoint_scan_command() -> &'static str {
         "\\( -name 'README*' -o -name 'pyproject.toml' -o -name 'package.json' ",
         "-o -name 'Makefile' -o -name '*.py' -o -name '*.sh' \\) ",
         "2>/dev/null | sed -n '1,80p'\n",
-        "if [ -d /tests ]; then\n",
-        "  printf '\\nVerifier surface files (visible /tests, read-only):\\n'\n",
-        "  find /tests -maxdepth 2 -type f ",
-        "\\( -name 'test*.py' -o -name '*.sh' -o -name 'pytest.ini' -o -name '*.txt' \\) ",
-        "2>/dev/null | sed -n '1,40p'\n",
-        "  printf '\\nVerifier-facing artifact and command hints (visible /tests snippets):\\n'\n",
-        "  find /tests -maxdepth 2 -type f ",
-        "\\( -name 'test*.py' -o -name '*.sh' -o -name 'pytest.ini' -o -name '*.txt' \\) ",
-        "-print0 2>/dev/null | xargs -0 -r grep -InE ",
-        "\"(/app/[^[:space:]\\\"')]+|/tmp/[^[:space:]\\\"')]+|/jail/[^[:space:]\\\"')]+|subprocess[.]run|pmars|gcc|pytest|assert |open\\(|Path\\()\" ",
-        "2>/dev/null | sed -n '1,80p'\n",
-        "fi"
     )
 }
 
@@ -28581,20 +28569,27 @@ mod tests {
     }
 
     #[test]
-    fn bounded_entrypoint_scan_command_includes_visible_verifier_surface() {
+    fn bounded_entrypoint_scan_command_is_bounded_to_task_workspace() {
         let command = bounded_entrypoint_scan_command();
 
+        assert!(command.contains("printf 'PWD: '; pwd"));
+        assert!(command.contains("ls -la | sed -n '1,80p'"));
         assert!(command.contains("Likely entrypoints:"));
-        assert!(command.contains("/tests"));
-        assert!(command.contains("Verifier surface files (visible /tests, read-only):"));
-        assert!(command.contains("Verifier-facing artifact and command hints"));
-        assert!(command.contains("/app/"));
-        assert!(command.contains("subprocess[.]run"));
-        assert!(command.contains("pmars"));
-        assert!(command.contains("gcc"));
-        assert!(command.contains("open\\("));
-        assert!(command.contains("Path\\("));
+        assert!(command.contains("find . -maxdepth 2 -type f"));
+        assert!(command.contains("-name 'README*'"));
+        assert!(command.contains("-name 'pyproject.toml'"));
+        assert!(command.contains("-name 'package.json'"));
         assert!(command.contains("sed -n '1,80p'"));
+        for protected in [
+            "/tests",
+            "/solutions",
+            "/task.toml",
+            "Verifier",
+            "xargs",
+            "grep",
+        ] {
+            assert!(!command.contains(protected));
+        }
     }
 
     #[test]
@@ -28612,14 +28607,14 @@ mod tests {
     }
 
     #[test]
-    fn bounded_entrypoint_scan_adds_verifier_surface_without_loop_limits() {
+    fn bounded_entrypoint_scan_records_workspace_output_without_loop_limits() {
         let mut state = worker_state_for_unit_tests();
         state.tool_schemas = vec![json!({"function": {"name": "bash"}})];
         let response = json!({
             "type": "tool_response",
             "payload": {
                 "success": true,
-                "output": "PWD: /app\n\nLikely entrypoints:\n./README.md\n\nVerifier surface files (visible /tests, read-only):\n/tests/test_outputs.py\n\nVerifier-facing artifact and command hints (visible /tests snippets):\n/tests/test_outputs.py:8:subprocess.run(['pmars', '-b', '-r', '100', '-f', '/app/my_warrior.red'])",
+                "output": "PWD: /workspace\n\nLikely entrypoints:\n./README.md\n./pyproject.toml",
                 "error": ""
             }
         });
@@ -28628,8 +28623,8 @@ mod tests {
         let scan = bounded_entrypoint_scan(&mut stdin, &mut state);
 
         assert!(scan.contains("Bounded entrypoint scan:"));
-        assert!(scan.contains("Verifier surface files"));
-        assert!(scan.contains("/app/my_warrior.red"));
+        assert!(scan.contains("./README.md"));
+        assert!(scan.contains("./pyproject.toml"));
         let event = latest_event(&state, "entrypoint_scan");
         assert_eq!(
             event
