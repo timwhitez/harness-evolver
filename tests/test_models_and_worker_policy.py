@@ -6,16 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
-
 from bench.agent import HLAgent
 from harness.config import ModelsConfig, RoleModelConfig
 from harness.context.isolation import ContextIsolation
 from harness.tools.base import ToolDef, ToolResult, ToolSchema
-from harness.tools.goal import GoalReadTool
 from harness.tools.correction import ToolFailureTracker
+from harness.tools.goal import GoalReadTool
 from harness.tools.todo import TodoReadTool, TodoStore, TodoWriteTool
 from hl.types import TrialStatus
+from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
 
 
 def _model_loop_tool_calls(result):
@@ -306,19 +305,7 @@ def test_python_agent_cancel_current_run_terminates_active_rust_worker(
 ):
     worker = tmp_path / "fake_worker.py"
     worker.write_text(
-        "\n".join(
-            [
-                "#!/usr/bin/env python3",
-                "import json, sys, time",
-                "for line in sys.stdin:",
-                "    event = json.loads(line)",
-                "    if event.get('type') == 'start':",
-                "        print(json.dumps({'type': 'trajectory_event',",
-                "            'event': {'type': 'fake_worker_started'}}), flush=True)",
-                "        while True:",
-                "            time.sleep(0.1)",
-            ]
-        )
+        "#!/usr/bin/env python3\nimport json, sys, time\nfor line in sys.stdin:\n    event = json.loads(line)\n    if event.get('type') == 'start':\n        print(json.dumps({'type': 'trajectory_event',\n            'event': {'type': 'fake_worker_started'}}), flush=True)\n        while True:\n            time.sleep(0.1)"
         + "\n"
     )
     worker.chmod(0o755)
@@ -439,8 +426,8 @@ def test_worker_loop_limit_fields_remain_recovery_metadata_only():
         "state.turn_count - state.last_checkpoint_turn",
         "verification_checkpoint_turns.iter().any",
         "no_progress_pivot_injected",
-        "return WorkerExit::Final(state.final_unverified_result())"
-        " if state.turn_count >= state.max_turns",
+        ("return WorkerExit::Final(state.final_unverified_result())"
+        " if state.turn_count >= state.max_turns"),
     ]
     for snippet in forbidden_rust_snippets:
         assert snippet not in rust_text
@@ -1909,10 +1896,10 @@ def test_worker_requires_single_file_deliverable_preflight_before_done(monkeypat
         {
             "task_id": "polyglot-rust-c",
             "previous_errors": [
-                "def test_fibonacci_polyglot():\n"
+                ("def test_fibonacci_polyglot():\n"
                 "    polyglot_files = os.listdir(\"/app/polyglot\")\n"
                 "    assert polyglot_files == [\"main.rs\"]\n"
-                "E       AssertionError: Expected only main.rs, found: ['test_poly.rs', 'main.rs', 'cmain']"
+                "E       AssertionError: Expected only main.rs, found: ['test_poly.rs', 'main.rs', 'cmain']")
             ],
         },
     )
@@ -4281,7 +4268,7 @@ def test_worker_requires_regex_backreference_contract_preflight_before_artifact_
         {
             "task_id": "regex-chess",
             "previous_errors": [
-                "regex_replacement_backreference_contract: Python re.sub "
+                ("regex_replacement_backreference_contract: Python re.sub "
                 "replacement strings must only reference groups present in "
                 "the compiled pattern; pair index 6174 failed with invalid "
                 "group reference 10; audit pattern `(?m) (w|b) [^-]+ "
@@ -4290,7 +4277,7 @@ def test_worker_requires_regex_backreference_contract_preflight_before_artifact_
                 "numeric references such as \\10 as \\g<1>0 when literal "
                 "suffixes are intended, remove or repair references such as "
                 "\\2 when only one group exists, and run pattern.sub(repl, "
-                "focused_sample) before adding more generated rules"
+                "focused_sample) before adding more generated rules")
             ],
         },
     )
@@ -4432,7 +4419,7 @@ def test_worker_blocks_full_regex_validation_until_backreference_preflight(monke
         {
             "task_id": "regex-chess",
             "previous_errors": [
-                "regex_replacement_backreference_contract: Python re.sub "
+                ("regex_replacement_backreference_contract: Python re.sub "
                 "replacement strings must only reference groups present in "
                 "the compiled pattern; pair index 6174 failed with invalid "
                 "group reference 10; audit pattern `(?m) (w|b) [^-]+ "
@@ -4441,7 +4428,7 @@ def test_worker_blocks_full_regex_validation_until_backreference_preflight(monke
                 "numeric references such as \\10 as \\g<1>0 when literal "
                 "suffixes are intended, remove or repair references such as "
                 "\\2 when only one group exists, and run pattern.sub(repl, "
-                "focused_sample) before adding more generated rules"
+                "focused_sample) before adding more generated rules")
             ],
         },
     )
@@ -4800,7 +4787,7 @@ PY"""
         {
             "task_id": "regex-chess",
             "previous_errors": [
-                "Historical analysis lesson from summary_010 for regex-chess: "
+                ("Historical analysis lesson from summary_010 for regex-chess: "
                 "failure_category=state_transition_set_contract; "
                 "Failure mechanism detail: state_transition_set_contract: "
                 "Generated next state must be a member of the verifier "
@@ -4811,7 +4798,7 @@ PY"""
                 "Our move: rnbqkbnr/pppp1ppp/8/8/4PpP1/8/PPPP3P/RNBQKBNR b KQkq - "
                 "not found in Python-chess moves: ['f4g3', 'f4e3']; "
                 "loop_stop_condition=false; time_round_token_limit_driven=false; "
-                "this is not a master, sub-agent, or Worker loop stop condition."
+                "this is not a master, sub-agent, or Worker loop stop condition.")
             ],
         },
     )
@@ -4956,14 +4943,14 @@ def test_worker_requires_arithmetic_reference_preflight_before_done(monkeypatch)
         {
             "task_id": "circuit-fibsqrt",
             "previous_errors": [
-                "def test_sqrt_fib():\n"
+                ("def test_sqrt_fib():\n"
                 "    fib_n = fibonacci(isqrt(n))\n"
                 "    fib_n_mod = fib_n % (2**32)\n"
                 "    test_cases = [1, 4, 8, 12, 41, 42, 107, 220, 209, 366, "
                 "12**2, 41**2, 42**2, 12**2 - 1, 12**2 + 1]\n"
                 "    result = subprocess.run(['/app/sim', str(n)], "
                 "capture_output=True, text=True)\n"
-                "    print('C output mismatch')"
+                "    print('C output mismatch')")
             ],
         },
     )
@@ -5383,14 +5370,14 @@ PY"""
         {
             "task_id": "sam-cell-seg",
             "previous_errors": [
-                "FAILED ../tests/test_outputs.py::test_demo_metadata_csv_content\n"
+                ("FAILED ../tests/test_outputs.py::test_demo_metadata_csv_content\n"
                 "def test_demo_metadata_csv_content():\n"
                 "    df = pd.read_csv(args.csv_path)\n"
                 "Failure mechanism detail: Verifier loads demo_metadata.csv via "
                 "pd.read_csv(args.csv_path) as a table and checks keyed row content; "
                 "repair must preserve columns rgb_path, csv_path, area, bbox, width, "
                 "height in exact order, row count, key column identity, "
-                "blank-vs-nonblank cells, numeric/text dtype and formatting."
+                "blank-vs-nonblank cells, numeric/text dtype and formatting.")
             ],
         },
     )
@@ -5568,14 +5555,14 @@ PY"""
         {
             "task_id": "sam-cell-seg",
             "previous_errors": [
-                "FAILED ../tests/test_outputs.py::test_demo_metadata_csv_content\n"
+                ("FAILED ../tests/test_outputs.py::test_demo_metadata_csv_content\n"
                 "def test_demo_metadata_csv_content():\n"
                 "    df = pd.read_csv(args.csv_path)\n"
                 "Failure mechanism detail: Verifier loads demo_metadata.csv via "
                 "pd.read_csv(args.csv_path) as a table and checks keyed row content; "
                 "repair must preserve columns rgb_path, csv_path, area, bbox, width, "
                 "height in exact order, row count, key column identity, "
-                "blank-vs-nonblank cells, numeric/text dtype and formatting."
+                "blank-vs-nonblank cells, numeric/text dtype and formatting.")
             ],
         },
     )
@@ -5697,7 +5684,7 @@ PY"""
         {
             "task_id": "sam-cell-seg",
             "previous_errors": [
-                "Historical analysis lesson from summary_010 for sam-cell-seg: "
+                ("Historical analysis lesson from summary_010 for sam-cell-seg: "
                 "failure_category=structured_csv_table_contract; "
                 "agent_contribution=policy:package_manager_timeout_cap:53; "
                 "Failure mechanism detail: structured_csv_table_contract: "
@@ -5708,7 +5695,7 @@ PY"""
                 "numeric/text dtype and formatting. Evidence: "
                 "df = pd.read_csv(args.csv_path); "
                 "loop_stop_condition=false; time_round_token_limit_driven=false; "
-                "this is not a master, sub-agent, or Worker loop stop condition."
+                "this is not a master, sub-agent, or Worker loop stop condition.")
             ],
         },
     )
@@ -5837,7 +5824,7 @@ PY"""
         {
             "task_id": "sam-cell-seg",
             "previous_errors": [
-                "Historical analysis lesson from summary_010 for sam-cell-seg: "
+                ("Historical analysis lesson from summary_010 for sam-cell-seg: "
                 "failure_category=structured_csv_table_contract; "
                 "Failure mechanism detail: ml_cv_heavy_import_pivot_mechanism: "
                 "importing convert_masks helper functions triggered top-level cv2 "
@@ -5850,7 +5837,7 @@ PY"""
                 "order, row count, key column identity, blank-vs-nonblank cells, "
                 "numeric/text dtype and formatting. "
                 "loop_stop_condition=false; time_round_token_limit_driven=false; "
-                "this is not a master, sub-agent, or Worker loop stop condition."
+                "this is not a master, sub-agent, or Worker loop stop condition.")
             ],
         },
     )
@@ -5968,9 +5955,9 @@ PY'''
         {
             "task_id": "literal-output",
             "previous_errors": [
-                'expected_output = "79586"\n'
+                ('expected_output = "79586"\n'
                 'actual = Path("/app/answer.txt").read_text().strip()\n'
-                "assert actual == expected_output"
+                "assert actual == expected_output")
             ],
         },
     )
@@ -6143,8 +6130,8 @@ PY'''
         {
             "task_id": "path-tracing-reverse",
             "previous_errors": [
-                "image_similarity_contract: Generated image/render artifact must match "
-                "the verifier reference above the required cosine/SSIM threshold"
+                ("image_similarity_contract: Generated image/render artifact must match "
+                "the verifier reference above the required cosine/SSIM threshold")
             ],
         },
     )

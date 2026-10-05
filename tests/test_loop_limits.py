@@ -1,8 +1,13 @@
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
-from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
-
+from harness.context import (
+    CompactionStrategy,
+    ContextIsolation,
+    ContextManager,
+    TrajectoryPack,
+)
+from hl.loop import HLLoop
 from hl.loop_limits import (
     disallowed_limit_terminal_reasons,
     is_limit_terminal_reason,
@@ -12,20 +17,13 @@ from hl.loop_limits import (
     unbounded_loop_flags,
     unbounded_scope_flags,
 )
-from harness.context import (
-    CompactionStrategy,
-    ContextIsolation,
-    ContextManager,
-    TrajectoryPack,
-)
-from hl.loop import HLLoop
 from meta.codex_update import CodexUpdateEngine
 from meta.missions import MissionPlanner
 from scripts.run_campaign import (
     _codex_update_should_run,
     _loop_limit_contract,
 )
-
+from tests.worker_contract_support import assert_worker_waits_are_cleanup_only
 
 LOOP_LIMIT_SCOPES = (
     "all_loops",
@@ -303,7 +301,7 @@ def test_shared_loop_limit_helpers_are_unbounded_and_non_terminal() -> None:
             assert scoped_unbounded["no_time_limit"] is True
             assert scoped_unbounded["no_round_limit"] is True
         for key, value in flags.items():
-            assert key.endswith("_stop_condition") or key.endswith("_limit_allowed"), key
+            assert key.endswith(("_stop_condition", "_limit_allowed")), key
             assert value is False, f"{scope}.{key} must stay audit-only"
 
     assert non_terminal_limit_flags("codex_update_sub_agent")[

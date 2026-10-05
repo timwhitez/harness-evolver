@@ -20,21 +20,17 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-from bench.worker_metrics import harbor_worker_metrics
 from urllib.parse import urlparse
 
-from bench.trajectory import TrajectoryReader
 from bench.network_environment import (
-    DEFAULT_DOWNLOAD_URL_REWRITES,
     DEFAULT_DOCKER_CPUS,
     DEFAULT_DOCKER_HUB_MIRROR,
-    DEFAULT_DOCKER_LABELS,
     DEFAULT_DOCKER_LOG_MAX_FILE,
     DEFAULT_DOCKER_LOG_MAX_SIZE,
     DEFAULT_DOCKER_MEMORY,
     DEFAULT_DOCKER_MEMORY_SWAP,
     DEFAULT_DOCKER_PIDS_LIMIT,
+    DEFAULT_DOWNLOAD_URL_REWRITES,
     DEFAULT_PREBUILT_DOCKER_HUB_MIRROR,
     DEFAULT_PYPI_INDEX_URL,
     DEFAULT_PYPI_TRUSTED_HOST,
@@ -42,9 +38,13 @@ from bench.network_environment import (
     PREBUILT_WARMUP_FAILURE_RECEIPT_SCHEMA,
     _parse_docker_labels,
 )
-from hl.types import TaskDifficulty, TaskDomain, TrialResult, TrialStatus
+from bench.network_environment import (
+    DEFAULT_DOCKER_LABELS as DEFAULT_DOCKER_LABELS,  # noqa: PLC0414 - public re-export through bench.harbor
+)
+from bench.trajectory import TrajectoryReader
+from bench.worker_metrics import harbor_worker_metrics
 from harness.tools.shell import external_agent_command_reason
-
+from hl.types import TaskDifficulty, TaskDomain, TrialResult, TrialStatus
 
 DEFAULT_WORKER_IMPORT_PATH = "bench.harbor_adapter:HLWorkerHarborAgent"
 DEFAULT_NETWORK_ENVIRONMENT_IMPORT_PATH = (
@@ -656,8 +656,8 @@ class HarborRunner:
                 task_difficulty=TaskDifficulty.MEDIUM,
                 status=TrialStatus.TIMEOUT,
                 error_log=[
-                    "Harbor command entered the external-interruption "
-                    f"compatibility path after audit reference {timeout_audit}s"
+                    ("Harbor command entered the external-interruption "
+                    f"compatibility path after audit reference {timeout_audit}s")
                 ],
                 wall_time_seconds=float(timeout_audit),
                 harbor_job_dir=str(command.job_dir),
@@ -676,7 +676,7 @@ class HarborRunner:
                     "partial_harbor_artifacts": False,
                 },
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserve unknown runner failures as TrialResult.ERROR
             return TrialResult(
                 trial_id=command.job_name,
                 task_id=task_id,
@@ -775,8 +775,8 @@ class HarborRunner:
         if job_result.status != TrialStatus.PASSED:
             job_result.status = TrialStatus.TIMEOUT
         errors = [
-            "Harbor command entered the external-interruption compatibility "
-            f"path after audit reference {timeout_audit}s"
+            ("Harbor command entered the external-interruption compatibility "
+            f"path after audit reference {timeout_audit}s")
         ]
         errors.extend(error for error in job_result.error_log if error not in errors)
         job_result.error_log = errors

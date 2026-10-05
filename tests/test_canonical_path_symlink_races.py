@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import base64
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from bench._canonical_harbor_grep import _HARBOR_GREP_PYTHON
 from bench._canonical_harbor_paths_v2 import _SECURE_READ, _SECURE_WRITE
+from harness.tools import safe_path_io
 from harness.tools.file_read import FileReadTool
 from harness.tools.file_write import FileWriteTool
-import harness.tools.safe_path_io as safe_path_io
-
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="O_NOFOLLOW race tests are POSIX-specific")
 
@@ -173,8 +172,8 @@ def test_harbor_grep_rejects_file_swapped_after_walk_authorization(
             "swapped = False",
             "def racing_open(path, flags, mode=0o777, *, dir_fd=None):",
             "    global swapped",
-            "    if (not swapped and path == target.name and dir_fd is not None "
-            "and flags & os.O_NOFOLLOW):",
+            ("    if (not swapped and path == target.name and dir_fd is not None "
+            "and flags & os.O_NOFOLLOW):"),
             "        target.unlink()",
             "        target.symlink_to(secret)",
             "        swapped = True",

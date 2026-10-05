@@ -88,6 +88,7 @@ def test_roadmap_audit_strict_fails_when_runtime_evidence_is_missing(tmp_path):
             "--jobs-dir",
             str(tmp_path / "jobs"),
         ],
+        check=False,
         capture_output=True,
         text=True,
     )

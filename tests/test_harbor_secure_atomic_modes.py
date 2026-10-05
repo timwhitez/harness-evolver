@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import base64
 import os
-from pathlib import Path
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from bench import _canonical_harbor_hardlink as hardlink
-
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix" or not hasattr(os, "O_NOFOLLOW"),
