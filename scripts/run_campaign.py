@@ -13,7 +13,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -776,6 +776,8 @@ def main() -> int:
             submit_results=submit_results,
             codex_update=args.codex_update,
             trials_config=trials_config,
+            trials_config_path=args.trials_config,
+            agent_config=agent_config,
             update_policy=update_policy,
             round_task_concurrency=round_task_concurrency,
             task_rotation=task_rotation,
@@ -1272,6 +1274,8 @@ def main() -> int:
                     submit_results=submit_results,
                     codex_update=args.codex_update,
                     trials_config=trials_config,
+                    trials_config_path=args.trials_config,
+                    agent_config=agent_config,
                     update_policy=update_policy,
                     round_task_concurrency=round_task_concurrency,
                     task_rotation=task_rotation,
@@ -1320,6 +1324,8 @@ def main() -> int:
         submit_results=submit_results,
         codex_update=args.codex_update,
         trials_config=trials_config,
+        trials_config_path=args.trials_config,
+        agent_config=agent_config,
         update_policy=update_policy,
         round_task_concurrency=round_task_concurrency,
         stopped_reason=stopped_reason,
@@ -1337,6 +1343,8 @@ def main() -> int:
             submit_results=submit_results,
             codex_update=args.codex_update,
             trials_config=trials_config,
+            trials_config_path=args.trials_config,
+            agent_config=agent_config,
             update_policy=update_policy,
             round_task_concurrency=round_task_concurrency,
             task_rotation=task_rotation,
@@ -10125,6 +10133,8 @@ def _build_campaign_report(
     submit_results: list[Any],
     codex_update: bool,
     trials_config: dict[str, Any] | None = None,
+    trials_config_path: str | Path | None = None,
+    agent_config: dict[str, object] | None = None,
     update_policy: dict[str, Any] | None = None,
     round_task_concurrency: int = 1,
     stopped_reason: str = "",
@@ -10203,11 +10213,15 @@ def _build_campaign_report(
         "regression": regression_plan,
         "submit": [result.__dict__ for result in submit_results],
         "reproducibility": {
-            "git_commit": _git_output(["git", "rev-parse", "HEAD"]),
-            "git_dirty": bool(_git_output(["git", "status", "--short"])),
+            **_git_metadata(Path.cwd()),
             "memory_path": str(memory_path),
-            "trials_config": "config/trials.yaml",
+            "config_scope": "report_invocation",
+            "trials_config": str(trials_config_path) if trials_config_path is not None else None,
+            "models_config_path": (agent_config or {}).get("models_config_path"),
+            "worker_role": (agent_config or {}).get("worker_role"),
+            "worker_role_source": (agent_config or {}).get("worker_role_source"),
             "models_config_priority": ["config/local.yaml", "config/models.yaml"],
+            "models_config_priority_scope": "discovery_search_order",
         },
     }
 
@@ -10476,6 +10490,8 @@ def _build_campaign_report_from_state(
     submit_results: list[Any],
     codex_update: bool,
     trials_config: dict[str, Any] | None = None,
+    trials_config_path: str | Path | None = None,
+    agent_config: dict[str, object] | None = None,
     update_policy: dict[str, Any] | None = None,
     round_task_concurrency: int = 1,
     task_rotation: dict[str, Any] | None = None,
@@ -10505,6 +10521,8 @@ def _build_campaign_report_from_state(
         submit_results=submit_results,
         codex_update=codex_update,
         trials_config=trials_config,
+        trials_config_path=trials_config_path,
+        agent_config=agent_config,
         update_policy=update_policy,
         round_task_concurrency=round_task_concurrency,
         stopped_reason=stopped_reason,
@@ -11521,11 +11539,34 @@ def _value_key(value: Any) -> str:
     return str(getattr(value, "value", value))
 
 
-def _git_output(command: list[str]) -> str:
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        return ""
-    return completed.stdout.strip()
+def _git_metadata(git_query_cwd: Path) -> dict[str, Any]:
+    """Observe this checkout at report generation, independently of historical trials."""
+    git_query_cwd = git_query_cwd.resolve()
+    metadata: dict[str, Any] = {
+        "git_scope": "report_generation_checkout",
+        "git_query_cwd": str(git_query_cwd),
+        "git_observed_at": datetime.now(UTC).isoformat(),
+        "git_commit": None,
+        "git_dirty": None,
+        "git_errors": {},
+    }
+    for field, arguments in (
+        ("git_commit", ["rev-parse", "HEAD"]),
+        ("git_dirty", ["status", "--short"]),
+    ):
+        try:
+            completed = subprocess.run(
+                ["git", *arguments], cwd=git_query_cwd, capture_output=True, text=True, check=False,
+            )
+        except OSError as exc:
+            metadata["git_errors"][field] = f"git unavailable: {type(exc).__name__}"
+            continue
+        if completed.returncode != 0:
+            metadata["git_errors"][field] = f"git exited with code {completed.returncode}"
+            continue
+        output = completed.stdout.strip()
+        metadata[field] = bool(output) if field == "git_dirty" else output
+    return metadata
 
 
 def _shell_join(argv: list[str]) -> str:
