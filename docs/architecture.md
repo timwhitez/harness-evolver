@@ -345,6 +345,79 @@ Two low-cost runner policies add signal before another edit:
   mission-candidate attempts, while supported attempts preserve the exact
   mission candidate id for evidence-backed extension.
 
+## Saved Trajectory Comparison
+
+`python scripts/compare_trials.py trial_a trial_b` keeps its summary output;
+`--json` emits a structured summary. Add `--trajectory` for a read-only view of
+saved attempts (also available as the installed `harness-evolver-compare` entry
+point):
+
+```bash
+harness-evolver-compare trial_a trial_b --trajectory --json \
+  --attempt-a task__attempt-a --attempt-b task__attempt-b
+```
+
+The view lists both attempt inventories. Each side can auto-select only a unique
+attempt; aggregates require exact saved attempt IDs, never array-position pairing.
+Different run-specific attempt IDs are allowed for the same task; unknown IDs or
+conflicting task/attempt ownership reject comparison. The reader prefers the
+local `trajectory.jsonl`, then `trajectory.json`, then embedded result events.
+Invalid files are reported rather than silently falling back. The new strict
+`TrajectoryReader.diagnose()` leaves legacy `load()` tolerance unchanged.
+
+Projection `saved_trajectory_v2` retains original event order, one-based event
+indices and source references, repeated calls, recovery/compaction archives,
+bootstrap, completion verification, and cancellation snapshots. Its report lists
+all ignored/normalized paths: top-level attempt annotations,
+declared tool-event timing annotations, historical optional tool-event transport
+IDs and snapshot run UUIDs are ignored;
+declared archived message IDs and `tool_result_delivery_incomplete.tool_call_ids[]`
+share one mapping by first occurrence within the selected attempt. List order,
+duplicate references and links between archive and delivery events are preserved.
+Arbitrary IDs/timestamps inside arguments, output or other payloads stay significant.
+Archived messages and metrics snapshots never become new executions. Rust request
+attempts, logical tool outcomes (including bootstrap), and unknown provider HTTP
+counts remain separate; missing legacy metrics stay unknown.
+
+Results are `identical`, `different`, or `partial`; partial evidence always lists
+its gaps and cannot establish equality, even if observed events match. The
+coverage contract requires current producer evidence for assistant messages,
+compaction, overflow recovery and metrics snapshots. Compaction and snapshots
+do not require a turn: their producers do not emit one. Missing historical fields
+remain unknown/partial. The compact versioned `EVENT_SCHEMAS` table in
+`bench/trajectory.py` types only COMMON identity/attempt fields and the events
+interpreted by the projection: `context_compaction`, `context_overflow_recovery`,
+`tool_result_delivery_incomplete`, `worker_metrics_snapshot`,
+`ephemeral_tool_output_pruned`, `tool_call`, `assistant_message`,
+`entrypoint_scan` (bootstrap), `llm_error_recovery_prompt`,
+`completion_verification`, and `rust_worker_core_cancelled`.
+Supplied malformed declared fields are input errors. All other event types and
+all undeclared fields have no type validation and compare verbatim as raw
+payload (JSON object key order ignored), except COMMON attempt annotations.
+Undeclared IDs and timing fields remain significant: a future unnormalized ID
+can conservatively yield `different`, never a false `identical`.
+Tests cover declared typed/transport paths and only check that interpreted event
+names still exist in the current producers. New producer events or fields require
+no schema update and do not fail a producer-drift gate in the HL/Codex loop.
+Only native complete snapshots
+with known counters and terminal Worker status can support equality.
+`first_difference` names the **first observable difference in the selected
+projection**, with selected position, original source events, and changed fields;
+it does not identify a cause. Metric-only differences are reported separately.
+`input_error`, `identity_mismatch`, and `selection_required` exit with code 2;
+all valid comparisons, including different/partial, exit with code 0. Invalid
+JSON-summary inputs also return `input_error`/2 without echoing their contents.
+With fewer than two saved trials, `--latest --json` (with or without
+`--trajectory`) returns `selection_required`/2; legacy text output is unchanged.
+
+Default payload displays contain type, redacted byte size and redacted SHA-256
+summaries. `--expand` explicitly displays local redacted parameters, outputs and
+archives. Equality uses saved values before display redaction, so a secret-only
+change still registers without revealing it. Credential-key/URL redaction follows
+the config boundary; free-text redaction follows campaign analysis patterns
+and masks quoted credential fields in JSON output fragments.
+Inputs, memory, scoreboard, scores and compaction history are never written.
+
 ## External Harness References
 
 Codex work packets include a `harness_reference_contract` so repeated poor
