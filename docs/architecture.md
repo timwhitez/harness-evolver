@@ -195,6 +195,18 @@ Worker context compaction uses the serialized UTF-8 JSON size of messages and
 tool schemas as a byte estimate, including tool arguments and retained reasoning;
 it does not claim an exact token count. The existing compaction threshold remains
 configurable. Normal compaction keeps recent complete interaction units. A
+new complete tool round keeps every existing bounded head/tail projection until
+a provider request accepts it, even when it exceeds the recent-result pruning
+window. Transient retries retain this protection; delivered older rounds still
+use the original window. The advisory threshold preserves the original short
+and recent-history guards and partial-progress behavior; it never drops the
+undelivered round, even when the request remains above target. Only a structured
+provider context-overflow rejection permits omission: recovery removes older
+units first, then may omit the entire pending call/result group with a
+`worker_tool_delivery` model notice and a `tool_result_delivery_incomplete`
+trajectory event (call IDs, `context_overflow` reason, and byte estimates).
+Irreducible system/task/work-state input uses `context_input_unfit`.
+This does not raise the context target or replay tools. A
 structured provider context-overflow response forces reduction even in short
 histories: system/task instructions survive, assistant calls and their parallel
 tool results are removed together, and meaningful todo/verification state is
