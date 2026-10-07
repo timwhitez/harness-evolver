@@ -197,6 +197,29 @@ def test_noneditable_wheel_install_runs_every_console_help_outside_checkout(
             completed.stderr,
         )
 
+    # The installed comparison uses saved synthetic evidence only, outside checkout.
+    memory = tmp_path / "compare-memory"
+    trace = [{"type": "assistant_message", "turn": 1, "content": "saved"}]
+    for trial_id in ("left", "right"):
+        trial_dir = memory / "runs" / trial_id
+        trial_dir.mkdir(parents=True)
+        (trial_dir / "result.json").write_text(json.dumps({
+            "trial_id": trial_id, "task_id": "wheel-task", "status": "unverified",
+            "turn_count": 1, "tool_calls": [], "trajectory": trace,
+            "metadata": {"worker_metrics_observation": {
+                "schema": "worker_metrics_v1", "status": "complete"}},
+        }), encoding="utf-8")
+    compare_executable = scripts_dir / (
+        "harness-evolver-compare.exe" if os.name == "nt" else "harness-evolver-compare")
+    compared = subprocess.run(
+        [str(compare_executable), "left", "right", "--trajectory", "--json",
+         "--memory-path", str(memory)],
+        cwd=tmp_path, env=isolated_environment, capture_output=True, text=True, check=False,
+    )
+    assert compared.returncode == 0, (compared.stdout, compared.stderr)
+    assert json.loads(compared.stdout)["status"] == "identical"
+    assert json.loads(compared.stdout)["projection_version"] == "saved_trajectory_v2"
+
     # Windows still validates wheel membership, installed imports, runtime
     # resources, and every console entry point above. A bare .py executable is
     # not a portable CreateProcess target for HL_WORKER_RUST_BIN, so the direct
