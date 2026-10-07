@@ -178,7 +178,7 @@ struct LlmError {
     kind: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ToolResponse {
     success: bool,
     output: String,
@@ -212,6 +212,8 @@ struct WorkerState {
     tool_schemas: Vec<Value>,
     trajectory: Vec<Value>,
     tool_call_history: Vec<Value>,
+    // Enabled-only association; serialized history retains its existing schema.
+    tool_result_archive_metadata: Option<HashMap<String, Value>>,
     // Bootstrap is reported, but must not change model-loop policy history.
     entrypoint_scan_tool_call: Option<Value>,
     token_usage: HashMap<String, i64>,
@@ -605,6 +607,7 @@ impl WorkerState {
             tool_schemas: request.tool_schemas,
             trajectory: request.initial_trajectory,
             tool_call_history: Vec::new(),
+            tool_result_archive_metadata: None,
             entrypoint_scan_tool_call: None,
             token_usage: HashMap::new(),
             usage_unknown: HashSet::new(),
@@ -1111,6 +1114,27 @@ impl WorkerState {
         completed_message_unit_end(&self.messages, start).map(|end| (start, end))
     }
 
+    fn archive_enabled(&self) -> bool {
+        self.task_context
+            .get("tool_result_archive_enabled")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && has_tool(&self.tool_schemas, "tool_result_read")
+    }
+
+    fn archive_hint(&self, metadata: &Value) -> String {
+        if !self.archive_enabled() {
+            return String::new();
+        }
+        let archive = &metadata["tool_result_archive"];
+        if let Some(reference) = archive["ref"].as_str() {
+            format!(" Captured ToolResult ref={reference}, capture_status={}; use tool_result_read without replay.",
+                archive["status"].as_str().unwrap_or("unknown"))
+        } else {
+            " Capture unavailable/unknown; use tool_result_index to discover current-attempt captures without replay.".to_string()
+        }
+    }
+
     fn prune_ephemeral_tool_outputs(&mut self) {
         let keep_recent = self.thresholds.ephemeral_tool_output_keep_recent;
         let max_chars = self.thresholds.ephemeral_tool_output_max_chars;
@@ -1144,8 +1168,17 @@ impl WorkerState {
             }
             let original_len = content.len();
             let head = truncate(content, 600);
+            let advice = if self.archive_enabled() {
+                let metadata = self.messages[idx]["tool_call_id"]
+                    .as_str()
+                    .and_then(|id| self.tool_result_archive_metadata.as_ref()?.get(id))
+                    .unwrap_or(&Value::Null);
+                self.archive_hint(metadata)
+            } else {
+                " Re-run the command if you need the full output again.".to_string()
+            };
             let placeholder = format!(
-                "[pruned {original_len}-char tool output to save context; only the most recent {keep_recent} tool results are kept in full. Re-run the command if you need the full output again.]\n{head}"
+                "[pruned {original_len}-char tool output to save context; only the most recent {keep_recent} tool results are kept in full.{advice}]\n{head}"
             );
             if let Some(map) = self.messages[idx].as_object_mut() {
                 map.insert("content".to_string(), json!(placeholder));
@@ -1167,12 +1200,18 @@ impl WorkerState {
         } else {
             failed_tool_content_for_model(result)
         };
+        // Archive tools already bound the complete JSON envelope. First-delivery
+        // protection and provider overflow recovery still govern the whole round.
+        if self.archive_enabled() && matches!(tool_name, "tool_result_read" | "tool_result_index") {
+            return raw;
+        }
+        let hint = self.archive_hint(&result.metadata);
         let max_chars = self.thresholds.ephemeral_tool_output_max_chars;
         if max_chars == 0 || raw.chars().count() <= max_chars {
             return if result.success {
-                raw
+                format!("{raw}{hint}")
             } else {
-                format!("Error: {raw}")
+                format!("Error: {raw}{hint}")
             };
         }
 
@@ -1192,8 +1231,13 @@ impl WorkerState {
             "omitted_chars": omitted,
         }));
         let prefix = if result.success { "" } else { "Error: " };
+        let advice = if self.archive_enabled() {
+            hint.as_str()
+        } else {
+            " Full output is preserved in trajectory artifacts when available; rerun a narrower command if exact omitted lines are needed."
+        };
         format!(
-            "{prefix}[tool output truncated for model context: original_chars={original_chars}, shown_chars={max_chars}, omitted_chars={omitted}. Full output is preserved in trajectory artifacts when available; rerun a narrower command if exact omitted lines are needed.]\n{head}\n...[omitted {omitted} chars]...\n{tail}"
+            "{prefix}[tool output truncated for model context: original_chars={original_chars}, shown_chars={max_chars}, omitted_chars={omitted}.{advice}]\n{head}\n...[omitted {omitted} chars]...\n{tail}"
         )
     }
 
@@ -1235,6 +1279,9 @@ impl WorkerState {
             "pending_completion_gate_repair_turn": self.pending_completion_gate_repair_turn,
             "pending_post_verification_todo_finalization_turn": self.pending_post_verification_todo_finalization_turn,
         });
+        if self.archive_enabled() {
+            work_state["tool_result_archive"] = json!("Use tool_result_index (next_offset) to rediscover current-attempt refs, then tool_result_read. Missing captures remain unknown; do not replay tools.");
+        }
         if let Some(fields) = work_state.as_object_mut() {
             fields.retain(|_, value| {
                 !value.is_null()
@@ -1277,7 +1324,11 @@ impl WorkerState {
             if omitting_pending {
                 self.messages.insert(self.messages.len().min(2), json!({
                     "role": "system", "name": "worker_tool_delivery",
-                    "content": "Latest tool round could not be delivered in full after provider context overflow; its complete call/result group was omitted. Do not replay writes. Use narrower reads or checks for missing evidence.",
+                    "content": if self.archive_enabled() {
+                        "Latest tool round could not be delivered in full after provider context overflow; its complete call/result group was omitted. Do not replay writes. Use tool_result_index to rediscover current-attempt refs and tool_result_read for captured evidence; unavailable captures remain unknown."
+                    } else {
+                        "Latest tool round could not be delivered in full after provider context overflow; its complete call/result group was omitted. Do not replay writes. Use narrower reads or checks for missing evidence."
+                    },
                 }));
             }
         }
@@ -1433,6 +1484,19 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
             let mut completed_tool_results = Vec::new();
             for call in tool_calls {
                 let (args, mut tool_result) = execute_tool_call(stdin, state, &call);
+                if state.archive_enabled()
+                    && tool_result.metadata.get("tool_result_archive").is_none()
+                    && !matches!(call.name.as_str(), "tool_result_read" | "tool_result_index")
+                {
+                    send_event(&json!({"type": "archive_request", "id": call.id,
+                        "tool": call.name, "result": tool_result}));
+                    let archive = read_typed_response::<Value>(stdin, "archive_response")
+                        .unwrap_or(json!({"ref": null, "status": "unknown", "reason": "archive_unavailable"}));
+                    if !tool_result.metadata.is_object() {
+                        tool_result.metadata = json!({});
+                    }
+                    tool_result.metadata["tool_result_archive"] = archive;
+                }
                 let terminal_failure =
                     terminal_environment_failure_text(&tool_result.error, &tool_result.output);
                 if let Some(observation) = terminal_failure {
@@ -1445,6 +1509,18 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
                     );
                 }
                 normalize_local_verification_exception_result(&call.name, &args, &mut tool_result);
+
+                if state.archive_enabled() {
+                    state
+                        .tool_result_archive_metadata
+                        .get_or_insert_with(HashMap::new)
+                        .insert(
+                            call.id.clone(),
+                            json!({
+                                "tool_result_archive": tool_result.metadata["tool_result_archive"]
+                            }),
+                        );
+                }
 
                 state.consecutive_empty_response_turns = 0;
                 let tool_event = json!({
