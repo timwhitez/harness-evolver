@@ -210,6 +210,30 @@ latency, API error counts, and cache-hit ratio. Campaign reports aggregate
 these metrics by domain, difficulty, task type, and whole campaign so future
 updates can optimize reliability and cost, not only pass/fail.
 
+Campaign final and checkpoint reports retain invocation provenance in
+`reproducibility`: `trials_config` is the supplied trials path, while
+`models_config_path`, `worker_role`, and `worker_role_source` come directly from
+the configuration resolver. `config_scope=report_invocation` applies even when
+the report aggregates stored trials; these fields do not identify historical
+trial inputs. CLI-only model requests retain `models_config_path=null`.
+`models_config_priority` remains a discovery search rule, labelled by
+`models_config_priority_scope=discovery_search_order`, rather than a selected
+source. Callers without source metadata emit `null` instead of inferring files.
+
+Git fields describe `git_scope=report_generation_checkout`: queries run with
+explicit `cwd=git_query_cwd`, the absolute invocation directory, which may be a
+subdirectory of the checkout. Commit and status describe the enclosing checkout;
+`git_observed_at` records collection start in UTC. `git_dirty` is `false` for a
+successful clean query, `true` for dirty, and `null` when unavailable. Each
+failed query leaves a bounded reason in `git_errors`, using only an exit code
+or exception class; commit and status failures remain independent. No raw
+configuration or environment dumps, Git diff, status paths, or error text is
+copied into these fields. Existing endpoint redaction remains in effect.
+Readers of older reports must treat absent fields as unknown, not clean or a
+default configuration. Report generation preserves trial/component snapshots
+and patch lineage; these observations are not an execution fingerprint or an
+atomic Git snapshot and do not change score, Mission, roadmap, or submit gates.
+
 Worker metrics schema `worker_metrics_v1` preserves optional `TrialResult.turn_count`
 and `metadata.turn_count`: the number of Rust model-request attempts, including
 failed requests and Worker recovery retries. Bootstrap is turn 0 and does not
