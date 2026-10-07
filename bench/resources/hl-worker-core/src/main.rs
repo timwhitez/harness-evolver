@@ -207,6 +207,8 @@ struct WorkerState {
     task_instruction: String,
     task_context: Value,
     messages: Vec<Value>,
+    // A complete tool round stays intact until a provider accepts its projection.
+    pending_tool_round: bool,
     tool_schemas: Vec<Value>,
     trajectory: Vec<Value>,
     tool_call_history: Vec<Value>,
@@ -599,6 +601,7 @@ impl WorkerState {
             task_instruction: request.task_instruction,
             task_context: request.task_context,
             messages: request.initial_messages,
+            pending_tool_round: false,
             tool_schemas: request.tool_schemas,
             trajectory: request.initial_trajectory,
             tool_call_history: Vec::new(),
@@ -1094,6 +1097,20 @@ impl WorkerState {
         }
     }
 
+    fn pending_tool_round_range(&self) -> Option<(usize, usize)> {
+        if !self.pending_tool_round {
+            return None;
+        }
+        let start = self.messages.iter().rposition(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+        })?;
+        completed_message_unit_end(&self.messages, start).map(|end| (start, end))
+    }
+
     fn prune_ephemeral_tool_outputs(&mut self) {
         let keep_recent = self.thresholds.ephemeral_tool_output_keep_recent;
         let max_chars = self.thresholds.ephemeral_tool_output_max_chars;
@@ -1112,8 +1129,12 @@ impl WorkerState {
             return;
         }
         let prune_until = tool_indices.len() - keep_recent;
+        let pending = self.pending_tool_round_range();
         let mut pruned = 0usize;
         for &idx in &tool_indices[..prune_until] {
+            if pending.is_some_and(|(start, end)| idx > start && idx < end) {
+                continue;
+            }
             let content = self.messages[idx]
                 .get("content")
                 .and_then(Value::as_str)
@@ -1229,6 +1250,7 @@ impl WorkerState {
             }
         }
         let mut omitted = Vec::new();
+        let mut undelivered_ids = Vec::new();
         // ponytail: reserialize per removed unit; incremental sizes if huge histories make this costly.
         while request_size_bytes(&self.messages, &self.tool_schemas) >= target {
             let unit = (2..self.messages.len()).find_map(|start| {
@@ -1238,7 +1260,26 @@ impl WorkerState {
             if !forced && self.messages.len().saturating_sub(end) < 12 {
                 break;
             }
+            let omitting_pending =
+                undelivered_ids.is_empty() && self.pending_tool_round_range() == Some((start, end));
+            if !forced && omitting_pending {
+                break;
+            }
+            if omitting_pending {
+                undelivered_ids = self.messages[start]["tool_calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|call| call["id"].clone())
+                    .collect();
+            }
             omitted.extend(self.messages.drain(start..end));
+            if omitting_pending {
+                self.messages.insert(self.messages.len().min(2), json!({
+                    "role": "system", "name": "worker_tool_delivery",
+                    "content": "Latest tool round could not be delivered in full after provider context overflow; its complete call/result group was omitted. Do not replay writes. Use narrower reads or checks for missing evidence.",
+                }));
+            }
         }
         let after = request_size_bytes(&self.messages, &self.tool_schemas);
         if omitted.is_empty() || after >= before || (forced && after >= target) {
@@ -1251,6 +1292,16 @@ impl WorkerState {
             "omitted_messages": omitted.len(), "omitted_history": omitted,
             "semantic_summary_generated": false,
         }));
+        if !undelivered_ids.is_empty() {
+            self.pending_tool_round = false;
+            self.append_trajectory(json!({
+                "type": "tool_result_delivery_incomplete", "turn": self.turn_count,
+                "tool_call_ids": undelivered_ids,
+                "reason": "context_overflow",
+                "estimate_unit": "serialized_request_bytes", "target_bytes": target,
+                "before_bytes": before, "after_bytes": after,
+            }));
+        }
         true
     }
 }
@@ -1355,6 +1406,7 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
             state.compact_if_needed();
             continue;
         }
+        state.pending_tool_round = false;
         state.accumulate_usage(&response.usage, &response.usage_observation);
         let content = response.message.content.clone();
         if !response.message.tool_calls.is_empty() {
@@ -1489,6 +1541,7 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
                 }
             }
 
+            state.pending_tool_round = true;
             for hint in correction_hints {
                 state.append_user_message(hint);
             }
@@ -28484,6 +28537,180 @@ mod tests {
                 .unwrap()
                 .len()
         );
+    }
+
+    #[test]
+    fn fresh_tool_round_survives_repeated_preparation_and_only_protects_matching_results() {
+        let mut state = worker_state_for_unit_tests();
+        state.thresholds.compaction_char_threshold = 120000;
+        state.messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"task"}),
+        ];
+        for _ in 0..2 {
+            // IDs may repeat across rounds: protect the newest paired unit by position.
+            state
+                .messages
+                .push(json!({"role":"assistant","content":"", "tool_calls":
+                (0..5).map(|id| json!({"id":format!("call-{id}"),"function":{
+                    "name":"read","arguments":"{}"}})).collect::<Vec<_>>() }));
+            for id in (0..5).rev() {
+                let result = ToolResponse {
+                    success: true,
+                    output: format!("{}<TAIL:{id}>", "X".repeat(5000)),
+                    error: String::new(),
+                    duration_ms: 0.0,
+                    metadata: json!({}),
+                };
+                let content = state.tool_result_content_for_model("read", &result);
+                state
+                    .messages
+                    .push(json!({"role":"tool", "tool_call_id":format!("call-{id}"),
+                    "content":content}));
+            }
+        }
+        state.append_user_message("A correction hint after the complete tool round.".into());
+        state.pending_tool_round = true;
+        assert_eq!(state.pending_tool_round_range(), Some((8, 14)));
+        let fresh = state.messages[8..14].to_vec();
+        state.prune_ephemeral_tool_outputs();
+        assert!(state.messages[3]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[pruned "));
+        let prepared = state.messages.clone();
+        for _ in 0..3 {
+            state.prune_ephemeral_tool_outputs();
+            state.compact_if_needed();
+            assert_eq!(state.messages, prepared);
+            assert_eq!(state.messages[8..14], fresh);
+        }
+        state.pending_tool_round = false;
+        state.prune_ephemeral_tool_outputs();
+        assert!(state.messages[9]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[pruned "));
+        assert_eq!(completed_message_unit_end(&state.messages, 8), Some(14));
+        state.pending_tool_round = true;
+        state.messages[9]["tool_call_id"] = json!("wrong-id");
+        let invalid = state.messages.clone();
+        assert_eq!(state.pending_tool_round_range(), None);
+        state.prune_ephemeral_tool_outputs();
+        assert_eq!(state.messages, invalid);
+    }
+
+    fn single_result_pending_history(rounds: usize) -> WorkerState {
+        let mut state = worker_state_for_unit_tests();
+        state.thresholds.compaction_char_threshold = 120000;
+        state.messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"task"}),
+        ];
+        for index in 0..rounds {
+            state
+                .messages
+                .push(json!({"role":"assistant","content":"","tool_calls":[{
+                "id":format!("call-{index}"),"type":"function","function":{
+                    "name":"read","arguments":format!("{{\"query\":\"{}\"}}", "A".repeat(30000))
+                }}]}));
+            state
+                .messages
+                .push(json!({"role":"tool","tool_call_id":format!("call-{index}"),
+                "content":format!("evidence-{index}")}));
+        }
+        state.pending_tool_round = true;
+        state
+    }
+
+    #[test]
+    fn advisory_compaction_preserves_pending_history_at_14_message_guard() {
+        let mut state = single_result_pending_history(6);
+        let original = state.messages.clone();
+        assert_eq!(original.len(), 14);
+        assert!(request_size_bytes(&original, &state.tool_schemas) > 120000);
+        state.prune_ephemeral_tool_outputs();
+        state.compact_if_needed();
+        // Baseline 4ff6f63 retains the entire short history, even above target.
+        assert_eq!(state.messages, original);
+        assert_eq!(state.pending_tool_round_range(), Some((12, 14)));
+        assert!(state.trajectory.is_empty());
+    }
+
+    #[test]
+    fn advisory_compaction_preserves_pending_history_at_16_message_guard() {
+        let mut state = single_result_pending_history(7);
+        let original = state.messages.clone();
+        assert_eq!(original.len(), 16);
+        state.prune_ephemeral_tool_outputs();
+        state.compact_if_needed();
+        // Baseline removes only the oldest unit, leaving 12 trailing messages.
+        let expected: Vec<_> = original[..2]
+            .iter()
+            .chain(&original[4..])
+            .cloned()
+            .collect();
+        assert_eq!(state.messages, expected);
+        assert_eq!(state.messages.len(), 14);
+        assert_eq!(state.messages[3]["content"], "evidence-1");
+        assert!(request_size_bytes(&state.messages, &state.tool_schemas) > 120000);
+        assert_eq!(state.pending_tool_round_range(), Some((12, 14)));
+        assert_eq!(
+            state.trajectory.last().unwrap()["omitted_history"],
+            json!(original[2..4])
+        );
+    }
+
+    #[test]
+    fn advisory_compaction_keeps_partial_progress_when_input_exceeds_target() {
+        let mut state = single_result_pending_history(7);
+        state.messages[1]["content"] = json!("task".repeat(40000));
+        let original = state.messages.clone();
+        let before = request_size_bytes(&original, &state.tool_schemas);
+        assert!(state.compact_context(None));
+        // An unreachable advisory target must not roll back baseline partial progress.
+        let expected: Vec<_> = original[..2]
+            .iter()
+            .chain(&original[4..])
+            .cloned()
+            .collect();
+        assert_eq!(state.messages, expected);
+        let after = request_size_bytes(&state.messages, &state.tool_schemas);
+        assert!(after > 120000 && after < before);
+        assert_eq!(state.pending_tool_round_range(), Some((12, 14)));
+        assert_eq!(
+            state.trajectory.last().unwrap()["reason"],
+            "payload_threshold"
+        );
+    }
+
+    #[test]
+    fn advisory_compaction_stops_before_pending_unit_with_12_trailing_hints() {
+        let mut state = single_result_pending_history(2);
+        state.messages[4]["tool_calls"][0]["function"]["arguments"] =
+            json!(format!("{{\"query\":\"{}\"}}", "A".repeat(150000)));
+        for index in 0..12 {
+            state.append_user_message(format!("correction hint {index}"));
+        }
+        let original = state.messages.clone();
+        // Both baseline history guards allow removal here; pending protection must stop it.
+        assert_eq!(
+            original.len() - state.pending_tool_round_range().unwrap().1,
+            12
+        );
+        assert!(state.compact_context(None));
+        let expected: Vec<_> = original[..2]
+            .iter()
+            .chain(&original[4..])
+            .cloned()
+            .collect();
+        assert_eq!(state.messages, expected);
+        assert_eq!(state.pending_tool_round_range(), Some((2, 4)));
+        assert!(request_size_bytes(&state.messages, &state.tool_schemas) > 120000);
+        assert!(!state
+            .trajectory
+            .iter()
+            .any(|event| event["type"] == "tool_result_delivery_incomplete"));
     }
 
     #[test]
