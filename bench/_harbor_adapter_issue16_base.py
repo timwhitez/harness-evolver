@@ -1664,7 +1664,8 @@ class HLWorkerHarborAgent(BaseAgent):
                 else {}
             ),
         )
-        return HLAgent(config=config, tool_registry=registry, role_config=role_config)
+        return HLAgent(config=config, tool_registry=registry, role_config=role_config,
+                       tool_result_evidence_path=self.logs_dir)
 
     def _build_environment_registry(
         self,

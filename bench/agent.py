@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import re
 import secrets
 import signal
@@ -15,6 +16,7 @@ import threading
 from typing import Any
 
 from bench import _agent_issue8_base as _base
+from bench.tool_result_archive import ArchiveTool, ToolResultArchive
 from bench.worker_protocol import WorkerStdout, WorkerProtocolError, validate_shutdown_bounds
 
 for _name, _value in vars(_base).items():
@@ -144,6 +146,46 @@ class HLAgent(_base.HLAgent):
     rust_stderr_tail_bytes: int = 65_536
     rust_shutdown_timeout_seconds: float = 5.0
     rust_stdout_frame_bytes: int = 64 * 1024 * 1024
+    tool_result_evidence_path: Path | None = None
+    _tool_result_archive: ToolResultArchive | None = field(default=None, init=False, repr=False)
+
+    def _initialize_run_state(self, task_instruction, task_context):
+        super()._initialize_run_state(task_instruction, task_context)
+        if self._tool_result_archive is not None:
+            for name in ("tool_result_index", "tool_result_read"):
+                self.tool_registry.unregister(name)
+        self._tool_result_archive = None
+        if self.config.tool_result_archive_enabled:
+            self._tool_result_archive = ToolResultArchive(
+                self.tool_result_evidence_path or task_context.get("evidence_path"),
+                secret_env_names=(self.role_config.api_key_env,) if self.role_config else ())
+            for read in (False, True):
+                self.tool_registry.register(ArchiveTool(self._tool_result_archive, read=read))
+
+    def _rust_worker_request(self, task_instruction, task_context):
+        request = super()._rust_worker_request(task_instruction, task_context)
+        if self.config.tool_result_archive_enabled:
+            request["task_context"] = dict(request["task_context"])
+            request["task_context"].pop("evidence_path", None)
+            request["task_context"]["tool_result_archive_enabled"] = True
+        return request
+
+    def _archive_bridge_result(self, event, result):
+        if self._tool_result_archive is None:
+            return {"ref": None, "status": "unknown", "reason": "archive_unavailable"}
+        cancelled = self._run_cancellation is not None and self._run_cancellation.is_set()
+        return self._tool_result_archive.capture(
+            event.get("id", ""), event.get("tool", ""), result, partial=cancelled,
+            producer=self.tool_registry.get(event.get("tool", "")))
+
+    def _execute_bridge_tool(self, event):
+        result = super()._execute_bridge_tool(event)
+        if self.config.tool_result_archive_enabled and event.get("tool") not in (
+                "tool_result_index", "tool_result_read"):
+            archive = self._archive_bridge_result(event, result)
+            metadata = result["metadata"] if isinstance(result["metadata"], dict) else {}
+            result["metadata"] = {**metadata, "tool_result_archive": archive}
+        return result
 
     @staticmethod
     def _write_bridge_event(process: subprocess.Popen, event: dict[str, Any]) -> None:
@@ -367,6 +409,11 @@ class HLAgent(_base.HLAgent):
                             "payload": self._execute_bridge_tool(event),
                         },
                     )
+                elif event_type == "archive_request":
+                    self._write_bridge_event(process, {
+                        "type": "archive_response",
+                        "payload": self._archive_bridge_result(event, event["result"]),
+                    })
                 elif event_type == "trajectory_event":
                     trajectory_event = event.get("event")
                     if isinstance(trajectory_event, dict):

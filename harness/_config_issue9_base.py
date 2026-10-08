@@ -279,6 +279,8 @@ class HarnessConfig(BaseModel):
 
     # Global settings
     model: str = "claude-sonnet-4-6"
+    # Attempt-local exact tool capture experiment; never a loop budget.
+    tool_result_archive_enabled: bool = Field(default=False, strict=True)
     # Compatibility/progress reference only. ``0`` disables turn-count based
     # late-run heuristics; Worker loops do not have a turn-count stop condition.
     # Legacy configs may still provide ``max_turns``; new serialized configs use

@@ -216,6 +216,98 @@ request; irreducible input returns `context_input_unfit` for external model/inpu
 reconfiguration. This diagnoses a rejected input, not a turn/time/token budget.
 Transient provider errors retain their existing recovery path.
 
+The `HarnessConfig.tool_result_archive_enabled` experiment defaults to `false`.
+With it off, Worker prompts, schemas, projections, and trajectories retain the
+existing contract, including first-delivery protection. Enable it explicitly in
+the harness YAML (`version: 0.1.0`, `tool_result_archive_enabled: true`); the
+Harbor adapter passes its existing attempt `logs_dir` as the evidence root.
+Direct `HLAgent` callers supply `tool_result_evidence_path` or trusted task-context
+`evidence_path`. Without a root, captures remain unknown; no fallback host memory
+store is created.
+
+When enabled, the Python boundary stores the exact captured ToolResult JSON
+(success, output, error, duration, metadata) before Rust projection/normalization
+under `<evidence root>/tool-results/<scope>/`. Rust local argument/policy
+rejections use the same capture boundary without dispatching an environment
+action. Archive reads/index responses are not recursively archived. Each run
+creates a fresh opaque scope; trusted host recovery may reopen that same scope.
+No model argument can select a scope, directory, host path, or another attempt.
+Refs identify journalled captures, never filenames. Checksums, regular-file
+checks and no-follow opens reject missing, altered, or symlinked payloads.
+Directory creation/opening rejects symlinks at every ancestor and retains a
+stable scope descriptor for file operations; replaced directory chains fail
+closed without redirecting captures to another attempt.
+
+Two optional tools follow the existing bounded read-window contract:
+`tool_result_index(offset=0, limit=16)` discovers refs with call IDs, tool names,
+status and `next_offset` (identifier displays cap at 32 characters with explicit
+truncation flags); `tool_result_read(ref, offset=0, limit=1024)` returns a
+complete JSON envelope with `content`, `total_chars`, `next_offset`, `truncated`,
+`capture_status`, and Unicode-character offsets into captured JSON. Concatenate
+content pages before decoding the original ToolResult. Index limits are 1–16;
+read limits are 1–1024; offsets are nonnegative integers. Entire successful
+bounded envelopes survive first delivery to the provider, even with a smaller
+ordinary projection limit. Existing provider-overflow recovery may still omit
+a whole round; compaction/pruning notices direct the model to rediscover refs.
+These tools read evidence only and prescribe no retrieval order or solving phase;
+ordinary file tools still support revisable notes.
+
+Capture exactness and upstream coverage are separate. Every stored payload is
+the exact boundary JSON; `capture_status` is default-deny upstream coverage.
+Only these exact built-in producer types may report `complete` (registry names
+and subclasses do not establish coverage):
+
+| Producer allowlist | Verified output-coverage contract |
+| --- | --- |
+| `FileReadTool` | Successful full range starting at line 1, known EOF/total, returned/end line counts equal total, no continuation or line/output truncation. Memory bounds alone do not imply omission. |
+| `FileWriteTool`, `FileEditTool` | Successful publication receipt with `atomic_replace=true`, `publication_state=published`, and no publication error, cleanup or durability warning. Receipts do not claim to contain the file contents. |
+| `TodoReadTool`, `TodoWriteTool` | Successful complete task-local list or update receipt; neither producer bounds its output. Pending todos are task state, not omitted output. |
+
+Any explicit partial, truncation, pagination, omission, failure, timeout or
+cancellation signal takes precedence, including failed results/error strings,
+GrepTool's `partial_results_available`, `read_error_count`, `search_failed`,
+omitted result/diagnostic counts, input-line/decode errors, per-line truncation,
+publication warnings, and the shell `output bytes omitted` marker. These mean
+`partial`. A read starting after line 1 is also partial even when it reaches EOF.
+Bounded output (`output_bounded` or `host_output_bounded`) without reliable
+coverage, unknown/null/non-mapping metadata, unverified tools (including shell,
+verify, grep, glob, goal and done), custom/registered replacements, and missing
+required range/publication metadata mean `unknown`. Real built-in executions
+and a signal table exercise these rules through capture, index and reads.
+Original metadata is captured exactly before bridge annotation normalization.
+Credential checks recursively inspect both keys and values at capture and read,
+including quoted credential assignments in output/error strings. Credential-name
+checks apply only to string values, so numeric/bool/null metrics are retained;
+configured credential values, credential strings and forbidden paths remain
+checked. Sensitive captures are withheld entirely, never redacted as exact.
+An interrupted tool with no completed output has no fabricated
+capture. Archive failure, storage/index quota, invalid/cross-attempt refs,
+missing/tampered captures, and absent legacy history remain `unknown`.
+Discovery always labels historical coverage unknown. Captures containing known
+environment/configured provider credentials, credential-shaped values, host HL
+memory paths or hidden verifier paths are withheld (`sensitive_capture`), rather
+than redacted and mislabelled exact. The archive does not grant new access to
+host evidence; existing task-tool guards still apply.
+
+Storage is capped at **16 MiB of captured JSON plus 1 MiB of discovery journal,
+with at most 2048 records per scope**. These are archive storage bounds, not
+Worker stop policies. Quota errors preserve execution and report unknown capture
+status. Files remain with their attempt evidence until the operator applies the
+same retention/cleanup policy to that attempt; this experiment adds no automatic
+cleanup. Integrity verification rereads a bounded capture on each page/index
+lookup, so archive I/O is an explicit cost, not free retrieval.
+
+No model capability improvement is established by offline contract tests.
+A later A/B experiment must freeze paired task/environment families (including
+held-out families), effective model/provider/reasoning configuration and all
+end-to-end resource conditions. Compare flag off/on; an optional storage-only
+audit arm must receive no extra solving allowance. Predeclare pairing, total
+resources and stopping conditions externally; account for all requests/tokens,
+tool actions, archive I/O, retries and wall time. Preserve errors, cancellations,
+censored/unknown and incomplete tasks; report verifier quality and exact/no-replay
+contracts before cost/coverage. Invocation provenance alone is not proof of equal
+historical execution inputs. Default enablement awaits measured tradeoffs.
+
 Trial reports also preserve efficiency evidence parsed from Harbor artifacts:
 token usage, cache tokens, cost when available, turns, API calls, provider
 latency, API error counts, and cache-hit ratio. Campaign reports aggregate
