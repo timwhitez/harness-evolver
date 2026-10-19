@@ -213,7 +213,6 @@ struct WorkerState {
     trajectory: Vec<Value>,
     tool_call_history: Vec<Value>,
     // Enabled-only association; serialized history retains its existing schema.
-    tool_result_archive_metadata: Option<HashMap<String, Value>>,
     // Bootstrap is reported, but must not change model-loop policy history.
     entrypoint_scan_tool_call: Option<Value>,
     token_usage: HashMap<String, i64>,
@@ -602,12 +601,11 @@ impl WorkerState {
         Self {
             task_instruction: request.task_instruction,
             task_context: request.task_context,
-            messages: request.initial_messages,
+            messages: public_worker_messages(&request.initial_messages),
             pending_tool_round: false,
             tool_schemas: request.tool_schemas,
             trajectory: request.initial_trajectory,
             tool_call_history: Vec::new(),
-            tool_result_archive_metadata: None,
             entrypoint_scan_tool_call: None,
             token_usage: HashMap::new(),
             usage_unknown: HashSet::new(),
@@ -818,7 +816,7 @@ impl WorkerState {
             "model_used": self.model_used,
             "token_usage": self.reported_usage(),
             "error_log": self.completion_error_log(),
-            "messages": self.messages,
+            "messages": public_worker_messages(&self.messages),
             "turn_count": self.turn_count,
         })
     }
@@ -838,7 +836,7 @@ impl WorkerState {
             "token_usage": self.reported_usage(),
             "error_log": [error],
             "metadata": metadata,
-            "messages": self.messages,
+            "messages": public_worker_messages(&self.messages),
             "turn_count": self.turn_count,
         })
     }
@@ -884,7 +882,7 @@ impl WorkerState {
                 "provider_auth_failure_stop_condition": false,
                 "provider_billing_quota_stop_condition": false,
             },
-            "messages": self.messages,
+            "messages": public_worker_messages(&self.messages),
             "turn_count": self.turn_count,
         })
     }
@@ -909,7 +907,7 @@ impl WorkerState {
                 "terminal_environment_failure_tool": tool_name,
                 "terminal_environment_failure_observation": truncate(observation, 1000),
             },
-            "messages": self.messages,
+            "messages": public_worker_messages(&self.messages),
             "turn_count": self.turn_count,
         })
     }
@@ -1169,9 +1167,8 @@ impl WorkerState {
             let original_len = content.len();
             let head = truncate(content, 600);
             let advice = if self.archive_enabled() {
-                let metadata = self.messages[idx]["tool_call_id"]
-                    .as_str()
-                    .and_then(|id| self.tool_result_archive_metadata.as_ref()?.get(id))
+                let metadata = self.messages[idx]
+                    .get("__hl_archive_capture")
                     .unwrap_or(&Value::Null);
                 self.archive_hint(metadata)
             } else {
@@ -1340,7 +1337,7 @@ impl WorkerState {
         self.append_trajectory(json!({
             "type": "context_compaction", "reason": if forced { "context_overflow" } else { "payload_threshold" },
             "estimate_unit": "serialized_request_bytes", "before_bytes": before, "after_bytes": after,
-            "omitted_messages": omitted.len(), "omitted_history": omitted,
+            "omitted_messages": omitted.len(), "omitted_history": public_worker_messages(&omitted),
             "semantic_summary_generated": false,
         }));
         if !undelivered_ids.is_empty() {
@@ -1357,9 +1354,23 @@ impl WorkerState {
     }
 }
 
+// Reserved fields never cross a provider/report boundary or bind legacy input.
+fn public_worker_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut public = message.clone();
+            if let Some(object) = public.as_object_mut() {
+                object.remove("__hl_archive_capture");
+            }
+            public
+        })
+        .collect()
+}
+
 fn request_size_bytes(messages: &[Value], tools: &[Value]) -> usize {
     // A UTF-8 JSON byte estimate, not a tokenizer or a provider's exact wire size.
-    serde_json::to_vec(&json!({"messages": messages, "tools": tools, "tool_choice": "auto"}))
+    serde_json::to_vec(&json!({"messages": public_worker_messages(messages), "tools": tools, "tool_choice": "auto"}))
         .map_or(usize::MAX, |payload| payload.len())
 }
 
@@ -1410,7 +1421,7 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
         state.turn_count += 1;
         send_event(&json!({
             "type": "llm_request",
-            "messages": state.messages,
+            "messages": public_worker_messages(&state.messages),
             "tool_schemas": state.tool_schemas,
         }));
         let response = match read_typed_response::<LlmResponse>(stdin, "llm_response") {
@@ -1510,18 +1521,6 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
                 }
                 normalize_local_verification_exception_result(&call.name, &args, &mut tool_result);
 
-                if state.archive_enabled() {
-                    state
-                        .tool_result_archive_metadata
-                        .get_or_insert_with(HashMap::new)
-                        .insert(
-                            call.id.clone(),
-                            json!({
-                                "tool_result_archive": tool_result.metadata["tool_result_archive"]
-                            }),
-                        );
-                }
-
                 state.consecutive_empty_response_turns = 0;
                 let tool_event = json!({
                     "turn": state.turn_count,
@@ -1566,11 +1565,21 @@ fn run_worker(stdin: &mut impl BufRead, state: &mut WorkerState) -> WorkerExit {
                     "error": tool_result.error,
                 }));
                 let tool_content = state.tool_result_content_for_model(&call.name, &tool_result);
-                state.messages.push(json!({
+                let mut message = json!({
                     "role": "tool",
                     "tool_call_id": call.id,
                     "content": tool_content,
-                }));
+                });
+                if state.archive_enabled() {
+                    // The monotonic actual-call ordinal identifies this occurrence,
+                    // independently of reusable provider IDs or moving message indices.
+                    // The descriptor travels with its message through clone/drain/rollback.
+                    message["__hl_archive_capture"] = json!({
+                        "occurrence": state.tool_call_history.len(),
+                        "tool_result_archive": tool_result.metadata["tool_result_archive"],
+                    });
+                }
+                state.messages.push(message);
 
                 if tool_result
                     .metadata
@@ -28674,6 +28683,117 @@ mod tests {
         assert_eq!(state.pending_tool_round_range(), None);
         state.prune_ephemeral_tool_outputs();
         assert_eq!(state.messages, invalid);
+    }
+
+    #[test]
+    fn archive_occurrence_survives_reused_transport_ids() {
+        let mut state = worker_state_for_unit_tests();
+        state.task_context["tool_result_archive_enabled"] = json!(true);
+        state.tool_schemas = vec![
+            json!({"type":"function","function":{"name":"occurrence_read","parameters":{"type":"object"}}}),
+            json!({"type":"function","function":{"name":"tool_result_read","parameters":{"type":"object"}}}),
+        ];
+        state.thresholds.compaction_char_threshold = 1_000_000;
+        state.messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"task"}),
+        ];
+        let mut protocol = String::new();
+        for round in 0..2 {
+            let calls: Vec<Value> = (0..5)
+                .map(|id| {
+                    json!({
+                        "id":format!("call-{id}"),"name":"occurrence_read",
+                        "arguments":format!("{{\"key\":\"call-{id}\"}}")
+                    })
+                })
+                .collect();
+            protocol.push_str(&format!("{}\n", json!({"type":"llm_response","payload":{"message":{"content":"","tool_calls":calls}}})));
+            for id in 0..5 {
+                protocol.push_str(&format!(
+                    "{}\n",
+                    json!({"type":"tool_response","payload":{
+                        "success":true,"output":format!("round-{round}/{id}:{}", "X".repeat(3990)),
+                        "error":"","duration_ms":1,"metadata":{"tool_result_archive":{
+                            "ref":format!("capture-{round}-{id}"),"status":"unknown"
+                        }}
+                    }})
+                ));
+            }
+        }
+        let mut input = io::Cursor::new(protocol.as_bytes());
+        // EOF after the third request ends this local protocol; it sends no model
+        // or environment request and leaves the two completed rounds inspectable.
+        let _ = run_worker(&mut input, &mut state);
+        let results: Vec<_> = state
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), 10);
+        for (index, message) in results.iter().enumerate() {
+            let round = index / 5;
+            let id = index % 5;
+            let content = message["content"].as_str().unwrap();
+            assert_eq!(content.starts_with("[pruned "), round == 0);
+            assert!(
+                content.contains(&format!("ref=capture-{round}-{id}, capture_status=unknown")),
+                "wrong occurrence hint at {index}"
+            );
+        }
+        let public = state.final_unverified_result()["messages"].clone();
+        assert!(!public.to_string().contains("__hl_archive_capture"));
+        assert_eq!(
+            request_size_bytes(&state.messages, &state.tool_schemas),
+            serde_json::to_vec(
+                &json!({"messages":public,"tools":state.tool_schemas,"tool_choice":"auto"})
+            )
+            .unwrap()
+            .len()
+        );
+    }
+
+    #[test]
+    fn archive_occurrence_survives_compaction_clone_and_overflow_rollback() {
+        let mut state = single_result_pending_history(7);
+        state.task_context["tool_result_archive_enabled"] = json!(true);
+        state.tool_schemas = vec![json!({"function":{"name":"tool_result_read"}})];
+        for index in 0..7 {
+            state.messages[3 + index * 2]["__hl_archive_capture"] = json!({
+                "occurrence":index + 1,"tool_result_archive":{"ref":format!("capture-{index}"),"status":"partial"}
+            });
+        }
+        let original = state.messages.clone();
+        assert!(!state.compact_context(Some(1)));
+        assert_eq!(state.messages, original);
+        assert!(state.compact_context(None));
+        let kept: Vec<_> = state
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(kept.len(), 6);
+        for (position, message) in kept.iter().enumerate() {
+            assert_eq!(message["__hl_archive_capture"]["occurrence"], position + 2);
+            assert_eq!(
+                message["__hl_archive_capture"]["tool_result_archive"]["ref"],
+                format!("capture-{}", position + 1)
+            );
+        }
+        let public = public_worker_messages(&state.messages);
+        assert!(!serde_json::to_string(&public)
+            .unwrap()
+            .contains("__hl_archive_capture"));
+        assert!(!serde_json::to_string(&state.trajectory)
+            .unwrap()
+            .contains("__hl_archive_capture"));
+        for result in [
+            state.final_unverified_result(),
+            state.error_result("controlled".into(), json!({})),
+            state.terminal_environment_unavailable_result("fixture", "controlled"),
+        ] {
+            assert_eq!(result["messages"], json!(public));
+        }
     }
 
     fn single_result_pending_history(rounds: usize) -> WorkerState {

@@ -558,3 +558,7 @@ pytest tests/test_hl_loop.py -v
 # With coverage
 pytest tests/ -v --cov=hl --cov=harness --cov=bench --cov=meta
 ```
+
+### Tool-result archive occurrence binding (#161)
+
+Each actual archived tool result retains its immutable capture descriptor and monotonic call occurrence beside the internal message. The provider transport ID remains solely the protocol pairing ID and may repeat across rounds. Message clone, compaction drain and failed-overflow rollback carry or remove that association with the result. Initial history has no trusted occurrence binding; an unbound result remains unknown. Archive read/index results do not replace older descriptors. Reserved internal association fields are stripped from provider requests, returned messages, omitted-history trajectories and serialized request-size accounting. Default-off ordinary request/trajectory bytes remain unchanged. Python scope/sequence refs, storage quotas, integrity/privacy controls and tool execution policies are unchanged.
