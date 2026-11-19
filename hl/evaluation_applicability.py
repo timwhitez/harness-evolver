@@ -46,30 +46,80 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _extract_worker_mapping_parts(raw_config: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Extract normalized worker-config representations from a single mapping."""
+    parts: list[dict[str, str]] = []
+    nested_scope = raw_config.get("scope")
+    if isinstance(nested_scope, str) and nested_scope.strip():
+        parsed = normalize_model_config(parse_model_scope_string(nested_scope))
+        if parsed:
+            parts.append(parsed)
+    nested_cfg = raw_config.get("config")
+    if isinstance(nested_cfg, Mapping):
+        norm_cfg = normalize_model_config(nested_cfg)
+        if norm_cfg:
+            parts.append(norm_cfg)
+    flat_norm = normalize_model_config(raw_config)
+    if flat_norm:
+        parts.append(flat_norm)
+    return parts
+
+
 def _normalize_worker_config(
     raw_config: Mapping[str, Any] | None,
     *,
     fallback_model: str = "",
     raw_model_scope: str = "",
-) -> tuple[dict[str, str] | None, str | None, dict[str, str]]:
-    """Return (canonical_dict, canonical_scope, partial_hints) or (None, None, hints)."""
-    merged: dict[str, Any] = {}
+    extra_configs: list[Mapping[str, Any]] | None = None,
+    extra_model_scopes: list[str] | None = None,
+) -> tuple[dict[str, str] | None, str | None, dict[str, str], str | None]:
+    """Return (canonical_dict, canonical_scope, partial_hints, conflict_reason).
+
+    Multiple worker identity representations inside the same record are each
+    normalized independently via ``normalize_model_config`` and compared on
+    overlapping known fields. Any contradiction preserves a conflict reason
+    and resolves to unknown instead of overwriting by field priority; consistent
+    or genuinely complementary sources are merged.
+    """
+    parts: list[dict[str, str]] = []
+
+    scopes: list[str] = []
     if raw_model_scope:
-        merged.update(parse_model_scope_string(raw_model_scope))
+        scopes.append(raw_model_scope)
+    if extra_model_scopes:
+        scopes.extend(s for s in extra_model_scopes if s)
+    for scope_str in scopes:
+        parsed = normalize_model_config(parse_model_scope_string(scope_str))
+        if parsed:
+            parts.append(parsed)
+
+    configs: list[Mapping[str, Any]] = []
     if isinstance(raw_config, Mapping):
-        for key, value in raw_config.items():
-            if value is not None and str(value) != "":
-                merged[key] = value
+        configs.append(raw_config)
+    if extra_configs:
+        configs.extend(c for c in extra_configs if isinstance(c, Mapping))
+    for cfg in configs:
+        parts.extend(_extract_worker_mapping_parts(cfg))
+
+    merged: dict[str, str] = {}
+    for part in parts:
+        for key, value in part.items():
+            if not value:
+                continue
+            if key in merged and merged[key] != value:
+                return None, None, {}, "conflicting_worker_config"
+            merged[key] = value
+
     normalized = normalize_model_config(merged, fallback_model=fallback_model)
     if not normalized:
-        return None, None, {}
+        return None, None, {}, None
     # Require both provider and model for a minimum known Worker identity.
     if not normalized.get("provider") or not normalized.get("model"):
-        return None, None, dict(normalized)
+        return None, None, dict(normalized), None
     scope = model_scope_from_config(normalized)
     if not scope:
-        return None, None, dict(normalized)
-    return normalized, scope, {}
+        return None, None, dict(normalized), None
+    return normalized, scope, {}, None
 
 
 def _normalize_task_split(mapping: Mapping[str, Any]) -> tuple[Any | None, bool]:
@@ -170,32 +220,48 @@ def _normalize_tool_env_interface(mapping: Mapping[str, Any]) -> tuple[Any | Non
 def extract_condition_observation(source: Mapping[str, Any] | None) -> dict[str, Any]:
     """Extract a single-artifact condition observation (never backfilling)."""
     if not isinstance(source, Mapping):
-        return {"values": {}, "partial": {}, "partial_worker": {}}
+        return {"values": {}, "partial": {}, "partial_worker": {}, "conflicts": {}}
 
     values: dict[str, Any] = {}
     partial: dict[str, str] = {}
     partial_worker: dict[str, str] = {}
+    conflicts: dict[str, str] = {}
 
-    nested = source.get("comparability_conditions") or source.get("evaluation_conditions")
+    nested_dicts: list[Mapping[str, Any]] = []
+    for nested_key in ("comparability_conditions", "evaluation_conditions"):
+        candidate = source.get(nested_key)
+        if isinstance(candidate, Mapping):
+            nested_dicts.append(candidate)
+
     merged_source: dict[str, Any] = dict(source)
-    if isinstance(nested, Mapping):
+    for nested in nested_dicts:
         for k, v in nested.items():
             if k not in merged_source or merged_source[k] in (None, "", {}):
                 merged_source[k] = v
 
-    raw_worker = (
-        merged_source.get("worker_config")
-        or merged_source.get("model_config")
-        or merged_source.get("agent_config")
-    )
+    worker_configs: list[Mapping[str, Any]] = []
+    worker_scopes: list[str] = []
+    for container in (source, *nested_dicts):
+        raw_s = str(container.get("model_scope") or "").strip()
+        if raw_s:
+            worker_scopes.append(raw_s)
+        for worker_key in ("worker_config", "model_config", "agent_config"):
+            raw_w = container.get(worker_key)
+            if isinstance(raw_w, Mapping) and raw_w:
+                worker_configs.append(raw_w)
+
     fallback_model = str(merged_source.get("model_used") or merged_source.get("model") or "")
-    raw_scope = str(merged_source.get("model_scope") or "")
-    worker_dict, worker_scope, worker_partial = _normalize_worker_config(
-        raw_worker if isinstance(raw_worker, Mapping) else None,
+    worker_dict, worker_scope, worker_partial, worker_conflict = _normalize_worker_config(
+        worker_configs[0] if worker_configs else None,
         fallback_model=fallback_model,
-        raw_model_scope=raw_scope,
+        raw_model_scope=worker_scopes[0] if worker_scopes else "",
+        extra_configs=worker_configs[1:],
+        extra_model_scopes=worker_scopes[1:],
     )
-    if worker_scope and worker_dict is not None:
+    if worker_conflict:
+        conflicts["worker_config"] = worker_conflict
+        partial["worker_config"] = worker_conflict
+    elif worker_scope and worker_dict is not None:
         values["worker_config"] = {"scope": worker_scope, "config": worker_dict}
     elif worker_partial:
         partial["worker_config"] = "partial_worker_config"
@@ -223,6 +289,7 @@ def extract_condition_observation(source: Mapping[str, Any] | None) -> dict[str,
         "values": values,
         "partial": partial,
         "partial_worker": partial_worker,
+        "conflicts": conflicts,
     }
 
 
@@ -263,19 +330,28 @@ def merge_condition_observations(
     for dim in COMPARABILITY_DIMENSIONS:
         distinct_by_key: dict[str, Any] = {}
         partial_reason = ""
+        conflict_reasons: list[str] = []
         partial_worker_hints: list[dict[str, str]] = []
         for obs in observations:
+            c_reason = (obs.get("conflicts") or {}).get(dim)
+            if c_reason:
+                conflict_reasons.append(str(c_reason))
             val = (obs.get("values") or {}).get(dim)
             if val is not None:
                 key = val["scope"] if dim == "worker_config" else _canonical_json(val)
                 distinct_by_key[key] = val
             p_reason = (obs.get("partial") or {}).get(dim)
-            if p_reason and not partial_reason:
+            if p_reason == f"conflicting_{dim}":
+                conflict_reasons.append(str(p_reason))
+            elif p_reason and not partial_reason:
                 partial_reason = p_reason
             if dim == "worker_config" and obs.get("partial_worker"):
                 partial_worker_hints.append(dict(obs["partial_worker"]))
 
-        if len(distinct_by_key) > 1:
+        if conflict_reasons:
+            status_by_dim[dim] = "unknown"
+            reasons.extend(conflict_reasons)
+        elif len(distinct_by_key) > 1:
             status_by_dim[dim] = "unknown"
             reasons.append(f"conflicting_{dim}")
         elif len(distinct_by_key) == 1:

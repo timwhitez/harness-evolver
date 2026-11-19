@@ -15462,3 +15462,309 @@ def test_change_evaluation_same_condition_pivot_thresholds_still_enforce(tmp_pat
     assert packet.runner_pivot_policy["layer_pressure"][0]["component_layer"] == "recovery"
 
 
+def test_same_record_worker_identity_conflict_vs_complementary_unit():
+    """Issue #169: overlapping worker fields contradicting in one record resolve to unknown."""
+    from hl.evaluation_applicability import (
+        compare_evaluation_applicability,
+        extract_condition_observation,
+        merge_condition_observations,
+    )
+
+    current = merge_condition_observations(
+        [extract_condition_observation(_known_eval_conditions(model="worker-new"))]
+    )
+
+    # 1. Verified repro: model_scope points to worker-old, worker_config points to worker-new
+    conflicting_record = {
+        "model_scope": (
+            "provider=openai_compatible|base_url_host=api.deepseek.com|"
+            "model=worker-old|reasoning_effort=max|max_output_tokens=8000"
+        ),
+        **_known_eval_conditions(model="worker-new"),
+    }
+    hist_conflict = merge_condition_observations(
+        [extract_condition_observation(conflicting_record)]
+    )
+    assert hist_conflict["complete"] is False
+    assert hist_conflict["status_by_dimension"]["worker_config"] == "unknown"
+    assert "conflicting_worker_config" in hist_conflict["reasons"]
+    res_conflict = compare_evaluation_applicability(hist_conflict, current)
+    assert res_conflict["status"] == "unknown"
+    assert res_conflict["comparable"] is False
+    assert "conflicting_worker_config" in res_conflict["reasons"]
+
+    # 2. Contradiction on non-model overlapping field (base_url vs base_url_host via normalization)
+    host_conflict_record = {
+        "model_scope": (
+            "provider=openai_compatible|base_url_host=old-gw.example:8443|"
+            "model=worker-new|reasoning_effort=max|max_output_tokens=8000"
+        ),
+        "worker_config": {
+            "provider": "openai_compatible",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "worker-new",
+            "reasoning_effort": "max",
+            "max_output_tokens": 8000,
+        },
+        "task_split": "held_in",
+        "evaluator": "harbor",
+        "tool_env_interface": "docker_archive_off",
+    }
+    res_host_conflict = compare_evaluation_applicability(
+        merge_condition_observations([extract_condition_observation(host_conflict_record)]),
+        current,
+    )
+    assert res_host_conflict["status"] == "unknown"
+    assert "conflicting_worker_config" in res_host_conflict["reasons"]
+
+    # 3. Conflict in one observation cannot be masked by a clean second observation
+    clean_obs = extract_condition_observation(_known_eval_conditions(model="worker-new"))
+    conflict_obs = extract_condition_observation(conflicting_record)
+    merged_mixed = merge_condition_observations([conflict_obs, clean_obs])
+    assert merged_mixed["status_by_dimension"]["worker_config"] == "unknown"
+    assert "conflicting_worker_config" in merged_mixed["reasons"]
+
+    # 4. Consistent representations (base_url normalizes to base_url_host; int vs str max_output_tokens)
+    consistent_record = {
+        "model_scope": (
+            "provider=openai_compatible|base_url_host=api.deepseek.com|"
+            "model=worker-new|reasoning_effort=max|max_output_tokens=8000"
+        ),
+        "worker_config": {
+            "provider": "openai_compatible",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "worker-new",
+            "reasoning_effort": "max",
+            "max_output_tokens": 8000,
+        },
+        "task_split": "held_in",
+        "evaluator": "harbor",
+        "tool_env_interface": "docker_archive_off",
+    }
+    res_consistent = compare_evaluation_applicability(
+        merge_condition_observations([extract_condition_observation(consistent_record)]),
+        current,
+    )
+    assert res_consistent["status"] == "applicable"
+    assert res_consistent["comparable"] is True
+
+    # 5. Genuinely complementary sources merge cleanly
+    complementary_record = {
+        "model_scope": "provider=openai_compatible|model=worker-new",
+        "worker_config": {
+            "base_url": "https://api.deepseek.com/v1",
+            "reasoning_effort": "max",
+            "max_output_tokens": 8000,
+        },
+        "task_split": "held_in",
+        "evaluator": "harbor",
+        "tool_env_interface": "docker_archive_off",
+    }
+    res_complementary = compare_evaluation_applicability(
+        merge_condition_observations([extract_condition_observation(complementary_record)]),
+        current,
+    )
+    assert res_complementary["status"] == "applicable"
+    assert res_complementary["comparable"] is True
+
+
+def test_same_record_worker_conflict_counterexample_in_packet_builder(tmp_path):
+    """Issue #169: real WorkPacketBuilder entrypoint treats same-record worker conflict as conditional only."""
+    def _build_and_eval(case_dir: pathlib.Path, *, conflicting: bool):
+        case_dir.mkdir(parents=True)
+        _init_repo(case_dir)
+        trials_dir = case_dir / "trials"
+        summaries_dir = trials_dir / "summaries"
+        lessons_dir = trials_dir / "memory" / "component_lessons"
+        diffs_dir = trials_dir / "diffs"
+        summaries_dir.mkdir(parents=True)
+        lessons_dir.mkdir(parents=True)
+        diffs_dir.mkdir(parents=True)
+
+        scope_model = "worker-old" if conflicting else "worker-new"
+        hist_scope = (
+            f"provider=openai_compatible|base_url_host=api.deepseek.com|"
+            f"model={scope_model}|reasoning_effort=max|max_output_tokens=8000"
+        )
+        new_conds = _known_eval_conditions(model="worker-new")
+
+        (lessons_dir / "codex_update.md").write_text(
+            "# codex_update\n\n"
+            "## 2026-11-02T10:00:00\n\n"
+            "Codex update outcome evidence.\n"
+            "source: change_evaluation\n"
+            "packet_id: pkt_case_1\n"
+            "outcome: prediction_missed\n"
+            "summary_id: sum_case_1\n"
+            "rollback_applied: true\n"
+            "reason: synthetic counterexample miss\n"
+        )
+
+        (summaries_dir / "camp_campaign_state.json").write_text(
+            json.dumps(
+                {
+                    "campaign_id": "camp",
+                    "failure_class_attempts": [
+                        {
+                            "packet_id": "pkt_case_1",
+                            "failure_class": "synth_miss_class",
+                            "component_layer": "recovery",
+                            "accepted": True,
+                            "next_eval_result": "prediction_missed",
+                        },
+                        {
+                            "packet_id": "pkt_case_2",
+                            "failure_class": "synth_miss_class",
+                            "component_layer": "recovery",
+                            "accepted": True,
+                            "next_eval_result": "prediction_missed",
+                        },
+                        {
+                            "packet_id": "pkt_case_3",
+                            "failure_class": "synth_other_class",
+                            "component_layer": "recovery",
+                            "accepted": True,
+                            "next_eval_result": "prediction_missed",
+                        },
+                    ],
+                    "change_evaluations": [
+                        {
+                            "packet_id": "pkt_case_1",
+                            "summary_id": "sum_case_1",
+                            "outcome": "prediction_missed",
+                            "rollback_applied": True,
+                            "model_scope": hist_scope,
+                            "comparability_conditions": new_conds,
+                            "prediction": {
+                                "expected_fixed_task_classes": ["synth_miss_class"],
+                                "risk_task_classes": ["synth_risk_class"],
+                            },
+                            "prediction_misses": [
+                                {
+                                    "task_id": "t-synth-1",
+                                    "event": "unchanged_fail",
+                                    "reason": "miss",
+                                    "matched_classes": ["synth_miss_class"],
+                                }
+                            ],
+                        },
+                        {
+                            "packet_id": "pkt_case_2",
+                            "summary_id": "sum_case_2",
+                            "outcome": "prediction_missed",
+                            "model_scope": hist_scope,
+                            "comparability_conditions": new_conds,
+                            "prediction": {
+                                "expected_fixed_task_classes": ["synth_miss_class"],
+                                "risk_task_classes": [],
+                            },
+                            "prediction_misses": [],
+                        },
+                        {
+                            "packet_id": "pkt_case_3",
+                            "summary_id": "sum_case_3",
+                            "outcome": "prediction_missed",
+                            "model_scope": hist_scope,
+                            "comparability_conditions": new_conds,
+                            "prediction": {
+                                "expected_fixed_task_classes": ["synth_other_class"],
+                                "risk_task_classes": [],
+                            },
+                            "prediction_misses": [],
+                        },
+                    ],
+                }
+            )
+        )
+
+        current_trial = _applicable_trial(
+            metadata={"evaluation_conditions": new_conds},
+        )
+        packet = WorkPacketBuilder(repo_root=case_dir, memory_path=trials_dir).build(
+            failures=[current_trial],
+            current_harness={"version": "0.2.0"},
+        )
+        engine = CodexUpdateEngine(repo_root=case_dir, events_dir=diffs_dir)
+        minimal_report = {
+            "status": "edited",
+            "summary": "Unrelated bounded worker change",
+            "changed_files": ["bench/agent.py"],
+            "validation_commands": ["pytest tests/ -v"],
+            "component_type": "adapter",
+            **contract_report_fields(),
+        }
+        review = engine._apply_report_gates(
+            PatchReviewResult(accepted=True, changed_files=["bench/agent.py"]),
+            exit_code=0,
+            final_report=minimal_report,
+            required_validation_commands=["pytest tests/ -v"],
+            failure_pattern_digest=packet.failure_pattern_digest,
+            rejected_update_buffer=packet.rejected_update_buffer,
+            runner_pivot_policy=packet.runner_pivot_policy,
+            change_evaluation_digest=packet.change_evaluation_digest,
+            prior_update_lesson_entries=packet.prior_update_lesson_entries,
+        )
+        return packet, review
+
+    # Conflicting record (model_scope=worker-old vs worker_config=worker-new): conditional only!
+    pkt_conflict, review_conflict = _build_and_eval(tmp_path / "conflict", conflicting=True)
+    digest_c = pkt_conflict.change_evaluation_digest
+    assert digest_c["applicability_counts"] == {
+        "applicable": 0,
+        "cross_environment": 0,
+        "unknown": 3,
+    }
+    by_pkt_c = {item["packet_id"]: item for item in digest_c["recent_evaluations"]}
+    assert by_pkt_c["pkt_case_1"]["applicability"]["status"] == "unknown"
+    assert "conflicting_worker_config" in by_pkt_c["pkt_case_1"]["applicability"]["reasons"]
+    assert digest_c["miss_classes"] == []
+    assert digest_c["risk_classes"] == []
+    assert any(item["class"] == "synth_miss_class" for item in digest_c["conditional_miss_classes"])
+    assert any(item["class"] == "synth_risk_class" for item in digest_c["conditional_risk_classes"])
+    buf_c = {item["packet_id"]: item for item in pkt_conflict.rejected_update_buffer}
+    assert buf_c["pkt_case_1"]["avoid_repeating"] is False
+    assert buf_c["pkt_case_1"]["conditional_only"] is True
+    lessons_c = {item["packet_id"]: item for item in pkt_conflict.prior_update_lesson_entries}
+    assert lessons_c["pkt_case_1"]["conditional_only"] is True
+    assert pkt_conflict.runner_pivot_policy["discouraged"] == []
+    assert pkt_conflict.runner_pivot_policy["layer_pressure"] == []
+    assert review_conflict.accepted is True
+    assert not any(
+        item.rule_id
+        in {
+            "report.memory_failed_directions",
+            "report.change_evaluation_misses",
+            "report.change_evaluation_risks",
+        }
+        for item in review_conflict.violations
+    )
+
+    # Non-conflicting record under identical conditions: enforces original constraints!
+    pkt_clean, review_clean = _build_and_eval(tmp_path / "clean", conflicting=False)
+    digest_ok = pkt_clean.change_evaluation_digest
+    assert digest_ok["applicability_counts"] == {
+        "applicable": 3,
+        "cross_environment": 0,
+        "unknown": 0,
+    }
+    assert [item["class"] for item in digest_ok["miss_classes"]] == [
+        "synth_miss_class",
+        "synth_other_class",
+    ]
+    assert [item["class"] for item in digest_ok["risk_classes"]] == ["synth_risk_class"]
+    buf_ok = {item["packet_id"]: item for item in pkt_clean.rejected_update_buffer}
+    assert buf_ok["pkt_case_1"]["avoid_repeating"] is True
+    assert not buf_ok["pkt_case_1"].get("conditional_only")
+    assert len(pkt_clean.runner_pivot_policy["discouraged"]) == 1
+    assert pkt_clean.runner_pivot_policy["discouraged"][0]["failure_class"] == "synth_miss_class"
+    assert len(pkt_clean.runner_pivot_policy["layer_pressure"]) == 1
+    assert pkt_clean.runner_pivot_policy["layer_pressure"][0]["component_layer"] == "recovery"
+    clean_rule_ids = {item.rule_id for item in review_clean.violations}
+    assert {
+        "report.memory_failed_directions",
+        "report.change_evaluation_misses",
+        "report.change_evaluation_risks",
+    }.issubset(clean_rule_ids)
+
+
+
