@@ -206,7 +206,7 @@ def main() -> int:
     args = parser.parse_args()
 
     from bench.harbor import HarborRunner
-    from hl.memory import FileSystemMemory
+    from hl.memory import FileSystemMemory, IncompleteRegressionSnapshotsError
     from hl.model_scope import model_scope_from_agent_config
     from scripts.run_trial import (
         _apply_execution_defaults,
@@ -241,7 +241,15 @@ def main() -> int:
 
     agent_config = resolve_agent_config(args, parser)
     model_scope = model_scope_from_agent_config(agent_config)
-    all_snapshots = memory.list_regression_snapshots(model_scope=model_scope)
+    try:
+        all_snapshots = memory.list_regression_snapshots(model_scope=model_scope)
+    except IncompleteRegressionSnapshotsError as exc:
+        print(
+            "Regression check incomplete (unreadable snapshot material; not compared): "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return 2
     if args.task:
         all_snapshots = [
             snapshot for snapshot in all_snapshots if snapshot.task_id == args.task

@@ -13,6 +13,9 @@ Storage layout:
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from glob import escape as glob_escape
 from pathlib import Path
@@ -42,6 +45,41 @@ def _normalize_lesson_body(body: str) -> str:
     different trial id or with trailing whitespace is treated as one entry.
     """
     return " ".join(str(body).split()).lower()
+
+
+@dataclass(frozen=True)
+class RegressionSnapshotLoadFailure:
+    """Safe diagnostic entry for an unreadable or invalid regression snapshot."""
+
+    path: str
+    error_type: str
+
+
+class IncompleteRegressionSnapshotsError(RuntimeError):
+    """Raised when one or more regression snapshot files cannot be loaded."""
+
+    def __init__(
+        self,
+        failures: list[RegressionSnapshotLoadFailure],
+        *,
+        valid_count: int = 0,
+    ) -> None:
+        self.failures = list(failures)
+        self.valid_count = valid_count
+        preview = ", ".join(
+            f"{item.path} ({item.error_type})" for item in self.failures[:5]
+        )
+        if len(self.failures) > 5:
+            preview += f", ... (+{len(self.failures) - 5} more)"
+        super().__init__(
+            "Regression snapshot set is incomplete; refusing partial comparison "
+            f"({len(self.failures)} unreadable file(s), {valid_count} readable): "
+            f"{preview}"
+        )
+
+
+class RegressionSnapshotDurabilityError(OSError):
+    """Raised when atomic replace succeeded but durability confirmation failed."""
 
 
 class FileSystemMemory(MemoryStore):
@@ -527,9 +565,45 @@ class FileSystemMemory(MemoryStore):
         return None
 
     def save_regression(self, task_id: str, snapshot: RegressionSnapshot) -> None:
+        payload = snapshot.model_dump_json(indent=2)
         path = self._regression_path(task_id, model_scope=snapshot.model_scope)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(snapshot.model_dump_json(indent=2))
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        tmp_path = Path(tmp_name)
+        replaced = False
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            tmp_path.unlink(missing_ok=True)
+            raise
+        try:
+            with handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            replaced = True
+        except Exception:
+            if not replaced:
+                tmp_path.unlink(missing_ok=True)
+            raise
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as exc:
+            raise RegressionSnapshotDurabilityError(
+                f"Atomic replace succeeded at {self._safe_regression_label(path)}, "
+                f"but post-replace durability confirmation failed ({type(exc).__name__}); "
+                "durability is unknown and previous content was not restored."
+            ) from exc
 
     def mark_regression_stable(
         self,
@@ -722,15 +796,35 @@ class FileSystemMemory(MemoryStore):
         if not self.regressions_dir.exists():
             return []
         snapshots: list[RegressionSnapshot] = []
+        failures: list[RegressionSnapshotLoadFailure] = []
         for path in sorted(self.regressions_dir.rglob("*.json")):
             try:
-                snapshot = RegressionSnapshot.model_validate_json(path.read_text())
-            except Exception:
+                snapshot = RegressionSnapshot.model_validate_json(
+                    path.read_text(encoding="utf-8")
+                )
+                snapshot = self._with_model_scope_from_source_trial(snapshot)
+            except Exception as exc:
+                failures.append(
+                    RegressionSnapshotLoadFailure(
+                        path=self._safe_regression_label(path),
+                        error_type=type(exc).__name__,
+                    )
+                )
                 continue
-            snapshot = self._with_model_scope_from_source_trial(snapshot)
             if model_scope_matches(snapshot.model_scope, model_scope):
                 snapshots.append(snapshot)
+        if failures:
+            raise IncompleteRegressionSnapshotsError(
+                failures,
+                valid_count=len(snapshots),
+            )
         return snapshots
+
+    def _safe_regression_label(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.regressions_dir).as_posix()
+        except ValueError:
+            return path.name
 
     def _with_model_scope_from_source_trial(
         self,

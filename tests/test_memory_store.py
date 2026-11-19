@@ -3,6 +3,8 @@
 from datetime import datetime
 import json
 
+import pytest
+
 from hl.attribution import FailureAttributor
 from hl.memory import FileSystemMemory
 from hl.model_scope import model_scope_from_config
@@ -1084,3 +1086,159 @@ class TestFileSystemMemory:
         # The oldest entries are dropped; the newest is retained.
         assert "batch-0" not in text
         assert f"batch-{cap + 9}" in text
+
+    def test_list_regression_snapshots_raises_on_corrupted_or_unreadable_files(
+        self, tmp_path, monkeypatch
+    ):
+        from hl.memory import IncompleteRegressionSnapshotsError
+
+        memory = FileSystemMemory(base_path=str(tmp_path))
+        scope = model_scope_from_config(
+            {"provider": "openai_compatible", "model": "deepseek-v4-flash"}
+        )
+        other_scope = model_scope_from_config(
+            {"provider": "openai_compatible", "model": "deepseek-v4-pro"}
+        )
+        memory.save_regression(
+            "valid-task",
+            RegressionSnapshot(
+                task_id="valid-task",
+                harness_version="0.1.0",
+                model_scope=scope,
+                validation_status="stable",
+            ),
+        )
+        # Truncated JSON with synthetic secret marker inside to verify safe error diagnostics.
+        corrupt_path = memory._regression_path("broken-task", model_scope=scope)
+        corrupt_path.write_text('{"task_id": "broken-task", "secret": "SYNTHETIC_SECRET_163"')
+        # Schema-invalid JSON placed under another model's directory must still not be guessed away.
+        schema_invalid = memory._regression_path("schema-bad", model_scope=other_scope)
+        schema_invalid.parent.mkdir(parents=True, exist_ok=True)
+        schema_invalid.write_text(json.dumps({"not_a_task_id": "SYNTHETIC_SECRET_OTHER"}))
+
+        with pytest.raises(IncompleteRegressionSnapshotsError) as exc_info:
+            memory.list_regression_snapshots(model_scope=scope)
+
+        msg = str(exc_info.value)
+        assert "broken-task.json" in msg
+        assert "schema-bad.json" in msg
+        assert "SYNTHETIC_SECRET_163" not in msg
+        assert "SYNTHETIC_SECRET_OTHER" not in msg
+        assert len(exc_info.value.failures) == 2
+
+        # Injected read error on an otherwise valid file also triggers incomplete error.
+        corrupt_path.unlink()
+        schema_invalid.unlink()
+        valid_path = memory._regression_path("valid-task", model_scope=scope)
+        original_read_text = type(valid_path).read_text
+
+        def failing_read_text(self, *args, **kwargs):
+            if self == valid_path:
+                raise PermissionError("injected read failure")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(valid_path), "read_text", failing_read_text)
+        with pytest.raises(IncompleteRegressionSnapshotsError) as read_exc:
+            memory.list_regression_snapshots(model_scope=scope)
+        assert read_exc.value.failures[0].error_type == "PermissionError"
+
+    def test_list_regression_snapshots_preserves_empty_other_model_and_legacy(self, tmp_path):
+        memory = FileSystemMemory(base_path=str(tmp_path))
+        scope = model_scope_from_config(
+            {"provider": "openai_compatible", "model": "deepseek-v4-flash"}
+        )
+        other_scope = model_scope_from_config(
+            {"provider": "openai_compatible", "model": "deepseek-v4-pro"}
+        )
+        # Truly empty directory -> []
+        assert memory.list_regression_snapshots(model_scope=scope) == []
+
+        # Valid other-model snapshot -> [] for current scope
+        memory.save_regression(
+            "other-task",
+            RegressionSnapshot(
+                task_id="other-task",
+                harness_version="0.1.0",
+                model_scope=other_scope,
+                validation_status="stable",
+            ),
+        )
+        assert memory.list_regression_snapshots(model_scope=scope) == []
+
+        # Legacy snapshot without model_scope derives scope from source_trial_id
+        memory.record_trial(
+            TrialResult(
+                trial_id="legacy_trial",
+                task_id="legacy-task",
+                task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                task_difficulty=TaskDifficulty.EASY,
+                status=TrialStatus.PASSED,
+                score=1.0,
+                verified=True,
+                metadata={
+                    "model_config": {
+                        "provider": "openai_compatible",
+                        "model": "deepseek-v4-flash",
+                    }
+                },
+            )
+        )
+        memory.save_regression(
+            "legacy-task",
+            RegressionSnapshot(
+                task_id="legacy-task",
+                harness_version="0.1.0",
+                source_trial_id="legacy_trial",
+                validation_status="stable",
+            ),
+        )
+        loaded = memory.list_regression_snapshots(model_scope=scope)
+        assert [s.task_id for s in loaded] == ["legacy-task"]
+
+    def test_save_regression_atomic_publish_fault_injection(self, tmp_path, monkeypatch):
+        import os as os_module
+        from hl.memory import RegressionSnapshotDurabilityError
+
+        memory = FileSystemMemory(base_path=str(tmp_path))
+        initial = RegressionSnapshot(
+            task_id="task-atomic",
+            harness_version="0.1.0",
+            validation_status="pending",
+            source_summary_id="sum-1",
+        )
+        memory.save_regression("task-atomic", initial)
+        target_path = memory._regression_path("task-atomic")
+        original_content = target_path.read_text()
+
+        # Pre-replace failure preserves old complete record and leaves no temp/json artifacts.
+        def fail_replace(src, dst):
+            raise OSError("injected replace failure")
+
+        monkeypatch.setattr(os_module, "replace", fail_replace)
+        with pytest.raises(OSError, match="injected replace failure"):
+            assert memory.mark_regression_stable("task-atomic", source_summary_id="sum-1") is False
+
+        assert target_path.read_text() == original_content
+        assert memory.get_regression_snapshot("task-atomic").validation_status == "pending"
+        assert list(memory.regressions_dir.rglob("*.tmp")) == []
+        assert [p.name for p in memory.regressions_dir.rglob("*.json")] == ["task-atomic.json"]
+
+        # Post-replace directory fsync failure reports durability unknown and does NOT roll back.
+        monkeypatch.undo()
+        real_fsync = os_module.fsync
+        fsync_calls = {"count": 0}
+
+        def fail_dir_fsync(fd):
+            fsync_calls["count"] += 1
+            if fsync_calls["count"] >= 2:
+                raise OSError("injected dir fsync failure")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os_module, "fsync", fail_dir_fsync)
+        with pytest.raises(RegressionSnapshotDurabilityError, match="durability is unknown"):
+            memory.mark_regression_stable("task-atomic", source_summary_id="sum-1")
+
+        # New snapshot replaced the target and was not auto-reverted.
+        assert memory.get_regression_snapshot("task-atomic").validation_status == "stable"
+        assert list(memory.regressions_dir.rglob("*.tmp")) == []
+

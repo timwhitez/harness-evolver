@@ -690,3 +690,91 @@ roles:
         assert persisted.validation_status == "pending"
         assert persisted.regression_runs == 1
         assert persisted.regression_failures == expected_failures
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize("mode", ["corrupt_only", "mixed_valid_and_corrupt", "specific_task"])
+    def test_regression_check_aborts_on_incomplete_snapshots_before_runner(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        dry_run,
+        mode,
+    ):
+        from scripts import regression_check as regression_check_module
+
+        memory_path = tmp_path / "trials"
+        memory = FileSystemMemory(base_path=str(memory_path))
+        model_config = {
+            "provider": "openai_compatible",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-v4-flash",
+            "reasoning_effort": "max",
+            "max_output_tokens": "8000",
+        }
+        scope = model_scope_from_config(model_config)
+        if mode in {"mixed_valid_and_corrupt", "specific_task"}:
+            memory.save_regression(
+                "valid-task",
+                RegressionSnapshot(
+                    task_id="valid-task",
+                    harness_version="0.1.0",
+                    validation_status="stable",
+                    model_scope=scope,
+                ),
+            )
+        corrupt_path = memory._regression_path("broken-task", model_scope=scope)
+        corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_path.write_text('{"task_id": "broken-task", "token": "SECRET_MARKER_163"')
+
+        calls = {"runner": 0, "api_key": 0, "project_test": 0}
+
+        class SpyHarborRunner:
+            def __init__(self, *args, **kwargs):
+                calls["runner"] += 1
+
+        def spy_require_key(*args, **kwargs):
+            calls["api_key"] += 1
+
+        def spy_subprocess_run(*args, **kwargs):
+            calls["project_test"] += 1
+            raise AssertionError("project test must not run when snapshots are incomplete")
+
+        monkeypatch.setattr("bench.harbor.HarborRunner", SpyHarborRunner)
+        monkeypatch.setattr("scripts.run_trial._require_worker_api_key", spy_require_key)
+        monkeypatch.setattr(subprocess, "run", spy_subprocess_run)
+        argv = [
+            "regression_check.py",
+            "--lane",
+            "full",
+            "--memory-path",
+            str(memory_path),
+            "--model",
+            "deepseek-v4-flash",
+            "--provider",
+            "openai_compatible",
+            "--base-url",
+            "https://api.deepseek.com/v1",
+            "--reasoning-effort",
+            "max",
+            "--max-output-tokens",
+            "8000",
+        ]
+        if mode == "specific_task":
+            argv.extend(["--task", "valid-task"])
+        if dry_run:
+            argv.append("--dry-run")
+        monkeypatch.setattr(sys, "argv", argv)
+
+        exit_code = regression_check_module.main()
+        captured = capsys.readouterr()
+
+        assert exit_code != 0
+        assert "incomplete" in captured.err.lower()
+        assert "not compared" in captured.err.lower()
+        assert "broken-task.json" in captured.err
+        assert "SECRET_MARKER_163" not in captured.err
+        assert "SECRET_MARKER_163" not in captured.out
+        assert "No regression snapshots found." not in captured.out
+        assert calls == {"runner": 0, "api_key": 0, "project_test": 0}
+
