@@ -142,3 +142,81 @@ def safe_endpoint_hostname(value: str | None) -> str | None:
     """Return only the normalized hostname from an endpoint URL."""
 
     return safe_endpoint(value).hostname
+
+
+_DEFAULT_SCHEME_PORTS: dict[str, int] = {
+    "http": 80,
+    "https": 443,
+}
+
+
+def _parse_explicit_port(port: int | str | None) -> tuple[bool, int | None]:
+    if port is None or port == "":
+        return True, None
+    if isinstance(port, bool):
+        return False, None
+    try:
+        parsed = int(str(port).strip())
+    except ValueError:
+        return False, None
+    if not (0 <= parsed <= 65535):
+        return False, None
+    return True, parsed
+
+
+def canonical_endpoint_host(
+    value: str | None,
+    *,
+    port: int | str | None = None,
+    scheme: str | None = None,
+) -> str | None:
+    """Return a secret-safe canonical ``host`` or ``host:port`` routing identity.
+
+    Strips userinfo, path, query, and fragment, normalizes hostname case/IDNA
+    and IPv6 literals, and preserves non-default ports that distinguish routing.
+    Default ports matching an explicit scheme (``http``: 80, ``https``: 443) are
+    normalized away; malformed endpoints or contradictory ports fail closed and
+    return ``None``.
+    """
+
+    text = str(value or "")
+    if not text:
+        return None
+    if (
+        ":" in text
+        and "://" not in text
+        and not text.startswith("//")
+        and not text.startswith("[")
+        and "/" not in text
+    ):
+        try:
+            IPv6Address(text)
+        except AddressValueError:
+            pass
+        else:
+            text = f"[{text}]"
+
+    endpoint = safe_endpoint(text)
+    if not endpoint.valid or not endpoint.hostname:
+        return None
+
+    port_ok, explicit_port = _parse_explicit_port(port)
+    if not port_ok:
+        return None
+
+    if endpoint.port is not None and explicit_port is not None and endpoint.port != explicit_port:
+        return None
+
+    effective_port = endpoint.port if endpoint.port is not None else explicit_port
+    effective_scheme = endpoint.scheme or (str(scheme).strip().lower() if scheme else None)
+    if (
+        effective_port is not None
+        and effective_scheme in _DEFAULT_SCHEME_PORTS
+        and effective_port == _DEFAULT_SCHEME_PORTS[effective_scheme]
+    ):
+        effective_port = None
+
+    host = f"[{endpoint.hostname}]" if ":" in endpoint.hostname else endpoint.hostname
+    if effective_port is not None:
+        return f"{host}:{effective_port}"
+    return host

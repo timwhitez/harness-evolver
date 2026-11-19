@@ -778,3 +778,436 @@ roles:
         assert "No regression snapshots found." not in captured.out
         assert calls == {"runner": 0, "api_key": 0, "project_test": 0}
 
+
+class TestUnifiedRegressionIdentityIssue170:
+    """Issue #170: unified dataset-scoped task identity and port-preserving route identity."""
+
+    @staticmethod
+    def _create_task(dataset_dir, *relative_parts: str) -> None:
+        task_dir = dataset_dir.joinpath(*relative_parts)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "task.toml").write_text('[metadata]\ncategory = "git"\ndifficulty = "easy"\n')
+
+    @staticmethod
+    def _write_models_yaml(path, *, base_url: str) -> None:
+        path.write_text(
+            f"""
+roles:
+  cpa_worker:
+    provider: openai_compatible
+    base_url: {base_url}
+    api_key_env: TEST_API_KEY
+    model: deepseek-flash
+    reasoning:
+      effort: high
+    max_output_tokens: 8000
+"""
+        )
+
+    def test_harbor_parse_job_dir_and_cli_pass_on_equivalent_task_and_port_representations(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+    ):
+        """Same confirmed task & port-bearing route differing only in representation passes CLI."""
+        from bench.harbor import HarborRunner
+        from scripts import regression_check as regression_check_module
+
+        dataset_dir = tmp_path / "terminal-bench"
+        self._create_task(dataset_dir, "fix-git")
+        self._create_task(dataset_dir, "vulnerable-secret")
+
+        memory_path = tmp_path / "trials"
+        memory = FileSystemMemory(base_path=str(memory_path))
+        models_path = tmp_path / "models.yaml"
+        self._write_models_yaml(models_path, base_url="http://127.0.0.1:24635/v1")
+
+        # Snapshot saved using namespaced task_id and port-bearing URL (equivalent to CLI route)
+        scope = model_scope_from_config(
+            {
+                "provider": "openai_compatible",
+                "base_url": "http://127.0.0.1:24635/v1",
+                "model": "deepseek-flash",
+                "reasoning_effort": "high",
+                "max_output_tokens": "8000",
+            }
+        )
+        assert "base_url_host=127.0.0.1:24635" in scope
+        memory.save_regression(
+            "terminal-bench/fix-git",
+            RegressionSnapshot(
+                task_id="terminal-bench/fix-git",
+                harness_version="0.1.0",
+                validation_status="stable",
+                model_scope=scope,
+            ),
+        )
+        # Second snapshot uses bare task_id while receipt will return namespaced task_id
+        memory.save_regression(
+            "vulnerable-secret",
+            RegressionSnapshot(
+                task_id="vulnerable-secret",
+                harness_version="0.1.0",
+                validation_status="stable",
+                model_scope=scope,
+            ),
+        )
+
+        # Build real synthetic Harbor job dirs parsed by the real HarborRunner.parse_job_dir!
+        jobs_root = tmp_path / "synthetic_jobs"
+
+        class SyntheticHarborRunner(HarborRunner):
+            def run_task(self, *, task_id, agent_config, job_name=None, jobs_dir=None, **kwargs):
+                cmd = self.build_command(task_id, agent_config, job_name=job_name, jobs_dir=jobs_dir)
+                # Namespaced snapshot in terminal-bench must pass bare filter to Harbor
+                if task_id == "terminal-bench/fix-git":
+                    assert "--include-task-name" in cmd.argv
+                    idx = cmd.argv.index("--include-task-name")
+                    assert cmd.argv[idx + 1] == "fix-git"
+                    job_dir = jobs_root / "job_fix_git"
+                    job_dir.mkdir(parents=True, exist_ok=True)
+                    (job_dir / "result.json").write_text(
+                        json.dumps(
+                            {
+                                "trial_results": [
+                                    {
+                                        "trial_name": "fix-git__a1b2c3d",
+                                        "task_name": "fix-git",
+                                        "task_id": {
+                                            "name": "fix-git",
+                                            "path": str(dataset_dir / "fix-git"),
+                                        },
+                                        "verifier_result": {"rewards": {"reward": 1.0}},
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                    return self.parse_job_dir(
+                        job_dir,
+                        task_id=task_id,
+                        returncode=0,
+                        agent_config=agent_config,
+                    )
+                # Bare snapshot receiving namespaced Harbor task_name
+                job_dir = jobs_root / "job_vuln"
+                job_dir.mkdir(parents=True, exist_ok=True)
+                (job_dir / "result.json").write_text(
+                    json.dumps(
+                        {
+                            "trial_results": [
+                                {
+                                    "trial_name": "vulnerable-secret__e4f5g6h",
+                                    "task_name": "terminal-bench/vulnerable-secret",
+                                    "verifier_result": {"rewards": {"reward": 1.0}},
+                                }
+                            ]
+                        }
+                    )
+                )
+                return self.parse_job_dir(
+                    job_dir,
+                    task_id=task_id,
+                    returncode=0,
+                    agent_config=agent_config,
+                )
+
+        monkeypatch.setattr("bench.harbor.HarborRunner", SyntheticHarborRunner)
+        monkeypatch.setenv("TEST_API_KEY", "test-secret")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "regression_check.py",
+                "--path",
+                str(dataset_dir),
+                "--memory-path",
+                str(memory_path),
+                "--models-config",
+                str(models_path),
+                "--worker-role",
+                "cpa_worker",
+            ],
+        )
+
+        exit_code = regression_check_module.main()
+        captured = capsys.readouterr()
+        assert exit_code == 0, captured.out + captured.err
+        assert "Regression lane smoke passed for 2 snapshot(s)." in captured.out
+
+        # Also verify --task bare filter selects namespaced snapshot uniquely within dataset
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "regression_check.py",
+                "--task",
+                "fix-git",
+                "--path",
+                str(dataset_dir),
+                "--memory-path",
+                str(memory_path),
+                "--models-config",
+                str(models_path),
+                "--worker-role",
+                "cpa_worker",
+            ],
+        )
+        assert regression_check_module.main() == 0
+        assert "passed for 1 snapshot(s)." in capsys.readouterr().out
+
+    def test_default_port_and_redacted_port_representations_match(self, tmp_path):
+        """https://Gateway.Example:443/v1 == https://gateway.example/v1 and host+port == host:port."""
+        memory = FileSystemMemory(base_path=str(tmp_path / "trials"))
+        dataset_dir = tmp_path / "terminal-bench"
+        self._create_task(dataset_dir, "fix-git")
+
+        snap_https = RegressionSnapshot(
+            task_id="terminal-bench/fix-git",
+            harness_version="0.1.0",
+            validation_status="stable",
+            model_scope=model_scope_from_config(
+                {
+                    "provider": "openai_compatible",
+                    "base_url": "https://Gateway.Example:443/v1",
+                    "model": "deepseek-flash",
+                }
+            ),
+        )
+        trial_https = TrialResult(
+            trial_id="t_https",
+            task_id="fix-git",
+            task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+            task_difficulty=TaskDifficulty.EASY,
+            status=TrialStatus.PASSED,
+            score=1.0,
+            verified=True,
+            metadata={
+                "model_config": {
+                    "provider": "openai_compatible",
+                    "base_url_host": "gateway.example",
+                    "model": "deepseek-flash",
+                }
+            },
+        )
+        res_https = memory.diagnose_snapshot_validation(
+            snap_https, trial_https, dataset_path=dataset_dir
+        )
+        assert res_https.passed is True
+
+        snap_port = RegressionSnapshot(
+            task_id="terminal-bench/fix-git",
+            harness_version="0.1.0",
+            validation_status="stable",
+            model_scope=model_scope_from_config(
+                {
+                    "provider": "openai_compatible",
+                    "base_url": "http://127.0.0.1:24635/v1",
+                    "model": "deepseek-flash",
+                }
+            ),
+        )
+        trial_redacted_port = TrialResult(
+            trial_id="t_port",
+            task_id="fix-git",
+            task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+            task_difficulty=TaskDifficulty.EASY,
+            status=TrialStatus.PASSED,
+            score=1.0,
+            verified=True,
+            metadata={
+                "model_config": {
+                    "provider": "openai_compatible",
+                    "base_url_host": "127.0.0.1",
+                    "base_url_port": 24635,
+                    "base_url_scheme": "http",
+                    "model": "deepseek-flash",
+                }
+            },
+        )
+        res_port = memory.diagnose_snapshot_validation(
+            snap_port, trial_redacted_port, dataset_path=dataset_dir
+        )
+        assert res_port.passed is True
+
+    @pytest.mark.parametrize(
+        ("case", "expected_kind", "expected_absent_kind"),
+        [
+            ("ambiguous_bare_cli_filter", "Task identity ambiguous", "model_route_mismatch"),
+            ("ambiguous_bare_receipt", "task_identity_ambiguous", "model_route_mismatch"),
+            ("wrong_dataset_task_mismatch", "task_identity_mismatch", "model_route_mismatch"),
+            ("missing_task_identity", "task_identity_missing", "model_route_mismatch"),
+            ("different_port_route_mismatch", "model_route_mismatch", "task_identity_mismatch"),
+            ("portless_vs_port_route_mismatch", "model_route_mismatch", "task_identity_mismatch"),
+            ("missing_route_identity", "model_route_missing", "task_identity_mismatch"),
+            ("failing_verifier", "verifier_failed", "task_identity_mismatch"),
+        ],
+    )
+    def test_cli_rejects_ambiguous_mismatched_missing_and_failing_receipts_with_distinct_errors(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        case,
+        expected_kind,
+        expected_absent_kind,
+    ):
+        """CLI rejects ambiguous bare names, route/port mismatches, missing IDs, and failed verifiers."""
+        from scripts import regression_check as regression_check_module
+
+        memory_path = tmp_path / "trials"
+        memory = FileSystemMemory(base_path=str(memory_path))
+        models_path = tmp_path / "models.yaml"
+        self._write_models_yaml(models_path, base_url="http://127.0.0.1:24635/v1")
+
+        route_cfg = {
+            "provider": "openai_compatible",
+            "base_url": "http://127.0.0.1:24635/v1",
+            "model": "deepseek-flash",
+            "reasoning_effort": "high",
+            "max_output_tokens": "8000",
+        }
+        scope = model_scope_from_config(route_cfg)
+
+        if case in {"ambiguous_bare_cli_filter", "ambiguous_bare_receipt"}:
+            dataset_dir = tmp_path / "multi-datasets"
+            self._create_task(dataset_dir, "dataset-a", "fix-git")
+            self._create_task(dataset_dir, "dataset-b", "fix-git")
+            snap_task_id = "dataset-a/fix-git"
+        else:
+            dataset_dir = tmp_path / "terminal-bench"
+            self._create_task(dataset_dir, "fix-git")
+            snap_task_id = "terminal-bench/fix-git"
+
+        memory.save_regression(
+            snap_task_id,
+            RegressionSnapshot(
+                task_id=snap_task_id,
+                harness_version="0.1.0",
+                validation_status="stable",
+                model_scope=scope,
+            ),
+        )
+
+        def _make_receipt(task_id: str) -> TrialResult:
+            if case == "ambiguous_bare_receipt":
+                return TrialResult(
+                    trial_id="t_ambig",
+                    task_id="fix-git",
+                    task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                    task_difficulty=TaskDifficulty.EASY,
+                    status=TrialStatus.PASSED,
+                    score=1.0,
+                    verified=True,
+                    metadata={"model_config": route_cfg},
+                )
+            if case == "wrong_dataset_task_mismatch":
+                return TrialResult(
+                    trial_id="t_wrong_ds",
+                    task_id="other-dataset/fix-git",
+                    task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                    task_difficulty=TaskDifficulty.EASY,
+                    status=TrialStatus.PASSED,
+                    score=1.0,
+                    verified=True,
+                    metadata={"model_config": route_cfg},
+                )
+            if case == "missing_task_identity":
+                return TrialResult(
+                    trial_id="t_no_task",
+                    task_id="",
+                    task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                    task_difficulty=TaskDifficulty.EASY,
+                    status=TrialStatus.PASSED,
+                    score=1.0,
+                    verified=True,
+                    metadata={"model_config": route_cfg},
+                )
+            if case == "different_port_route_mismatch":
+                wrong_route = {**route_cfg, "base_url": "http://127.0.0.1:24636/v1"}
+                return TrialResult(
+                    trial_id="t_wrong_port",
+                    task_id="fix-git",
+                    task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                    task_difficulty=TaskDifficulty.EASY,
+                    status=TrialStatus.PASSED,
+                    score=1.0,
+                    verified=True,
+                    metadata={"model_config": wrong_route},
+                )
+            if case == "portless_vs_port_route_mismatch":
+                portless_route = {
+                    "provider": "openai_compatible",
+                    "base_url_host": "127.0.0.1",
+                    "model": "deepseek-flash",
+                    "reasoning_effort": "high",
+                    "max_output_tokens": "8000",
+                }
+                return TrialResult(
+                    trial_id="t_portless",
+                    task_id="fix-git",
+                    task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                    task_difficulty=TaskDifficulty.EASY,
+                    status=TrialStatus.PASSED,
+                    score=1.0,
+                    verified=True,
+                    metadata={"model_config": portless_route},
+                )
+            if case == "missing_route_identity":
+                return TrialResult(
+                    trial_id="t_no_route",
+                    task_id="fix-git",
+                    task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                    task_difficulty=TaskDifficulty.EASY,
+                    status=TrialStatus.PASSED,
+                    score=1.0,
+                    verified=True,
+                    metadata={},
+                )
+            return TrialResult(
+                trial_id="t_fail_verif",
+                task_id="fix-git",
+                task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+                task_difficulty=TaskDifficulty.EASY,
+                status=TrialStatus.FAILED,
+                score=0.0,
+                verified=True,
+                metadata={"model_config": route_cfg},
+            )
+
+        class FakeRunner:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def build_command(self, *args, **kwargs):
+                return object()
+
+            def run_task(self, *, task_id, agent_config, **kwargs):
+                return _make_receipt(task_id)
+
+        monkeypatch.setattr("bench.harbor.HarborRunner", FakeRunner)
+        monkeypatch.setenv("TEST_API_KEY", "test-secret")
+        argv = [
+            "regression_check.py",
+            "--path",
+            str(dataset_dir),
+            "--memory-path",
+            str(memory_path),
+            "--models-config",
+            str(models_path),
+            "--worker-role",
+            "cpa_worker",
+        ]
+        if case == "ambiguous_bare_cli_filter":
+            argv.extend(["--task", "fix-git"])
+        monkeypatch.setattr(sys, "argv", argv)
+
+        exit_code = regression_check_module.main()
+        captured = capsys.readouterr()
+        combined_output = captured.out + "\n" + captured.err
+        assert exit_code == 1
+        assert expected_kind in combined_output
+        assert expected_absent_kind not in combined_output
+
+

@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import re
 from typing import Any, Mapping
-from urllib.parse import urlparse
+
+from harness.url_safety import canonical_endpoint_host
 
 
 MODEL_SCOPE_KEYS = (
@@ -54,9 +55,22 @@ def normalize_model_config(
     fallback_model: str = "",
 ) -> dict[str, str]:
     config = config or {}
-    base_url_host = config.get("base_url_host")
-    if not base_url_host and config.get("base_url"):
-        base_url_host = _base_url_host(str(config.get("base_url")))
+    raw_host = config.get("base_url_host")
+    raw_url = config.get("base_url")
+    raw_port = config.get("base_url_port")
+    raw_scheme = config.get("base_url_scheme")
+    base_url_host: str | None = None
+    if raw_host is not None and str(raw_host).strip() != "":
+        host_text = str(raw_host).strip()
+        if host_text == "<invalid>":
+            base_url_host = "<invalid>"
+        else:
+            base_url_host = (
+                canonical_endpoint_host(host_text, port=raw_port, scheme=raw_scheme)
+                or "<invalid>"
+            )
+    elif raw_url is not None and str(raw_url).strip() != "":
+        base_url_host = _base_url_host(str(raw_url))
     model = config.get("model") or fallback_model
     values = {
         "provider": config.get("provider"),
@@ -73,9 +87,56 @@ def normalize_model_config(
     }
 
 
+def canonicalize_model_scope(model_scope: str) -> str:
+    """Canonicalize a ``key=value|...`` model_scope string using unified endpoint rules."""
+    text = str(model_scope or "").strip()
+    if not text or "|" not in text or "=" not in text:
+        return text
+    parsed: dict[str, str] = {}
+    for segment in text.split("|"):
+        if "=" not in segment:
+            return text
+        key, value = segment.split("=", 1)
+        key = key.strip()
+        if key not in MODEL_SCOPE_KEYS:
+            return text
+        value = value.strip()
+        if value:
+            parsed[key] = value
+    if not parsed.get("model"):
+        return text
+    return model_scope_from_config(parsed)
+
+
+def diff_model_scopes(expected_scope: str, actual_scope: str) -> list[str]:
+    """Return per-field differences between two canonical model_scope strings."""
+    exp_canon = canonicalize_model_scope(expected_scope)
+    act_canon = canonicalize_model_scope(actual_scope)
+
+    def _parse(scope: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for segment in scope.split("|"):
+            if "=" in segment:
+                key, value = segment.split("=", 1)
+                result[key.strip()] = value.strip()
+        return result
+
+    exp_map = _parse(exp_canon)
+    act_map = _parse(act_canon)
+    diffs: list[str] = []
+    for key in MODEL_SCOPE_KEYS:
+        if exp_map.get(key, "") != act_map.get(key, ""):
+            diffs.append(
+                f"{key}: expected={exp_map.get(key, '')!r}, actual={act_map.get(key, '')!r}"
+            )
+    if not diffs and exp_canon != act_canon:
+        diffs.append(f"scope: expected={exp_canon!r}, actual={act_canon!r}")
+    return diffs
+
+
 def model_scope_matches(snapshot_scope: str, current_scope: str) -> bool:
     if current_scope:
-        return snapshot_scope == current_scope
+        return canonicalize_model_scope(snapshot_scope) == canonicalize_model_scope(current_scope)
     return snapshot_scope == ""
 
 
@@ -88,7 +149,8 @@ def safe_model_scope_name(model_scope: str) -> str:
 
 
 def _base_url_host(base_url: str) -> str:
-    parsed = urlparse(base_url)
-    if parsed.netloc:
-        return parsed.netloc
-    return base_url.split("/")[0]
+    text = str(base_url or "")
+    if not text:
+        return ""
+    resolved = canonical_endpoint_host(text)
+    return resolved if resolved is not None else "<invalid>"

@@ -307,10 +307,15 @@ class HarborRunner:
             argv.extend(["--environment-kwarg", f"{key}={self._kwarg_value(value)}"])
 
         if self.dataset_path:
-            argv.extend(["--path", self.dataset_path, "--include-task-name", task_id])
+            from hl.task_identity import DatasetTaskResolver
+
+            include_task_name = DatasetTaskResolver.from_dataset_path(
+                self.dataset_path
+            ).harbor_include_task_name(task_id)
+            argv.extend(["--path", self.dataset_path, "--include-task-name", include_task_name])
             dataset_config: dict[str, Any] = {
                 "path": self.dataset_path,
-                "include_task_name": task_id,
+                "include_task_name": include_task_name,
             }
         elif self.dataset_name:
             argv.extend(["--dataset", self.dataset_name, "--include-task-name", task_id])
@@ -998,6 +1003,7 @@ class HarborRunner:
         metadata = {
             "harbor_returncode": returncode,
             "job_result_path": str(job_result_path),
+            "harbor_task_id": selected.get("task_id"),
             "agent_info": selected.get("agent_info"),
             "model_config": self._model_config_metadata(agent_config, selected),
             "task_metadata": self._task_metadata(selected),

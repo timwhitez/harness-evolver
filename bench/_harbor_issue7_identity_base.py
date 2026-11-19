@@ -257,7 +257,35 @@ class HarborRunner(_BaseHarborRunner):
     """HarborRunner variant that requires exact normalized task identity."""
 
     def _trial_result_matches_task(self, result: dict[str, Any], task_id: str) -> bool:
-        return _identity_matches_requested(_task_identity(result), task_id)
+        identity = _task_identity(result)
+        if not self.dataset_path:
+            return _identity_matches_requested(identity, task_id)
+        from hl.task_identity import DatasetTaskResolver
+
+        resolver = DatasetTaskResolver.from_dataset_path(self.dataset_path)
+        if resolver.dataset_root is None:
+            return _identity_matches_requested(identity, task_id)
+
+        requested_resolved = resolver.resolve(task_id)
+        if requested_resolved.status != "resolved" or not requested_resolved.canonical_id:
+            return False
+
+        if identity.paths:
+            if len(identity.paths) != 1:
+                return False
+            observed_resolved = resolver.resolve(next(iter(identity.paths)))
+        elif len(identity.names) == 1:
+            observed_resolved = resolver.resolve(next(iter(identity.names)))
+        else:
+            return False
+
+        if observed_resolved.status != "resolved" or not observed_resolved.canonical_id:
+            return False
+        if observed_resolved.canonical_id == requested_resolved.canonical_id:
+            return True
+        if observed_resolved.in_dataset or requested_resolved.in_dataset:
+            return False
+        return _identity_matches_requested(identity, task_id)
 
     def _select_trial_result(
         self,

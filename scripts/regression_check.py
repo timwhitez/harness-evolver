@@ -208,6 +208,7 @@ def main() -> int:
     from bench.harbor import HarborRunner
     from hl.memory import FileSystemMemory, IncompleteRegressionSnapshotsError
     from hl.model_scope import model_scope_from_agent_config
+    from hl.task_identity import DatasetTaskResolver
     from scripts.run_trial import (
         _apply_execution_defaults,
         _require_worker_api_key,
@@ -250,10 +251,27 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    task_resolver = DatasetTaskResolver.from_dataset_path(
+        args.path,
+        known_task_ids=[snapshot.task_id for snapshot in all_snapshots],
+    )
     if args.task:
-        all_snapshots = [
-            snapshot for snapshot in all_snapshots if snapshot.task_id == args.task
-        ]
+        resolved_arg = task_resolver.resolve(args.task)
+        if resolved_arg.status == "ambiguous":
+            print(f"Task identity ambiguous: {resolved_arg.reason}", file=sys.stderr)
+            return 1
+        if resolved_arg.status != "resolved" or not resolved_arg.canonical_id:
+            print(f"Task identity missing: {resolved_arg.reason}", file=sys.stderr)
+            return 1
+        filtered_snapshots = []
+        for snapshot in all_snapshots:
+            snap_resolved = task_resolver.resolve(snapshot.task_id)
+            if (
+                snap_resolved.status == "resolved"
+                and snap_resolved.canonical_id == resolved_arg.canonical_id
+            ):
+                filtered_snapshots.append(snapshot)
+        all_snapshots = filtered_snapshots
     snapshots = [
         snapshot
         for snapshot in all_snapshots
@@ -378,7 +396,7 @@ def main() -> int:
 
     _require_worker_api_key(agent_config, parser)
 
-    failed: list[str] = []
+    failed: list[tuple[str, Any]] = []
     for snapshot, result in _run_regression_snapshots(
         snapshots=snapshots,
         runner=runner,
@@ -394,14 +412,25 @@ def main() -> int:
                 snapshot.task_id,
                 result,
                 model_scope=model_scope,
+                dataset_path=args.path,
+                task_resolver=task_resolver,
             )
-        if memory.snapshot_validation_failed(snapshot, result):
-            failed.append(snapshot.task_id)
+        validation = memory.diagnose_snapshot_validation(
+            snapshot,
+            result,
+            dataset_path=args.path,
+            task_resolver=task_resolver,
+            expected_model_scope=model_scope,
+        )
+        if not validation.passed:
+            failed.append((snapshot.task_id, validation))
 
     if failed:
         print("Regressions detected:")
-        for task_id in failed:
-            print(f"- {task_id}")
+        for task_id, validation in failed:
+            kind = validation.failure_kind or "snapshot_validation_failed"
+            detail = "; ".join(validation.reasons)
+            print(f"- {task_id} [{kind}]: {detail}")
         return 1
 
     if args.lane == "full":

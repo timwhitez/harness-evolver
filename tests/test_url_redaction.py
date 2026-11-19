@@ -208,19 +208,28 @@ def test_malformed_port_never_falls_back_to_raw_url() -> None:
     assert "bad" not in serialized
 
 
-def test_harbor_metadata_contains_hostname_only() -> None:
+def test_harbor_metadata_preserves_routing_port_and_strips_secrets() -> None:
     runner = HarborRunner()
 
     metadata = runner._model_config_metadata(
         {
             "model": "example",
-            "base_url": "https://user:secret@Gateway.Example:8443/v1?token=abc",
+            "base_url": "https://user:secret@Gateway.Example:8443/v1?token=abc#frag",
         }
     )
 
-    assert metadata["base_url_host"] == "gateway.example"
+    assert metadata["base_url_host"] == "gateway.example:8443"
     serialized = json.dumps(metadata, sort_keys=True)
     assert "user" not in serialized
     assert "secret" not in serialized
-    assert "8443" not in serialized
+    assert "/v1" not in serialized
     assert "token" not in serialized
+    assert "frag" not in serialized
+
+    default_port_metadata = runner._model_config_metadata(
+        {
+            "model": "example",
+            "base_url": "https://user:secret@Gateway.Example:443/v1?token=abc",
+        }
+    )
+    assert default_port_metadata["base_url_host"] == "gateway.example"

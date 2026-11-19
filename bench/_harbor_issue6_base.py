@@ -36,6 +36,8 @@ def _canonical_result_identity(
 def _matching_trial_results(
     trial_results: list[dict[str, Any]],
     task_id: str,
+    *,
+    matcher: Any = None,
 ) -> list[dict[str, Any]]:
     """Return all attempts only when their shared task identity is unique.
 
@@ -52,9 +54,13 @@ def _matching_trial_results(
     for result in trial_results:
         if not isinstance(result, dict):
             continue
-        identity = _base._task_identity(result)
-        if not _base._identity_matches_requested(identity, task_id):
-            continue
+        if matcher is not None:
+            if not matcher(result, task_id):
+                continue
+        else:
+            identity = _base._task_identity(result)
+            if not _base._identity_matches_requested(identity, task_id):
+                continue
         canonical = _canonical_result_identity(result)
         if canonical is None:
             continue
@@ -79,7 +85,13 @@ class HarborRunner(_base.HarborRunner):
         trial_results: list[dict[str, Any]],
         task_id: str,
     ) -> list[dict[str, Any]]:
-        return _matching_trial_results(trial_results, task_id)
+        return _matching_trial_results(
+            trial_results,
+            task_id,
+            matcher=lambda result, req: _base.HarborRunner._trial_result_matches_task(
+                self, result, req
+            ),
+        )
 
     def _select_trial_result(
         self,

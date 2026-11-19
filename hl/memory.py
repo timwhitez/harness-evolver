@@ -23,12 +23,16 @@ from typing import Any
 
 from hl.attribution import FailureAttributor
 from hl.model_scope import (
+    canonicalize_model_scope,
+    diff_model_scopes,
     model_config_from_trial,
+    model_scope_from_config,
     model_scope_from_trial,
     model_scope_matches,
     safe_model_scope_name,
 )
 from hl.protocol import MemoryStore
+from hl.task_identity import DatasetTaskResolver, resolve_trial_task_identity
 from hl.types import (
     FeedbackSignal,
     HarnessPatch,
@@ -53,6 +57,19 @@ class RegressionSnapshotLoadFailure:
 
     path: str
     error_type: str
+
+
+@dataclass(frozen=True)
+class SnapshotValidationResult:
+    """Structured outcome of validating a Harbor receipt against a regression snapshot."""
+
+    passed: bool
+    failure_kind: str = ""
+    reasons: tuple[str, ...] = ()
+    resolved_snapshot_task_id: str | None = None
+    resolved_receipt_task_id: str | None = None
+    snapshot_model_scope: str = ""
+    receipt_model_scope: str = ""
 
 
 class IncompleteRegressionSnapshotsError(RuntimeError):
@@ -646,6 +663,8 @@ class FileSystemMemory(MemoryStore):
         result: TrialResult,
         *,
         model_scope: str = "",
+        dataset_path: str | Path | None = None,
+        task_resolver: DatasetTaskResolver | None = None,
     ) -> bool:
         snapshot = self.get_regression_snapshot(
             task_id,
@@ -657,7 +676,13 @@ class FileSystemMemory(MemoryStore):
         snapshot.last_regression_status = result.status.value
         snapshot.last_regression_at = datetime.now()
         snapshot.last_regression_wall_time_seconds = result.wall_time_seconds
-        if self.snapshot_validation_failed(snapshot, result):
+        if self.snapshot_validation_failed(
+            snapshot,
+            result,
+            dataset_path=dataset_path,
+            task_resolver=task_resolver,
+            expected_model_scope=model_scope,
+        ):
             snapshot.regression_failures += 1
         self.save_regression(task_id, snapshot)
         return True
@@ -710,10 +735,114 @@ class FileSystemMemory(MemoryStore):
 
         return False
 
+    def diagnose_snapshot_validation(
+        self,
+        snapshot: RegressionSnapshot,
+        result: TrialResult,
+        *,
+        dataset_path: str | Path | None = None,
+        task_resolver: DatasetTaskResolver | None = None,
+        expected_model_scope: str = "",
+    ) -> SnapshotValidationResult:
+        """Validate a Harbor receipt against a snapshot with explicit failure kinds.
+
+        Applies one unified dataset-scoped task identity resolver and one unified
+        port-preserving endpoint/scope canonicalizer. Never treats missing,
+        ambiguous, or invalid identity as equal.
+        """
+
+        resolver = task_resolver or DatasetTaskResolver.from_dataset_path(dataset_path)
+        snap_task = resolver.resolve(snapshot.task_id)
+        receipt_task = resolve_trial_task_identity(result, resolver)
+
+        snap_scope = canonicalize_model_scope(snapshot.model_scope)
+        if not snap_scope and snapshot.scope_config:
+            snap_scope = model_scope_from_config(snapshot.scope_config)
+        receipt_scope = canonicalize_model_scope(model_scope_from_trial(result))
+        exp_scope = canonicalize_model_scope(expected_model_scope) if expected_model_scope else ""
+
+        failure_kinds: list[str] = []
+        reasons: list[str] = []
+
+        # 1. Task identity check
+        if snap_task.status == "missing" or receipt_task.status == "missing":
+            failure_kinds.append("task_identity_missing")
+            reasons.append(
+                f"task identity missing (snapshot={snapshot.task_id!r}, receipt={result.task_id!r})"
+            )
+        elif snap_task.status == "ambiguous" or receipt_task.status == "ambiguous":
+            failure_kinds.append("task_identity_ambiguous")
+            detail_parts = []
+            if snap_task.status == "ambiguous":
+                detail_parts.append(f"snapshot: {snap_task.reason}")
+            if receipt_task.status == "ambiguous":
+                detail_parts.append(f"receipt: {receipt_task.reason}")
+            reasons.append(f"task identity ambiguous ({'; '.join(detail_parts)})")
+        elif snap_task.status == "contradictory" or receipt_task.status == "contradictory":
+            failure_kinds.append("task_identity_mismatch")
+            detail_parts = []
+            if snap_task.status == "contradictory":
+                detail_parts.append(f"snapshot: {snap_task.reason}")
+            if receipt_task.status == "contradictory":
+                detail_parts.append(f"receipt: {receipt_task.reason}")
+            reasons.append(f"task identity mismatch ({'; '.join(detail_parts)})")
+        elif snap_task.canonical_id != receipt_task.canonical_id:
+            failure_kinds.append("task_identity_mismatch")
+            reasons.append(
+                "task identity mismatch "
+                f"(snapshot={snapshot.task_id!r} -> {snap_task.canonical_id!r}, "
+                f"receipt={result.task_id!r} -> {receipt_task.canonical_id!r})"
+            )
+
+        # 2. Model route / scope check
+        if not snap_scope or not receipt_scope:
+            failure_kinds.append("model_route_missing")
+            reasons.append(
+                "model route identity missing "
+                f"(snapshot={snap_scope or '<missing>'!r}, "
+                f"receipt={receipt_scope or '<missing>'!r})"
+            )
+        elif "base_url_host=<invalid>" in snap_scope or "base_url_host=<invalid>" in receipt_scope:
+            failure_kinds.append("model_route_invalid")
+            reasons.append(
+                "model route endpoint invalid "
+                f"(snapshot={snap_scope!r}, receipt={receipt_scope!r})"
+            )
+        elif snap_scope != receipt_scope:
+            diffs = diff_model_scopes(snap_scope, receipt_scope)
+            failure_kinds.append("model_route_mismatch")
+            reasons.append(f"model route mismatch ({'; '.join(diffs)})")
+        elif exp_scope and receipt_scope != exp_scope:
+            diffs = diff_model_scopes(exp_scope, receipt_scope)
+            failure_kinds.append("model_route_mismatch")
+            reasons.append(f"model route mismatch against active CLI route ({'; '.join(diffs)})")
+
+        # 3. Verifier / score check
+        if not (result.verified and result.score >= 1.0):
+            failure_kinds.append("verifier_failed")
+            reasons.append(
+                f"verifier failed (status={result.status.value}, "
+                f"verified={result.verified}, score={result.score})"
+            )
+
+        return SnapshotValidationResult(
+            passed=not failure_kinds,
+            failure_kind=failure_kinds[0] if failure_kinds else "",
+            reasons=tuple(reasons),
+            resolved_snapshot_task_id=snap_task.canonical_id,
+            resolved_receipt_task_id=receipt_task.canonical_id,
+            snapshot_model_scope=snap_scope,
+            receipt_model_scope=receipt_scope,
+        )
+
     def snapshot_validation_failed(
         self,
         snapshot: RegressionSnapshot,
         result: TrialResult,
+        *,
+        dataset_path: str | Path | None = None,
+        task_resolver: DatasetTaskResolver | None = None,
+        expected_model_scope: str = "",
     ) -> bool:
         """Fail closed for the exact snapshot selected by a validation gate.
 
@@ -723,14 +852,13 @@ class FileSystemMemory(MemoryStore):
         before the campaign may promote it to stable.
         """
 
-        if result.task_id != snapshot.task_id:
-            return True
-        if not model_scope_matches(
-            snapshot.model_scope,
-            model_scope_from_trial(result),
-        ):
-            return True
-        return not (result.verified and result.score >= 1.0)
+        return not self.diagnose_snapshot_validation(
+            snapshot,
+            result,
+            dataset_path=dataset_path,
+            task_resolver=task_resolver,
+            expected_model_scope=expected_model_scope,
+        ).passed
 
     def save_patch(self, patch: HarnessPatch) -> str:
         safe_name = patch.component_name.replace("/", "_")
