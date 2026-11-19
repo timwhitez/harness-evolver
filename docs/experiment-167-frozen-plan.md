@@ -1,6 +1,6 @@
 # Frozen Experiment Plan: Paired Updater Attribution Evaluation (#167)
 
-Status: **PLAN_FROZEN / REAL_EXPERIMENT_NOT_RUN** (live Worker API keys such as `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `WORKER_API_KEY` are not configured in the current environment; offline tests do not substitute for real model/Harbor runs).
+Status: **COMPLETED** — Real paired experiment executed with `deepseek-flash` via CPA gateway; full results recorded in `docs/experiment-167-report.md`.
 
 ## 1. Objective and Single Method Variable
 
