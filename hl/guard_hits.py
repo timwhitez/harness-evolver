@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -294,12 +295,15 @@ def _fail_to_pass_transition_examples(
             for item in task_results.get(task_id, [])
             if _order_or_max(item.get("order")) < _order_or_max(order)
         ]
-        if not any(not _is_passing_score(item.get("score"), pass_score) for item in previous):
+        comparable_previous_scores = [
+            parsed
+            for item in previous
+            if (parsed := _optional_float(item.get("score"))) is not None
+            and not math.isnan(parsed)
+        ]
+        if not any(prev_score < pass_score for prev_score in comparable_previous_scores):
             continue
-        previous_best = max(
-            (_optional_float(item.get("score")) or 0.0 for item in previous),
-            default=None,
-        )
+        previous_best = max(comparable_previous_scores)
         examples.append(
             {
                 "campaign_id": occurrence.get("campaign_id", ""),
