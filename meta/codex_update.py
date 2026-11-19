@@ -1040,6 +1040,11 @@ class CodexUpdateEngine(UpdateEngine):
             "loop_limit_contract": self._loop_limit_contract(),
             "change_manifest_path": str(run_dir / "change_manifest.json"),
             "validation_results_path": str(validation_results_path or ""),
+            **self._provenance_and_change_fields(
+                packet=packet,
+                review=review,
+                diff_path=diff_path,
+            ),
         }
         record_path = run_dir / "update_record.json"
         summary_path = run_dir / "update_summary.md"
@@ -1054,6 +1059,7 @@ class CodexUpdateEngine(UpdateEngine):
                     component_delta=component_delta,
                     validation_ladder=ladder,
                     mission_selection=mission_selection,
+                    diff_path=diff_path,
                 ),
                 indent=2,
             )
@@ -1070,6 +1076,60 @@ class CodexUpdateEngine(UpdateEngine):
         )
         return record_path, summary_path
 
+    def _git_head_commit(self) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return completed.stdout.strip()
+        except OSError:
+            pass
+        return ""
+
+    def _provenance_and_change_fields(
+        self,
+        *,
+        packet: CodexWorkPacket,
+        review: PatchReviewResult,
+        diff_path: str | Path,
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        current_conds = (packet.evaluation_applicability.get("current_conditions") or {}).get(
+            "conditions"
+        )
+        if isinstance(current_conds, dict) and current_conds:
+            fields["comparability_conditions"] = current_conds
+        updater_prov: dict[str, str] = {
+            "updater_runner": "codex",
+            "updater_model": str(self.model or ""),
+        }
+        if self.reasoning_effort:
+            updater_prov["updater_reasoning_effort"] = str(self.reasoning_effort)
+        fields["updater_provenance"] = updater_prov
+        diff_sha256 = ""
+        try:
+            diff_file = Path(diff_path)
+            if diff_file.is_file():
+                diff_sha256 = hashlib.sha256(diff_file.read_bytes()).hexdigest()
+        except OSError:
+            diff_sha256 = ""
+        change_identity: dict[str, Any] = {
+            "packet_id": packet.packet_id,
+            "changed_files": list(review.changed_files),
+        }
+        base_commit = self._git_head_commit()
+        if base_commit:
+            change_identity["base_commit"] = base_commit
+        if diff_sha256:
+            change_identity["diff_sha256"] = diff_sha256
+        fields["harness_change_identity"] = change_identity
+        return fields
+
     def _change_manifest(
         self,
         *,
@@ -1079,10 +1139,16 @@ class CodexUpdateEngine(UpdateEngine):
         component_delta: dict[str, Any],
         validation_ladder: dict[str, Any],
         mission_selection: dict[str, Any],
+        diff_path: str | Path = "",
     ) -> dict[str, Any]:
         prediction = final_report.get("prediction")
         if not isinstance(prediction, dict):
             prediction = {}
+        provenance_fields = self._provenance_and_change_fields(
+            packet=packet,
+            review=review,
+            diff_path=diff_path,
+        )
         return {
             "schema_version": 1,
             "packet_id": packet.packet_id,
@@ -1094,6 +1160,7 @@ class CodexUpdateEngine(UpdateEngine):
             "loophole_review": final_report.get("loophole_review", []),
             "loophole_fixes": final_report.get("loophole_fixes", []),
             "external_research": final_report.get("external_research", {}),
+            **provenance_fields,
             "failure_evidence": {
                 "failing_tasks": packet.failing_tasks,
                 "failure_pattern_digest": packet.failure_pattern_digest,
@@ -1331,6 +1398,8 @@ class CodexUpdateEngine(UpdateEngine):
                 + decision_inputs["analysis_weakness_signatures"],
                 "- Self-Harness candidates: "
                 + decision_inputs["self_harness_improvement_queue"],
+                "- Change evaluation applicability: "
+                + decision_inputs["change_evaluation_applicability"],
                 "- Change evaluation miss classes: "
                 + decision_inputs["change_evaluation_miss_classes"],
                 "- Change evaluation risk classes: "
@@ -3169,6 +3238,8 @@ def _prior_update_lesson_markers(
             break
         if not isinstance(raw_entry, dict):
             continue
+        if _lesson_entry_is_non_applicable(raw_entry):
+            continue
         for key in (
             "mission_candidate_id",
             "mission_failure_category",
@@ -3210,6 +3281,9 @@ def _summary_decision_inputs(packet: CodexWorkPacket) -> dict[str, str]:
         ),
         "self_harness_improvement_queue": _summary_self_harness_improvement_queue(
             packet.self_harness_improvement_queue
+        ),
+        "change_evaluation_applicability": _summary_change_evaluation_applicability(
+            packet.change_evaluation_digest.get("applicability_counts")
         ),
         "change_evaluation_miss_classes": _summary_class_counts(
             packet.change_evaluation_digest.get("miss_classes")
@@ -3265,9 +3339,36 @@ def _summary_prior_update_lessons(
             value = str(raw_entry.get(key) or "").strip()
             if value:
                 parts.append(value)
+        if _lesson_entry_is_non_applicable(raw_entry):
+            app_status = str(
+                ((raw_entry.get("applicability") or {}).get("status"))
+                or "non_applicable"
+            )
+            parts.append(f"conditional:{app_status}")
         if parts:
             entries.append(" / ".join(parts))
     return "; ".join(entries) or "none"
+
+
+def _summary_change_evaluation_applicability(raw_counts: Any) -> str:
+    if not isinstance(raw_counts, dict) or not raw_counts:
+        return "none"
+    parts = [
+        f"{key}={int(raw_counts.get(key) or 0)}"
+        for key in ("applicable", "cross_environment", "unknown")
+    ]
+    return ", ".join(parts)
+
+
+def _lesson_entry_is_non_applicable(entry: dict[str, Any]) -> bool:
+    if bool(entry.get("conditional_only")):
+        return True
+    app = entry.get("applicability")
+    if isinstance(app, dict):
+        status = str(app.get("status") or "").strip()
+        if status and status != "applicable":
+            return True
+    return False
 
 
 def _summary_analysis_candidate_classes(
@@ -3856,6 +3957,12 @@ def _summary_rejected_update_packets(
             parts.append(component_layer)
         if source:
             parts.append(source)
+        if entry.get("conditional_only"):
+            app_status = str(
+                ((entry.get("applicability") or {}).get("status"))
+                or "non_applicable"
+            )
+            parts.append(f"conditional:{app_status}")
         entries.append(" / ".join(parts))
     return "; ".join(entries) or "none"
 
@@ -4216,6 +4323,8 @@ def _rejected_update_buffer_markers(
     for entry in rejected_update_buffer:
         if len(markers) >= limit:
             break
+        if _rejected_buffer_entry_is_non_actionable(entry):
+            continue
         for key in ("failure_class", "component_layer", "packet_id"):
             marker = str(entry.get(key) or "").strip()
             if len(marker) >= 3:
@@ -4307,6 +4416,8 @@ def _prior_update_lesson_memory_entries(
     }
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict):
+            continue
+        if _lesson_entry_is_non_applicable(raw_entry):
             continue
         outcome = str(raw_entry.get("outcome") or "").strip()
         if outcome and outcome not in actionable_outcomes:

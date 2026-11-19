@@ -183,6 +183,22 @@ update leaves a falsifiable manifest and is compared against later evidence:
 - The next round after an accepted update writes `change_evaluation.json`
   beside the manifest. It records task flips, prediction hits, prediction
   misses, and whether rollback was recommended or applied.
+- Historical `change_evaluation` applicability is governed by explicit minimum
+  known comparability conditions: actual `worker_config` (normalized via
+  `hl.model_scope.normalize_model_config` with non-empty `provider` and
+  `model`), `task_split` identity, `evaluator` identity, and
+  `tool_env_interface`. Resolution follows `packet -> evaluation ->
+  summary/trial` provenance without ever backfilling from the current run;
+  missing, partial, conflicting, or non-unique associations remain `unknown`
+  (empty equality never proves compatibility). `updater_provenance` and
+  `harness_change_identity` (`base_commit -> candidate_commit`) are tracked
+  separately and never by themselves render results non-comparable. Only
+  `applicable` evaluations generate mandatory `miss_classes`, `risk_classes`,
+  evaluation-sourced `rejected_update_buffer` `required_mutation` constraints,
+  homologous `component_lesson`/`post_update_rollback` constraints, or
+  evaluation-derived `runner_pivot_policy` `discouraged`/`layer_pressure`
+  enforcement; `cross_environment` and `unknown` evaluations remain retained in
+  full history as conditional context only.
 - Host validation is dynamic. Packet-required commands still run, and the
   updater derives additional checks from changed files: Python compile checks,
   changed-test pytest, campaign dry-runs for meta/script edits, Harbor dry-run

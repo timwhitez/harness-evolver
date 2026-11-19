@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from hl.attribution import FailureAttributor
+from hl.evaluation_applicability import (
+    extract_condition_observation,
+    extract_harness_change_identity,
+    extract_trial_observation,
+    extract_updater_provenance,
+    merge_condition_observations,
+)
 from hl.model_scope import safe_model_scope_name
 
 
@@ -227,6 +235,8 @@ def evaluate_change_manifest(
     flipped_fail: list[str] = []
     unchanged_fail: list[str] = []
     unchanged_pass: list[str] = []
+    baseline_unavailable_pass: list[str] = []
+    baseline_unavailable_fail: list[str] = []
     hits: list[dict[str, Any]] = []
     misses: list[dict[str, Any]] = []
     evaluated: list[dict[str, Any]] = []
@@ -236,10 +246,32 @@ def evaluate_change_manifest(
         if not task_id:
             continue
         current_score = _safe_float(getattr(trial, "score", 0.0))
-        before_entry = tasks_before.get(task_id, {})
-        previous_score = _safe_float(before_entry.get("last_score"))
-        previous_best = _safe_float(before_entry.get("best_score"))
-        previous_passed = previous_score >= 1.0 or previous_best >= 1.0
+        raw_before = tasks_before.get(task_id)
+        if isinstance(raw_before, dict) and raw_before:
+            prev_last = _optional_float(raw_before.get("last_score"))
+            prev_best = _optional_float(raw_before.get("best_score"))
+            if prev_last is not None and prev_best is not None:
+                baseline_available = True
+                baseline_status = "observed"
+                baseline_reason = ""
+                previous_score: float | None = prev_last
+                previous_best: float | None = prev_best
+            else:
+                baseline_available = False
+                baseline_status = "unavailable"
+                baseline_reason = "incomplete_before_entry"
+                previous_score = None
+                previous_best = None
+        else:
+            baseline_available = False
+            baseline_status = "unavailable"
+            baseline_reason = (
+                "missing_before_frontier"
+                if not tasks_before
+                else "missing_before_task"
+            )
+            previous_score = None
+            previous_best = None
         current_passed = current_score >= 1.0
         labels = _trial_labels(trial)
         expected_matched_classes = _matched_classes(labels, expected_classes)
@@ -247,52 +279,95 @@ def evaluate_change_manifest(
         expected_match = bool(expected_matched_classes)
         risk_match = bool(risk_matched_classes)
 
-        if not previous_passed and current_passed:
-            flipped_pass.append(task_id)
-            if expected_match:
-                hits.append(
-                    _prediction_event(
-                        task_id,
-                        "flipped_pass",
-                        labels,
-                        "expected improvement",
-                        matched_classes=expected_matched_classes,
+        if not baseline_available:
+            if current_passed:
+                baseline_unavailable_pass.append(task_id)
+                if expected_match:
+                    hits.append(
+                        _prediction_event(
+                            task_id,
+                            "baseline_unavailable_pass",
+                            labels,
+                            "baseline unavailable; expected improvement passed",
+                            matched_classes=expected_matched_classes,
+                            baseline_status=baseline_status,
+                            baseline_reason=baseline_reason,
+                        )
                     )
-                )
-        elif previous_passed and not current_passed:
-            flipped_fail.append(task_id)
-            if risk_match:
-                hits.append(
-                    _prediction_event(
-                        task_id,
-                        "flipped_fail",
-                        labels,
-                        "declared risk",
-                        matched_classes=risk_matched_classes,
-                    )
-                )
             else:
-                misses.append(
-                    _prediction_event(task_id, "flipped_fail", labels, "unexpected regression")
-                )
-        elif not current_passed:
-            unchanged_fail.append(task_id)
-            if expected_match:
-                misses.append(
-                    _prediction_event(
-                        task_id,
-                        "unchanged_fail",
-                        labels,
-                        "expected fix missed",
-                        matched_classes=expected_matched_classes,
+                baseline_unavailable_fail.append(task_id)
+                if expected_match:
+                    misses.append(
+                        _prediction_event(
+                            task_id,
+                            "baseline_unavailable_fail",
+                            labels,
+                            "baseline unavailable; expected fix missed",
+                            matched_classes=expected_matched_classes,
+                            baseline_status=baseline_status,
+                            baseline_reason=baseline_reason,
+                        )
                     )
-                )
         else:
-            unchanged_pass.append(task_id)
+            assert previous_score is not None and previous_best is not None
+            previous_passed = previous_score >= 1.0 or previous_best >= 1.0
+            if not previous_passed and current_passed:
+                flipped_pass.append(task_id)
+                if expected_match:
+                    hits.append(
+                        _prediction_event(
+                            task_id,
+                            "flipped_pass",
+                            labels,
+                            "expected improvement",
+                            matched_classes=expected_matched_classes,
+                            baseline_status=baseline_status,
+                        )
+                    )
+            elif previous_passed and not current_passed:
+                flipped_fail.append(task_id)
+                if risk_match:
+                    hits.append(
+                        _prediction_event(
+                            task_id,
+                            "flipped_fail",
+                            labels,
+                            "declared risk",
+                            matched_classes=risk_matched_classes,
+                            baseline_status=baseline_status,
+                        )
+                    )
+                else:
+                    misses.append(
+                        _prediction_event(
+                            task_id,
+                            "flipped_fail",
+                            labels,
+                            "unexpected regression",
+                            baseline_status=baseline_status,
+                        )
+                    )
+            elif not current_passed:
+                unchanged_fail.append(task_id)
+                if expected_match:
+                    misses.append(
+                        _prediction_event(
+                            task_id,
+                            "unchanged_fail",
+                            labels,
+                            "expected fix missed",
+                            matched_classes=expected_matched_classes,
+                            baseline_status=baseline_status,
+                        )
+                    )
+            else:
+                unchanged_pass.append(task_id)
 
         evaluated.append(
             {
                 "task_id": task_id,
+                "baseline_status": baseline_status,
+                "baseline_reason": baseline_reason,
                 "previous_last_score": previous_score,
                 "previous_best_score": previous_best,
                 "current_score": current_score,
@@ -316,7 +391,14 @@ def evaluate_change_manifest(
         outcome = "prediction_supported"
     else:
         outcome = "mixed"
-    return {
+    trial_observations = [extract_trial_observation(trial) for trial in trials]
+    if isinstance(manifest, dict) and manifest.get("comparability_conditions"):
+        trial_observations.append(extract_condition_observation(manifest))
+    merged_conditions = merge_condition_observations(trial_observations)
+    updater_provenance = extract_updater_provenance(manifest if isinstance(manifest, dict) else None)
+    harness_change_identity = extract_harness_change_identity(manifest if isinstance(manifest, dict) else None)
+    result: dict[str, Any] = {
+        "schema_version": 2,
         "packet_id": str(manifest.get("packet_id") or ""),
         "summary_id": summary_id,
         "evaluated_at": datetime.now().isoformat(),
@@ -326,6 +408,8 @@ def evaluate_change_manifest(
         "flipped_fail": flipped_fail,
         "unchanged_fail": unchanged_fail,
         "unchanged_pass": unchanged_pass,
+        "baseline_unavailable_pass": baseline_unavailable_pass,
+        "baseline_unavailable_fail": baseline_unavailable_fail,
         "prediction_hits": hits,
         "prediction_misses": misses,
         "hit_count": hit_count,
@@ -333,6 +417,14 @@ def evaluate_change_manifest(
         "outcome": outcome,
         "rollback_recommended": bool(miss_count > hit_count and miss_count > 0),
     }
+    if merged_conditions.get("conditions"):
+        result["comparability_conditions"] = merged_conditions["conditions"]
+        result["comparability_status"] = merged_conditions
+    if updater_provenance:
+        result["updater_provenance"] = updater_provenance
+    if harness_change_identity:
+        result["harness_change_identity"] = harness_change_identity
+    return result
 
 
 def _trial_labels(trial: Any) -> list[str]:
@@ -406,8 +498,10 @@ def _prediction_event(
     reason: str,
     *,
     matched_classes: list[str] | None = None,
+    baseline_status: str = "",
+    baseline_reason: str = "",
 ) -> dict[str, Any]:
-    result = {
+    result: dict[str, Any] = {
         "task_id": task_id,
         "event": event,
         "labels": labels[:12],
@@ -415,6 +509,10 @@ def _prediction_event(
     }
     if matched_classes:
         result["matched_classes"] = matched_classes[:8]
+    if baseline_status:
+        result["baseline_status"] = baseline_status
+    if baseline_reason:
+        result["baseline_reason"] = baseline_reason
     return result
 
 
@@ -432,6 +530,16 @@ def _task_summary(entry: dict[str, Any]) -> dict[str, Any]:
         "failures": int(entry.get("failures") or 0),
         "regressed_after_packet": list(entry.get("regressed_after_packet") or []),
     }
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(parsed) else parsed
 
 
 def _safe_float(value: Any, *, default: float = 0.0) -> float:

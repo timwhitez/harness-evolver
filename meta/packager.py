@@ -10,6 +10,14 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from hl.attribution import FailureAttributor
+from hl.evaluation_applicability import (
+    compare_evaluation_applicability,
+    extract_condition_observation,
+    extract_harness_change_identity,
+    extract_trial_observation,
+    extract_updater_provenance,
+    merge_condition_observations,
+)
 from hl.failure_mechanisms import (
     DEPENDENCY_LOOP_BASE_REPLACEMENT_NEUTRAL_MECHANISM_NAMES,
     PRIMARY_VERIFIER_CONTRACT_MECHANISM_NAMES,
@@ -148,6 +156,7 @@ class CodexWorkPacket(BaseModel):
     mission_selection_contract: dict[str, Any] = Field(default_factory=dict)
     update_history: dict[str, Any] = Field(default_factory=dict)
     change_evaluation_digest: dict[str, Any] = Field(default_factory=dict)
+    evaluation_applicability: dict[str, Any] = Field(default_factory=dict)
     policy_recurrence_signals: list[dict[str, Any]] = Field(default_factory=list)
     infrastructure_triage: dict[str, Any] = Field(default_factory=dict)
     self_harness_improvement_queue: dict[str, Any] = Field(default_factory=dict)
@@ -184,6 +193,7 @@ class WorkPacketBuilder:
                 else self.repo_root / raw_memory_path
             )
         self._campaign_states_cache: list[dict[str, Any]] | None = None
+        self._current_conditions_cache: dict[str, Any] | None = None
         self._completed_trial_full_context_threshold = 64
 
     def build(
@@ -217,6 +227,10 @@ class WorkPacketBuilder:
         ]
         self._campaign_states_cache = self._load_campaign_states(
             limit=DEFAULT_CAMPAIGN_STATE_CONTEXT_LIMIT
+        )
+        self._current_conditions_cache = self._current_applicability_conditions(
+            failures,
+            current_harness,
         )
         try:
             campaign_context = self._campaign_context(
@@ -253,6 +267,20 @@ class WorkPacketBuilder:
             rejected_update_buffer = self._rejected_update_buffer(
                 limit=DEFAULT_REJECTED_UPDATE_BUFFER_LIMIT
             )
+            change_evaluation_digest = self._change_evaluation_digest()
+            evaluation_applicability = {
+                "current_conditions": self._effective_current_conditions(),
+                "applicability_counts": change_evaluation_digest.get(
+                    "applicability_counts", {}
+                ),
+                "policy": (
+                    "Only historical evaluations with applicability.status == 'applicable' "
+                    "generate mandatory miss_classes, risk_classes, evaluation-sourced "
+                    "rejected_update_buffer required_mutation, homologous component "
+                    "lessons, or evaluation-derived runner_pivot_policy constraints. "
+                    "cross_environment and unknown records remain retained as conditional context."
+                ),
+            }
             return CodexWorkPacket(
                 packet_id=packet_id,
                 hl_goal=goal_prompt,
@@ -296,7 +324,8 @@ class WorkPacketBuilder:
                 runner_pivot_policy=self._runner_pivot_policy(),
                 mission_selection_contract=self._mission_selection_contract(),
                 update_history=update_history,
-                change_evaluation_digest=self._change_evaluation_digest(),
+                change_evaluation_digest=change_evaluation_digest,
+                evaluation_applicability=evaluation_applicability,
                 policy_recurrence_signals=policy_recurrence_signals,
                 infrastructure_triage=infrastructure_triage,
                 self_harness_improvement_queue=self_harness_improvement_queue,
@@ -316,6 +345,7 @@ class WorkPacketBuilder:
             )
         finally:
             self._campaign_states_cache = None
+            self._current_conditions_cache = None
 
     def write(self, packet: CodexWorkPacket, path: str | Path) -> Path:
         packet_path = Path(path)
@@ -625,7 +655,22 @@ class WorkPacketBuilder:
                     "additionalProperties": False,
                     "properties": {
                         "concise": {"type": "string"},
-                        "detailed": {"type": "string"},
+                        "detailed": {
+                            "type": "string",
+                            "description": (
+                                "Detailed update handoff memory. Only when evidence conflicts, "
+                                "predictions in the same direction missed, or existing attribution "
+                                "is insufficient (for example environment vs tool vs policy timeout), "
+                                "concisely record the current explanation, plausible competing "
+                                "cause(s), supporting/refuting packet/trial/summary refs, and the "
+                                "discriminating observation that separates them (or keep unknown "
+                                "and return noop/rejected when unavailable without claiming "
+                                "unverified checks were ruled out). Do not invent a second cause "
+                                "when current evidence is already decisive. When revising or reusing "
+                                "a prior attribution, keep the prior conclusion/invalidation reason "
+                                "and state why new evidence or unchanged conditions justify it."
+                            ),
+                        },
                         "failed_directions_to_avoid": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -648,9 +693,10 @@ class WorkPacketBuilder:
                                 "no-diff update, tracked Worker/harness change, required "
                                 "validation, allowed edit roots, fresh trajectory, verifier "
                                 "evidence, or missing evidence. "
-                                "When change_evaluation_digest.miss_classes is non-empty, "
+                                "When applicable change_evaluation_digest.miss_classes is non-empty, "
                                 "cover the top miss-heavy class labels so repeated poor "
-                                "directions are explicitly avoided or mutated."
+                                "directions are explicitly avoided or mutated; cross_environment "
+                                "and unknown evaluations are conditional heuristics only."
                             ),
                         },
                         "supported_directions_to_preserve": {
@@ -4148,6 +4194,11 @@ class WorkPacketBuilder:
                 "pitfall/support record so later updates avoid repeating failed "
                 "directions and preserve validated ones."
             ),
+            "competing_attribution_guidance": [
+                "Only when evidence conflicts, same-direction predictions missed, or existing attribution is insufficient (such as environment vs tool vs policy timeout), record concisely in memory_record.detailed: current explanation, plausible competing cause(s), supporting/refuting packet/trial/summary refs, and the discriminating observation (e.g., same input failing in a healthy neighbor points to policy; failed env probe points to infra).",
+                "Do not force a second explanation when current evidence is already decisive (such as an exact interface failure). When a discriminating observation is unavailable, preserve unknown and choose noop/rejected rather than reporting unverified checks as ruled out.",
+                "When revising an attribution, keep the prior conclusion and why it was invalidated. When reusing a prior attribution after a missed prediction, explain what new evidence or changed condition applies; when existing evidence already suffices, do not manufacture extra observations.",
+            ],
         }
 
     def _framework_comparison_contract(self) -> dict[str, Any]:
@@ -4248,6 +4299,7 @@ class WorkPacketBuilder:
                 "If the current trigger failures are outliers, use them as examples but do not optimize only for them.",
                 "Before repeating a component layer or failure class, inspect rejected_update_buffer and explain what new evidence changes the decision.",
                 "If the last accepted direction was prediction_missed or rolled back, mutate the approach or pivot to a different learnable surface.",
+                "When prior evidence conflicts or same-direction predictions missed, check prior memory_record.detailed and artifact refs for competing attributions and discriminating observations before repeating or revising the attribution; keep unknown and return noop/rejected if discriminating evidence is missing.",
                 "If evidence is too mixed for a safe bounded change, return noop/rejected with the missing evidence.",
             ],
             "required_final_report_fields": [
@@ -4278,10 +4330,11 @@ class WorkPacketBuilder:
                 "When mission_debug.feature_candidates include mission-attributed-* entries, prefer their failure_category, affected_components, allowed_edit_paths, and validation_contracts over broad status-only buckets.",
                 "Generate one primary bounded candidate and at least one rejected alternative in the final rationale.",
                 "Prefer executable policy changes with measurable prediction targets over observability-only patches unless evidence quality is the explicit blocker.",
-                "Read change_evaluation_digest before choosing a candidate; preserve hit-backed classes and mutate or avoid miss-heavy classes.",
+                "Read change_evaluation_digest and evaluation_applicability before choosing a candidate; preserve applicable hit-backed classes and mutate or avoid applicable miss-heavy classes, treating cross_environment and unknown records as conditional heuristics only.",
                 "When policy_recurrence_signals is non-empty, treat it as evidence that an existing recognizer or policy is too late, too weak, or insufficiently enforced before adding a duplicate rule.",
                 "When infrastructure_triage.trigger_all_infrastructure is true, do not turn the update into a Worker prompt/reasoning patch unless a separate non-infrastructure category proves a Worker-owned failure; prefer Harbor/environment attribution, retry evidence, or packet-routing changes.",
                 "Read prior_update_lesson_entries before choosing a candidate; if they name failed packet_id, outcome, or mission_candidate_id, mutate that direction or explain the fresh evidence that justifies revisiting it.",
+                "When evidence conflicts, same-direction predictions missed, or attribution is ambiguous, record competing causes, packet/trial/summary refs, and the discriminating observation in memory_record.detailed; skip fabricating competing causes when current evidence is decisive, and preserve unknown as noop/rejected when discriminating evidence cannot be obtained.",
                 "If a prior candidate missed its prediction, do not submit a cosmetic variant of the same direction.",
                 "If runner_pivot_policy.layer_pressure is non-empty, avoid another same-layer patch unless fresh evidence explains why the new surface is different; memory_record.failed_directions_to_avoid must name the pressured layer plus a recent packet_id or failure_class when available.",
                 "If runner_pivot_policy.supported is non-empty, consider whether the bounded candidate should preserve or extend that supported direction before pivoting elsewhere.",
@@ -4721,6 +4774,13 @@ class WorkPacketBuilder:
                     "superseded_by_current_reviewer"
                 ):
                     entry["superseded_by_current_reviewer"] = True
+                prior_memory = self._prior_memory_fields(
+                    review_path.parent.name,
+                    run_dir=review_path.parent,
+                    update_record=update_record,
+                )
+                if prior_memory:
+                    entry.update(prior_memory)
                 entries.append(entry)
         unsuccessful = sum(
             1
@@ -4755,6 +4815,95 @@ class WorkPacketBuilder:
         except (OSError, ValueError):
             return {}
         return record if isinstance(record, dict) else {}
+
+    def _change_manifest_record(self, run_dir: Path) -> dict[str, Any]:
+        manifest_path = run_dir / "change_manifest.json"
+        if not manifest_path.is_file():
+            return {}
+        try:
+            manifest = self._read_json(manifest_path)
+        except (OSError, ValueError):
+            return {}
+        return manifest if isinstance(manifest, dict) else {}
+
+    def _summary_markdown_memory_record(self, run_dir: Path) -> dict[str, str]:
+        summary_path = run_dir / "update_summary.md"
+        if not summary_path.is_file():
+            return {}
+        try:
+            text = summary_path.read_text(errors="replace")
+        except OSError:
+            return {}
+        sections: dict[str, list[str]] = {}
+        current = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                heading = stripped[3:].strip().lower()
+                current = heading if heading in {"concise", "detailed"} else ""
+                continue
+            if current:
+                sections.setdefault(current, []).append(line)
+        result: dict[str, str] = {}
+        for key, placeholder in (
+            ("concise", "No concise record supplied."),
+            ("detailed", "No detailed record supplied."),
+        ):
+            value = "\n".join(sections.get(key, [])).strip()
+            if value and value != placeholder:
+                result[key] = value
+        return result
+
+    def _prior_memory_fields(
+        self,
+        packet_id: str,
+        *,
+        run_dir: Path | None = None,
+        update_record: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not packet_id and run_dir is None:
+            return {}
+        target_dir = run_dir or (self.memory_path / "diffs" / packet_id)
+        if not target_dir.is_dir():
+            return {}
+        record = update_record if update_record is not None else self._codex_update_record(target_dir)
+        manifest = self._change_manifest_record(target_dir)
+        concise = ""
+        detailed = ""
+        for source in (record, manifest):
+            raw_mem = source.get("memory_record") if isinstance(source, dict) else None
+            if not isinstance(raw_mem, dict):
+                continue
+            if not concise:
+                concise = str(raw_mem.get("concise") or "").strip()
+            if not detailed:
+                detailed = str(raw_mem.get("detailed") or "").strip()
+        if not concise or not detailed:
+            md_mem = self._summary_markdown_memory_record(target_dir)
+            if not concise:
+                concise = md_mem.get("concise", "")
+            if not detailed:
+                detailed = md_mem.get("detailed", "")
+        memory_payload: dict[str, str] = {}
+        if concise:
+            memory_payload["concise"] = concise[:500]
+        if detailed:
+            memory_payload["detailed"] = detailed[:1600]
+        artifact_refs: dict[str, str] = {}
+        for ref_key, filename in (
+            ("change_manifest_path", "change_manifest.json"),
+            ("update_summary_path", "update_summary.md"),
+            ("update_record_path", "update_record.json"),
+        ):
+            candidate = target_dir / filename
+            if candidate.is_file():
+                artifact_refs[ref_key] = str(candidate)
+        fields: dict[str, Any] = {}
+        if memory_payload:
+            fields["memory_record"] = memory_payload
+        if artifact_refs:
+            fields["artifact_refs"] = artifact_refs
+        return fields
 
     def _external_research_record(self, update_record: dict[str, Any]) -> dict[str, Any]:
         research = update_record.get("external_research")
@@ -4814,13 +4963,258 @@ class WorkPacketBuilder:
         loophole_fixes = [str(item) for item in record.get("loophole_fixes") or []][:3]
         if loophole_fixes:
             fields["loophole_fixes"] = loophole_fixes
+        prior_memory = self._prior_memory_fields(
+            packet_id,
+            run_dir=self.memory_path / "diffs" / packet_id,
+            update_record=record,
+        )
+        if prior_memory:
+            fields.update(prior_memory)
         return fields
+
+    def _current_applicability_conditions(
+        self,
+        failures: list[TrialResult],
+        current_harness: dict[str, Any],
+    ) -> dict[str, Any]:
+        observations = [extract_trial_observation(trial) for trial in failures]
+        if isinstance(current_harness, dict):
+            harness_obs = extract_condition_observation(current_harness)
+            if harness_obs.get("values") or harness_obs.get("partial"):
+                observations.append(harness_obs)
+        return merge_condition_observations(observations)
+
+    def _effective_current_conditions(self) -> dict[str, Any]:
+        if self._current_conditions_cache is not None:
+            return self._current_conditions_cache
+        return merge_condition_observations([])
+
+    def _summaries_for_id(
+        self,
+        summary_id: str,
+        states: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not summary_id:
+            return []
+        found: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for state in states:
+            for item in state.get("summaries") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("summary_id") or "") != summary_id:
+                    continue
+                key = json.dumps(
+                    {
+                        "summary_id": summary_id,
+                        "trial_ids": [str(t) for t in item.get("trial_ids") or []],
+                    },
+                    sort_keys=True,
+                )
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    found.append(item)
+        summary_file = self.memory_path / "summaries" / f"{summary_id}.json"
+        if summary_file.is_file():
+            try:
+                data = self._read_json(summary_file)
+            except (OSError, ValueError):
+                data = {}
+            if data and str(data.get("summary_id") or summary_id) == summary_id:
+                key = json.dumps(
+                    {
+                        "summary_id": summary_id,
+                        "trial_ids": [str(t) for t in data.get("trial_ids") or []],
+                    },
+                    sort_keys=True,
+                )
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    found.append(data)
+        return found
+
+    def _resolve_evaluation_provenance(
+        self,
+        *,
+        packet_id: str,
+        evaluation: dict[str, Any] | None,
+        campaign_state: dict[str, Any] | None,
+        all_states: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        observations: list[dict[str, Any]] = []
+        ambiguous_reasons: list[str] = []
+        updater_provenance: dict[str, str] = {}
+        harness_change_identity: dict[str, Any] = {}
+
+        # 1. Packet / Manifest / UpdateRecord / Event layer (never backfill from current!)
+        run_dir = self.memory_path / "diffs" / packet_id if packet_id else None
+        if run_dir is not None and run_dir.is_dir():
+            packet_file = run_dir / "codex_update_packet.json"
+            if packet_file.is_file():
+                try:
+                    pkt_data = self._read_json(packet_file)
+                except (OSError, ValueError):
+                    pkt_data = {}
+                if isinstance(pkt_data, dict) and pkt_data:
+                    app_cond = (pkt_data.get("evaluation_applicability") or {}).get(
+                        "current_conditions"
+                    )
+                    if isinstance(app_cond, dict) and app_cond.get("conditions"):
+                        observations.append(
+                            extract_condition_observation(
+                                {"comparability_conditions": app_cond.get("conditions")}
+                            )
+                        )
+                    harness = pkt_data.get("current_harness")
+                    if isinstance(harness, dict) and harness:
+                        obs = extract_condition_observation(harness)
+                        if obs.get("values") or obs.get("partial"):
+                            observations.append(obs)
+                    for ft in pkt_data.get("failing_tasks") or []:
+                        if isinstance(ft, dict):
+                            obs = extract_trial_observation(ft)
+                            if obs.get("values") or obs.get("partial"):
+                                observations.append(obs)
+
+            manifest = self._change_manifest_record(run_dir)
+            if manifest:
+                obs = extract_condition_observation(manifest)
+                if obs.get("values") or obs.get("partial"):
+                    observations.append(obs)
+                for ft in (manifest.get("failure_evidence") or {}).get("failing_tasks") or []:
+                    if isinstance(ft, dict):
+                        ft_obs = extract_trial_observation(ft)
+                        if ft_obs.get("values") or ft_obs.get("partial"):
+                            observations.append(ft_obs)
+                updater_provenance.update(extract_updater_provenance(manifest))
+                harness_change_identity.update(extract_harness_change_identity(manifest))
+
+            record = self._codex_update_record(run_dir)
+            if record:
+                obs = extract_condition_observation(record)
+                if obs.get("values") or obs.get("partial"):
+                    observations.append(obs)
+                for k, v in extract_updater_provenance(record).items():
+                    updater_provenance.setdefault(k, v)
+                for k, v in extract_harness_change_identity(record).items():
+                    harness_change_identity.setdefault(k, v)
+
+        matching_events: list[dict[str, Any]] = []
+        if packet_id:
+            for state in all_states:
+                for ev in state.get("codex_update_events") or []:
+                    if isinstance(ev, dict) and str(ev.get("packet_id") or "") == packet_id:
+                        matching_events.append(ev)
+        for ev in matching_events:
+            obs = extract_condition_observation(ev)
+            if obs.get("values") or obs.get("partial"):
+                observations.append(obs)
+            for k, v in extract_updater_provenance(ev).items():
+                updater_provenance.setdefault(k, v)
+            for k, v in extract_harness_change_identity(ev).items():
+                harness_change_identity.setdefault(k, v)
+
+        # 2. Evaluation layer (+ detect non-unique evaluations for the same packet_id)
+        eval_candidates: list[dict[str, Any]] = []
+        if isinstance(evaluation, dict) and evaluation:
+            eval_candidates.append(evaluation)
+        if run_dir is not None:
+            eval_file = run_dir / "change_evaluation.json"
+            if eval_file.is_file():
+                try:
+                    file_eval = self._read_json(eval_file)
+                except (OSError, ValueError):
+                    file_eval = {}
+                if isinstance(file_eval, dict) and file_eval:
+                    eval_candidates.append(file_eval)
+        if packet_id:
+            for state in all_states:
+                for item in state.get("change_evaluations") or []:
+                    if isinstance(item, dict) and str(item.get("packet_id") or "") == packet_id:
+                        eval_candidates.append(item)
+
+        summary_ids = {
+            str(item.get("summary_id") or "").strip()
+            for item in eval_candidates
+            if str(item.get("summary_id") or "").strip()
+        }
+        if len(summary_ids) > 1:
+            ambiguous_reasons.append("ambiguous_evaluation_summary_association")
+
+        for item in eval_candidates:
+            obs = extract_condition_observation(item)
+            if obs.get("values") or obs.get("partial"):
+                observations.append(obs)
+            for k, v in extract_updater_provenance(item).items():
+                updater_provenance.setdefault(k, v)
+            for k, v in extract_harness_change_identity(item).items():
+                harness_change_identity.setdefault(k, v)
+
+        # 3. Summary -> Trial layer (check unique association)
+        trial_ids: list[str] = []
+        for summary_id in sorted(summary_ids):
+            matched_summaries = self._summaries_for_id(summary_id, all_states)
+            if len(matched_summaries) > 1:
+                ambiguous_reasons.append("ambiguous_summary_association")
+            elif len(matched_summaries) == 1:
+                sum_obj = matched_summaries[0]
+                obs = extract_condition_observation(sum_obj)
+                if obs.get("values") or obs.get("partial"):
+                    observations.append(obs)
+                for tid in sum_obj.get("trial_ids") or []:
+                    tid_str = str(tid).strip()
+                    if tid_str and tid_str not in trial_ids:
+                        trial_ids.append(tid_str)
+
+        for item in eval_candidates:
+            for ev_trial in item.get("evaluated_trials") or []:
+                if isinstance(ev_trial, dict):
+                    obs = extract_trial_observation(ev_trial)
+                    if obs.get("values") or obs.get("partial"):
+                        observations.append(obs)
+                    tid_str = str(
+                        ev_trial.get("trial_id") or ev_trial.get("after_trial_id") or ""
+                    ).strip()
+                    if tid_str and tid_str not in trial_ids:
+                        trial_ids.append(tid_str)
+
+        for tid in trial_ids:
+            try:
+                trial_obj = self._load_trial_result(tid)
+            except (OSError, ValueError):
+                continue
+            obs = extract_trial_observation(trial_obj)
+            if obs.get("values") or obs.get("partial"):
+                observations.append(obs)
+
+        merged_hist = merge_condition_observations(
+            observations,
+            ambiguous_reasons=ambiguous_reasons,
+        )
+        applicability = compare_evaluation_applicability(
+            merged_hist,
+            self._effective_current_conditions(),
+        )
+        return {
+            "applicability": applicability,
+            "comparability_conditions": merged_hist,
+            "updater_provenance": updater_provenance,
+            "harness_change_identity": harness_change_identity,
+        }
 
     def _change_evaluation_digest(self, limit: int | None = None) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
         hit_classes: dict[str, int] = {}
         miss_classes: dict[str, int] = {}
         risk_classes: dict[str, int] = {}
+        conditional_hit_classes: dict[str, int] = {}
+        conditional_miss_classes: dict[str, int] = {}
+        conditional_risk_classes: dict[str, int] = {}
+        applicability_counts = {
+            "applicable": 0,
+            "cross_environment": 0,
+            "unknown": 0,
+        }
         states = self._recent_campaign_states(limit=None)
         events_by_packet_id = self._codex_update_events_by_packet(states)
         for state in states:
@@ -4835,6 +5229,17 @@ class WorkPacketBuilder:
                     packet_id,
                     events_by_packet_id=events_by_packet_id,
                 )
+                provenance = self._resolve_evaluation_provenance(
+                    packet_id=packet_id,
+                    evaluation=evaluation,
+                    campaign_state=state,
+                    all_states=states,
+                )
+                applicability = provenance["applicability"]
+                app_status = str(applicability.get("status") or "unknown")
+                if app_status in applicability_counts:
+                    applicability_counts[app_status] += 1
+                is_applicable = app_status == "applicable"
                 prediction = evaluation.get("prediction")
                 if not isinstance(prediction, dict):
                     prediction = {}
@@ -4880,44 +5285,68 @@ class WorkPacketBuilder:
                     outcome_expected_hits.extend(mission_markers)
                 if self._evaluation_outcome_missed(outcome):
                     outcome_expected_misses.extend(mission_markers)
+                target_hits = hit_classes if is_applicable else conditional_hit_classes
+                target_misses = miss_classes if is_applicable else conditional_miss_classes
+                target_risks = risk_classes if is_applicable else conditional_risk_classes
                 for class_name in self._matched_event_classes(hits) + outcome_expected_hits:
-                    hit_classes[class_name] = hit_classes.get(class_name, 0) + 1
+                    target_hits[class_name] = target_hits.get(class_name, 0) + 1
                 for class_name in (
                     self._matched_event_classes(misses) + outcome_expected_misses
                 ):
-                    miss_classes[class_name] = miss_classes.get(class_name, 0) + 1
+                    target_misses[class_name] = target_misses.get(class_name, 0) + 1
                 for class_name in risks:
-                    risk_classes[class_name] = risk_classes.get(class_name, 0) + 1
-                entries.append(
-                    {
-                        "packet_id": packet_id,
-                        "summary_id": str(evaluation.get("summary_id") or ""),
-                        "iteration": event.get("iteration"),
-                        "outcome": outcome,
-                        "failure_class": str(event.get("failure_class") or ""),
-                        "component_layer": str(event.get("component_layer") or ""),
-                        "mission_candidate_id": mission_candidate_id,
-                        "mission_failure_category": mission_failure_category,
-                        "hit_count": int(evaluation.get("hit_count") or 0),
-                        "miss_count": int(evaluation.get("miss_count") or 0),
-                        "prediction_hits": hits[:4],
-                        "prediction_misses": misses[:4],
-                        "expected_fixed_task_classes": expected_classes,
-                        "risk_task_classes": risks,
-                    }
-                )
+                    target_risks[class_name] = target_risks.get(class_name, 0) + 1
+                entry_payload: dict[str, Any] = {
+                    "packet_id": packet_id,
+                    "summary_id": str(evaluation.get("summary_id") or ""),
+                    "iteration": event.get("iteration"),
+                    "outcome": outcome,
+                    "failure_class": str(event.get("failure_class") or ""),
+                    "component_layer": str(event.get("component_layer") or ""),
+                    "mission_candidate_id": mission_candidate_id,
+                    "mission_failure_category": mission_failure_category,
+                    "hit_count": int(evaluation.get("hit_count") or 0),
+                    "miss_count": int(evaluation.get("miss_count") or 0),
+                    "prediction_hits": hits[:4],
+                    "prediction_misses": misses[:4],
+                    "baseline_unavailable_pass": [
+                        str(item)
+                        for item in evaluation.get("baseline_unavailable_pass") or []
+                        if str(item).strip()
+                    ][:8],
+                    "baseline_unavailable_fail": [
+                        str(item)
+                        for item in evaluation.get("baseline_unavailable_fail") or []
+                        if str(item).strip()
+                    ][:8],
+                    "expected_fixed_task_classes": expected_classes,
+                    "risk_task_classes": risks,
+                    "applicability": applicability,
+                    "comparability_conditions": provenance["comparability_conditions"],
+                    **self._prior_memory_fields(packet_id),
+                }
+                if provenance["updater_provenance"]:
+                    entry_payload["updater_provenance"] = provenance["updater_provenance"]
+                if provenance["harness_change_identity"]:
+                    entry_payload["harness_change_identity"] = provenance["harness_change_identity"]
+                entries.append(entry_payload)
         return {
             "recent_evaluations": entries,
             "recent_evaluations_window_audit_only": limit,
             "recent_evaluations_window_stop_condition": False,
             "change_evaluation_count_stop_condition": False,
+            "applicability_counts": applicability_counts,
             "hit_classes": self._ranked_counts(hit_classes),
             "miss_classes": self._ranked_counts(miss_classes),
             "risk_classes": self._ranked_counts(risk_classes),
+            "conditional_hit_classes": self._ranked_counts(conditional_hit_classes),
+            "conditional_miss_classes": self._ranked_counts(conditional_miss_classes),
+            "conditional_risk_classes": self._ranked_counts(conditional_risk_classes),
             "selection_guidance": [
-                "Use miss_classes to avoid cosmetic repeats of evaluated poor directions.",
-                "Use hit_classes only when the new patch preserves the same verifier/frontier evidence discipline.",
-                "Use risk_classes to define explicit validation and rollback checks before accepting a related patch.",
+                "Use applicable miss_classes to avoid cosmetic repeats of evaluated poor directions under matching conditions.",
+                "Use applicable hit_classes only when the new patch preserves the same verifier/frontier evidence discipline.",
+                "Use applicable risk_classes to define explicit validation and rollback checks before accepting a related patch.",
+                "Treat cross_environment and unknown entries (including conditional_miss_classes/conditional_risk_classes) as conditional heuristics only; do not treat them as unconditional prohibitions under current conditions.",
             ],
         }
 
@@ -5448,6 +5877,15 @@ class WorkPacketBuilder:
             packet_id,
             events_by_packet_id=events_by_packet_id,
         )
+        all_states = self._recent_campaign_states(limit=None)
+        provenance = self._resolve_evaluation_provenance(
+            packet_id=packet_id,
+            evaluation=evaluation,
+            campaign_state=campaign_state,
+            all_states=all_states,
+        )
+        applicability = provenance["applicability"]
+        is_applicable = applicability.get("status") == "applicable"
         prediction = evaluation.get("prediction")
         if not isinstance(prediction, dict):
             prediction = {}
@@ -5459,7 +5897,23 @@ class WorkPacketBuilder:
         )
         rollback_recommended = bool(evaluation.get("rollback_recommended"))
         rollback_applied = bool(evaluation.get("rollback_applied"))
-        return {
+        if is_applicable:
+            required_mutation = self._change_evaluation_required_mutation(
+                evaluation,
+                prediction_misses,
+                rollback_recommended=rollback_recommended,
+                rollback_applied=rollback_applied,
+            )
+        else:
+            app_status = str(applicability.get("status") or "unknown")
+            app_reasons = ", ".join(applicability.get("reasons") or [])
+            required_mutation = (
+                f"Conditional heuristic only (applicability={app_status}"
+                + (f"; {app_reasons}" if app_reasons else "")
+                + "): prior evaluation under different or unknown conditions is retained "
+                "for context and does not unconditionally block or force mutations under current conditions."
+            )
+        entry: dict[str, Any] = {
             "source": "change_evaluation",
             "packet_id": packet_id,
             "summary_id": str(evaluation.get("summary_id") or ""),
@@ -5494,15 +5948,17 @@ class WorkPacketBuilder:
             "risk_task_classes": [
                 str(item) for item in prediction.get("risk_task_classes") or []
             ][:8],
-            "avoid_repeating": True,
+            "applicability": applicability,
+            "avoid_repeating": is_applicable,
+            **({"conditional_only": True} if not is_applicable else {}),
             **self._loophole_record_fields(packet_id),
-            "required_mutation": self._change_evaluation_required_mutation(
-                evaluation,
-                prediction_misses,
-                rollback_recommended=rollback_recommended,
-                rollback_applied=rollback_applied,
-            ),
+            "required_mutation": required_mutation,
         }
+        if provenance["updater_provenance"]:
+            entry["updater_provenance"] = provenance["updater_provenance"]
+        if provenance["harness_change_identity"]:
+            entry["harness_change_identity"] = provenance["harness_change_identity"]
+        return entry
 
     def _change_evaluation_required_mutation(
         self,
@@ -5853,11 +6309,20 @@ class WorkPacketBuilder:
         for item in value[:8]:
             if not isinstance(item, dict):
                 continue
-            event = {
+            event_name = str(item.get("event") or "")
+            event: dict[str, Any] = {
                 "task_id": str(item.get("task_id") or ""),
-                "event": str(item.get("event") or ""),
+                "event": event_name,
                 "reason": str(item.get("reason") or ""),
             }
+            baseline_status = str(item.get("baseline_status") or "").strip()
+            if not baseline_status and event_name.startswith("baseline_unavailable_"):
+                baseline_status = "unavailable"
+            if baseline_status:
+                event["baseline_status"] = baseline_status
+            baseline_reason = str(item.get("baseline_reason") or "").strip()
+            if baseline_reason:
+                event["baseline_reason"] = baseline_reason
             raw_classes = item.get("matched_classes")
             if not isinstance(raw_classes, list) or not raw_classes:
                 raw_classes = item.get("labels")
@@ -5947,11 +6412,31 @@ class WorkPacketBuilder:
                 categories.add(mission_category)
         return categories
 
+    def _change_evaluation_records_by_packet(
+        self,
+        states: list[dict[str, Any]],
+    ) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+        records: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        for state in states:
+            for evaluation in state.get("change_evaluations") or []:
+                if not isinstance(evaluation, dict):
+                    continue
+                packet_id = str(evaluation.get("packet_id") or "")
+                if packet_id:
+                    records[packet_id] = (state, evaluation)
+        return records
+
     def _runner_pivot_policy(self) -> dict[str, Any]:
         attempts: list[dict[str, Any]] = []
         states = list(reversed(self._recent_campaign_states(limit=None)))
-        inferred_results = self._inferred_next_eval_results_from_states(states)
+        inferred_details = self._inferred_next_eval_details_from_states(states)
+        inferred_results = {
+            packet_id: detail["outcome"]
+            for packet_id, detail in inferred_details.items()
+        }
+        eval_records_by_packet = self._change_evaluation_records_by_packet(states)
         events_by_packet_id = self._codex_update_events_by_packet(states)
+        eval_prov_cache: dict[str, dict[str, Any]] = {}
         for state in states:
             raw = state.get("failure_class_attempts")
             if isinstance(raw, list):
@@ -5962,13 +6447,59 @@ class WorkPacketBuilder:
                 )
         discouraged: list[dict[str, Any]] = []
         layer_pressure: list[dict[str, Any]] = []
+        conditional_attempts: list[dict[str, Any]] = []
         unsuccessful_by_direction: dict[tuple[str, str], int] = {}
         unsuccessful_by_layer: dict[str, list[dict[str, Any]]] = {}
         unsuccessful_by_mission: dict[str, list[dict[str, Any]]] = {}
         latest_result_by_direction: dict[tuple[str, str], dict[str, Any]] = {}
         latest_attempt_by_layer: dict[str, dict[str, Any]] = {}
         latest_attempt_by_mission: dict[str, dict[str, Any]] = {}
-        for attempt in attempts:
+        projected_attempts: list[dict[str, Any]] = []
+        for raw_attempt in attempts:
+            attempt = dict(raw_attempt)
+            packet_id = str(attempt.get("packet_id") or "")
+            next_eval_result = str(attempt.get("next_eval_result") or "")
+            detail = inferred_details.get(packet_id, {})
+            eval_sourced = False
+            if attempt.get("next_eval_result_inferred"):
+                eval_sourced = detail.get("source") == "change_evaluation"
+            elif (
+                bool(attempt.get("accepted"))
+                and packet_id
+                and packet_id in eval_records_by_packet
+                and next_eval_result
+                in {
+                    "prediction_missed",
+                    "mixed",
+                    "prediction_supported",
+                    "rollback_applied",
+                }
+            ):
+                _, eval_obj = eval_records_by_packet[packet_id]
+                if next_eval_result != "rollback_applied" or bool(
+                    eval_obj.get("rollback_applied") or eval_obj.get("rollback_recommended")
+                ):
+                    eval_sourced = True
+
+            if eval_sourced and packet_id in eval_records_by_packet:
+                if packet_id not in eval_prov_cache:
+                    eval_state, eval_obj = eval_records_by_packet[packet_id]
+                    eval_prov_cache[packet_id] = self._resolve_evaluation_provenance(
+                        packet_id=packet_id,
+                        evaluation=eval_obj,
+                        campaign_state=eval_state,
+                        all_states=states,
+                    )
+                applicability = eval_prov_cache[packet_id]["applicability"]
+                attempt["evaluation_applicability"] = applicability
+                attempt["derived_from_change_evaluation"] = True
+                if applicability.get("status") != "applicable":
+                    attempt["conditional_only"] = True
+                    conditional_attempts.append(attempt)
+                    projected_attempts.append(attempt)
+                    continue
+
+            projected_attempts.append(attempt)
             failure_class = str(attempt.get("failure_class") or "")
             component_layer = str(attempt.get("component_layer") or "")
             mission_candidate_id = str(attempt.get("mission_candidate_id") or "")
@@ -5977,7 +6508,7 @@ class WorkPacketBuilder:
                 latest_attempt_by_layer[component_layer] = attempt
             if mission_candidate_id:
                 latest_attempt_by_mission[mission_candidate_id] = attempt
-            if failure_class and str(attempt.get("next_eval_result") or ""):
+            if failure_class and next_eval_result:
                 latest_result_by_direction[key] = attempt
             if self._attempt_is_superseded_scope_rejection(
                 attempt,
@@ -6082,16 +6613,20 @@ class WorkPacketBuilder:
             if self._attempt_was_supported(attempt)
         ]
         return {
-            "attempts": attempts,
-            "attempt_history_count": len(attempts),
+            "attempts": projected_attempts,
+            "attempt_history_count": len(projected_attempts),
             "attempt_history_truncated": False,
             "attempt_history_truncation_stop_condition": False,
             "discouraged": discouraged,
             "layer_pressure": layer_pressure,
             "supported": supported,
+            "conditional_evaluation_attempts_count": len(conditional_attempts),
             "rule": (
                 "After repeated unsuccessful updates for the same failure class at "
                 "the same component layer, prefer rollback/pivot to another layer. "
+                "Evaluation-sourced attempts with cross_environment or unknown "
+                "applicability remain conditional context and do not enforce "
+                "discouraged or layer_pressure constraints. "
                 "This uses the full available campaign-state attempt history; "
                 "attempt count is not a sub-agent stop or truncation condition."
             ),
@@ -6101,15 +6636,27 @@ class WorkPacketBuilder:
         self,
         campaign_states: list[dict[str, Any]],
     ) -> dict[str, str]:
-        inferred: dict[str, str] = {}
+        details = self._inferred_next_eval_details_from_states(campaign_states)
+        return {
+            packet_id: detail["outcome"]
+            for packet_id, detail in details.items()
+        }
+
+    def _inferred_next_eval_details_from_states(
+        self,
+        campaign_states: list[dict[str, Any]],
+    ) -> dict[str, dict[str, str]]:
+        details: dict[str, dict[str, str]] = {}
         packet_ids_by_summary = self._codex_update_packet_ids_by_summary(campaign_states)
         for state in campaign_states:
-            for packet_id, outcome in self._inferred_next_eval_results_by_packet(
+            for packet_id, (outcome, source) in self._inferred_next_eval_details_by_packet(
                 state,
                 packet_ids_by_summary=packet_ids_by_summary,
             ).items():
-                self._record_inferred_next_eval_result(inferred, packet_id, outcome)
-        return inferred
+                current = (details.get(packet_id) or {}).get("outcome", "")
+                if self._next_eval_result_should_replace(current, outcome):
+                    details[packet_id] = {"outcome": outcome, "source": source}
+        return details
 
     def _inferred_next_eval_results_by_packet(
         self,
@@ -6117,7 +6664,21 @@ class WorkPacketBuilder:
         *,
         packet_ids_by_summary: dict[str, str] | None = None,
     ) -> dict[str, str]:
-        inferred: dict[str, str] = {}
+        return {
+            packet_id: outcome
+            for packet_id, (outcome, _) in self._inferred_next_eval_details_by_packet(
+                campaign_state,
+                packet_ids_by_summary=packet_ids_by_summary,
+            ).items()
+        }
+
+    def _inferred_next_eval_details_by_packet(
+        self,
+        campaign_state: dict[str, Any],
+        *,
+        packet_ids_by_summary: dict[str, str] | None = None,
+    ) -> dict[str, tuple[str, str]]:
+        inferred: dict[str, tuple[str, str]] = {}
         for evaluation in campaign_state.get("change_evaluations") or []:
             if not isinstance(evaluation, dict):
                 continue
@@ -6127,7 +6688,9 @@ class WorkPacketBuilder:
             outcome = "rollback_applied" if evaluation.get("rollback_applied") else str(
                 evaluation.get("outcome") or ""
             )
-            self._record_inferred_next_eval_result(inferred, packet_id, outcome)
+            current = (inferred.get(packet_id) or ("", ""))[0]
+            if self._next_eval_result_should_replace(current, outcome):
+                inferred[packet_id] = (outcome, "change_evaluation")
         for failure in campaign_state.get("codex_validation_failures") or []:
             if not isinstance(failure, dict):
                 continue
@@ -6139,21 +6702,17 @@ class WorkPacketBuilder:
                 packet_ids_by_summary=packet_ids_by_summary,
             )
             if packet_id:
-                self._record_inferred_next_eval_result(
-                    inferred,
-                    packet_id,
-                    "validation_failed",
-                )
+                current = (inferred.get(packet_id) or ("", ""))[0]
+                if self._next_eval_result_should_replace(current, "validation_failed"):
+                    inferred[packet_id] = ("validation_failed", "validation_failure")
         for event in campaign_state.get("frontier_regression_events") or []:
             if not isinstance(event, dict):
                 continue
             packet_id = str(event.get("packet_id") or "")
             if packet_id:
-                self._record_inferred_next_eval_result(
-                    inferred,
-                    packet_id,
-                    "frontier_regression",
-                )
+                current = (inferred.get(packet_id) or ("", ""))[0]
+                if self._next_eval_result_should_replace(current, "frontier_regression"):
+                    inferred[packet_id] = ("frontier_regression", "frontier_regression")
         return inferred
 
     def _record_inferred_next_eval_result(
@@ -6288,13 +6847,56 @@ class WorkPacketBuilder:
         lessons_dir = self.memory_path / "memory" / "component_lessons"
         if not lessons_dir.exists():
             return []
+        states = self._recent_campaign_states(limit=None)
+        eval_records_by_packet = self._change_evaluation_records_by_packet(states)
+        prov_cache: dict[str, dict[str, Any]] = {}
         entries: list[dict[str, Any]] = []
         for path in sorted(lessons_dir.glob("*.md"), key=lambda item: item.stat().st_mtime):
             try:
                 text = path.read_text(errors="replace")
             except OSError:
                 continue
-            entries.extend(self._structured_lesson_entries(path.name, text))
+            for entry in self._structured_lesson_entries(path.name, text):
+                source = str(entry.get("source") or "").strip()
+                packet_id = str(entry.get("packet_id") or "").strip()
+                summary_id = str(entry.get("summary_id") or "").strip()
+                reason = str(entry.get("reason") or "").lower()
+                matched_record = (
+                    eval_records_by_packet.get(packet_id)
+                    if packet_id and packet_id != "unknown"
+                    else None
+                )
+                derived_from_eval = False
+                if source == "change_evaluation":
+                    derived_from_eval = True
+                elif source == "post_update_rollback" and matched_record is not None:
+                    _, eval_obj = matched_record
+                    eval_summary_id = str(eval_obj.get("summary_id") or "").strip()
+                    summary_matches = not summary_id or summary_id == "unknown" or not eval_summary_id or summary_id == eval_summary_id
+                    if summary_matches and (
+                        bool(eval_obj.get("rollback_applied"))
+                        or bool(eval_obj.get("rollback_recommended"))
+                        or "change prediction misses" in reason
+                        or "prediction" in reason
+                    ):
+                        derived_from_eval = True
+                if derived_from_eval:
+                    cache_key = f"{packet_id}:{summary_id}"
+                    if cache_key not in prov_cache:
+                        eval_state = matched_record[0] if matched_record else None
+                        eval_obj = matched_record[1] if matched_record else None
+                        prov_cache[cache_key] = self._resolve_evaluation_provenance(
+                            packet_id="" if packet_id == "unknown" else packet_id,
+                            evaluation=eval_obj,
+                            campaign_state=eval_state,
+                            all_states=states,
+                        )
+                    applicability = prov_cache[cache_key]["applicability"]
+                    entry["derived_from_change_evaluation"] = True
+                    entry["applicability"] = applicability
+                    if applicability.get("status") != "applicable":
+                        entry["conditional_only"] = True
+                entries.append(entry)
         return entries
 
     def _structured_lesson_entries(

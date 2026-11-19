@@ -12031,6 +12031,220 @@ def test_change_manifest_matches_natural_language_risk_classes():
     assert evaluation["prediction_misses"] == []
 
 
+def test_change_manifest_distinguishes_unavailable_baseline_from_observed_zero(tmp_path):
+    from hl.frontier import evaluate_change_manifest, load_frontier
+    from hl.memory import FileSystemMemory
+    from hl.types import TaskDifficulty, TaskDomain, TrialResult, TrialStatus, TrialSummary
+    from meta.packager import WorkPacketBuilder
+    from scripts.run_campaign import _evaluate_pending_change_manifest
+
+    # 1) Missing task, missing frontier file, and bad JSON frontier all mark unavailable (not 0 / not first_ever).
+    bad_frontier_file = tmp_path / "bad_frontier.json"
+    bad_frontier_file.write_text("{corrupt-json")
+    empty_from_missing = load_frontier(tmp_path / "missing_frontier.json")
+    empty_from_bad = load_frontier(bad_frontier_file)
+
+    manifest = {
+        "packet_id": "codex_packet_baseline_check",
+        "prediction": {
+            "expected_fixed_task_classes": ["software_engineering"],
+            "risk_task_classes": [],
+        },
+    }
+    pass_trial = TrialResult(
+        trial_id="after-pass",
+        task_id="new-task-pass",
+        task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+        task_difficulty=TaskDifficulty.EASY,
+        status=TrialStatus.PASSED,
+        score=1.0,
+        verified=True,
+    )
+    fail_trial = TrialResult(
+        trial_id="after-fail",
+        task_id="new-task-fail",
+        task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+        task_difficulty=TaskDifficulty.EASY,
+        status=TrialStatus.FAILED,
+        score=0.0,
+        verified=True,
+    )
+    incomplete_trial = TrialResult(
+        trial_id="after-incomplete",
+        task_id="incomplete-task",
+        task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+        task_difficulty=TaskDifficulty.EASY,
+        status=TrialStatus.FAILED,
+        score=0.0,
+        verified=True,
+    )
+    observed_zero_trial = TrialResult(
+        trial_id="after-observed-zero",
+        task_id="observed-zero-task",
+        task_domain=TaskDomain.SOFTWARE_ENGINEERING,
+        task_difficulty=TaskDifficulty.EASY,
+        status=TrialStatus.PASSED,
+        score=1.0,
+        verified=True,
+    )
+
+    for empty_frontier in (empty_from_missing, empty_from_bad):
+        ev_empty = evaluate_change_manifest(
+            manifest=manifest,
+            trials=[pass_trial, fail_trial],
+            frontier_before=empty_frontier,
+            summary_id="summary_empty",
+        )
+        assert ev_empty["flipped_pass"] == []
+        assert ev_empty["unchanged_fail"] == []
+        assert ev_empty["baseline_unavailable_pass"] == ["new-task-pass"]
+        assert ev_empty["baseline_unavailable_fail"] == ["new-task-fail"]
+        assert ev_empty["hit_count"] == 1
+        assert ev_empty["miss_count"] == 1
+        assert ev_empty["outcome"] == "mixed"
+        assert all(row["previous_last_score"] is None for row in ev_empty["evaluated_trials"])
+        assert all(row["previous_best_score"] is None for row in ev_empty["evaluated_trials"])
+        assert all(row["baseline_status"] == "unavailable" for row in ev_empty["evaluated_trials"])
+        assert "first_ever" not in json.dumps(ev_empty).lower()
+
+    # 2) Mix of observed zero, incomplete entry, and missing task preserves class-level hit/miss and rollback.
+    frontier_mixed = {
+        "tasks": {
+            "observed-zero-task": {"task_id": "observed-zero-task", "last_score": 0.0, "best_score": 0.0},
+            "incomplete-task": {"task_id": "incomplete-task", "last_score": None},
+        }
+    }
+    ev_mixed = evaluate_change_manifest(
+        manifest=manifest,
+        trials=[observed_zero_trial, incomplete_trial, fail_trial],
+        frontier_before=frontier_mixed,
+        summary_id="summary_mixed",
+    )
+    by_task = {row["task_id"]: row for row in ev_mixed["evaluated_trials"]}
+    assert by_task["observed-zero-task"]["baseline_status"] == "observed"
+    assert by_task["observed-zero-task"]["previous_last_score"] == 0.0
+    assert by_task["incomplete-task"]["baseline_status"] == "unavailable"
+    assert by_task["incomplete-task"]["baseline_reason"] == "incomplete_before_entry"
+    assert by_task["incomplete-task"]["previous_last_score"] is None
+    assert by_task["new-task-fail"]["baseline_status"] == "unavailable"
+    assert ev_mixed["flipped_pass"] == ["observed-zero-task"]
+    assert ev_mixed["unchanged_fail"] == []
+    assert ev_mixed["baseline_unavailable_fail"] == ["incomplete-task", "new-task-fail"]
+    # Class-level rollback policy is preserved: 1 hit (observed-zero-task), 2 misses -> rollback recommended.
+    assert ev_mixed["hit_count"] == 1
+    assert ev_mixed["miss_count"] == 2
+    assert ev_mixed["outcome"] == "prediction_missed"
+    assert ev_mixed["rollback_recommended"] is True
+
+    # 3) End-to-end: raw evaluation -> campaign save -> packager digest preserves distinction,
+    #    idempotency on repeat packet_id, and legacy v1 records remain readable without guessing.
+    memory_path = tmp_path / "trials"
+    memory = FileSystemMemory(base_path=str(memory_path))
+    run_dir = memory_path / "diffs" / "codex_packet_e2e_165"
+    run_dir.mkdir(parents=True)
+    diff_path = run_dir / "git.diff"
+    diff_path.write_text("diff\n")
+    (run_dir / "change_manifest.json").write_text(
+        json.dumps(
+            {
+                "accepted": True,
+                "packet_id": "codex_packet_e2e_165",
+                "prediction": {
+                    "expected_fixed_task_classes": ["software_engineering"],
+                    "risk_task_classes": [],
+                    "expected_metric_delta": 1.0,
+                    "confidence": "medium",
+                    "falsification_window": "next summary",
+                },
+            }
+        )
+    )
+    rollback_calls = []
+
+    class UpdateEngine:
+        def rollback_last_accepted(self):
+            return False
+
+        def rollback_diff(self, path):
+            rollback_calls.append(path)
+            return True
+
+    state = {
+        "campaign_id": "camp_165",
+        "last_accepted_codex_update": {
+            "packet_id": "codex_packet_e2e_165",
+            "summary_id": "summary_001",
+            "trial_ids": ["t0"],
+            "patches_applied": ["codex_update:accepted"],
+            "overall_score": 0.0,
+            "diff_path": str(diff_path),
+        },
+        "change_evaluations": [
+            {
+                "packet_id": "codex_packet_legacy_v1",
+                "summary_id": "summary_000",
+                "outcome": "prediction_missed",
+                "prediction": {"expected_fixed_task_classes": ["software_engineering"]},
+                "prediction_misses": [
+                    {
+                        "task_id": "legacy-task",
+                        "event": "unchanged_fail",
+                        "reason": "expected fix missed",
+                        "matched_classes": ["software_engineering"],
+                    }
+                ],
+            }
+        ],
+    }
+    summary = TrialSummary(
+        summary_id="summary_002",
+        trial_ids=["after-fail"],
+        total_tasks=1,
+        failed=1,
+        patches_applied=[],
+    )
+    eval_first = _evaluate_pending_change_manifest(
+        loop=SimpleNamespace(system=SimpleNamespace(update_engine=UpdateEngine())),
+        memory=memory,
+        campaign_state=state,
+        memory_path=memory_path,
+        campaign_id="camp_165",
+        summary=summary,
+        trials=[fail_trial],
+        frontier_before={},
+        update_policy={"cooldown_after_rollback": 1},
+    )
+    assert eval_first["rollback_applied"] is True
+    assert len(rollback_calls) == 1
+    # Idempotency: repeat call with same packet_id does not append another evaluation or rollback.
+    eval_repeat = _evaluate_pending_change_manifest(
+        loop=SimpleNamespace(system=SimpleNamespace(update_engine=UpdateEngine())),
+        memory=memory,
+        campaign_state=state,
+        memory_path=memory_path,
+        campaign_id="camp_165",
+        summary=summary,
+        trials=[fail_trial],
+        frontier_before={},
+        update_policy={"cooldown_after_rollback": 1},
+    )
+    assert eval_repeat == {}
+    assert len(rollback_calls) == 1
+
+    builder = WorkPacketBuilder(repo_root=Path("."), memory_path=memory_path)
+    digest = builder._change_evaluation_digest()
+    by_packet = {item["packet_id"]: item for item in digest["recent_evaluations"]}
+    new_eval_digest = by_packet["codex_packet_e2e_165"]
+    assert new_eval_digest["baseline_unavailable_fail"] == ["new-task-fail"]
+    assert new_eval_digest["prediction_misses"][0]["event"] == "baseline_unavailable_fail"
+    assert new_eval_digest["prediction_misses"][0]["baseline_status"] == "unavailable"
+    assert new_eval_digest["prediction_misses"][0]["baseline_reason"] == "missing_before_frontier"
+
+    legacy_digest = by_packet["codex_packet_legacy_v1"]
+    assert "baseline_status" not in legacy_digest["prediction_misses"][0]
+
+
+
 def test_partial_pass_diagnostic_hook_treats_k_as_audit_only(tmp_path):
     from hl.memory import FileSystemMemory
     from hl.types import TaskDifficulty, TaskDomain, TrialResult, TrialStatus, TrialSummary

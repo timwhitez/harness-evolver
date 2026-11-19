@@ -32,6 +32,38 @@ from meta.update_policy import (
 )
 
 
+def _known_eval_conditions(
+    *,
+    model: str = "deepseek-v4-flash",
+    provider: str = "openai_compatible",
+    task_split: str = "held_in",
+    evaluator: str = "harbor",
+    tool_env_interface: str = "docker_archive_off",
+) -> dict:
+    return {
+        "worker_config": {
+            "provider": provider,
+            "base_url_host": "api.deepseek.com",
+            "model": model,
+            "reasoning_effort": "max",
+            "max_output_tokens": "8000",
+        },
+        "task_split": task_split,
+        "evaluator": evaluator,
+        "tool_env_interface": tool_env_interface,
+    }
+
+
+def _applicable_trial(**updates) -> TrialResult:
+    trial = failed_trial()
+    merged_meta = dict(trial.metadata)
+    merged_meta["evaluation_conditions"] = _known_eval_conditions()
+    updates_copy = dict(updates)
+    if "metadata" in updates_copy:
+        merged_meta.update(updates_copy.pop("metadata"))
+    return trial.model_copy(update={"metadata": merged_meta, **updates_copy})
+
+
 def failed_trial() -> TrialResult:
     return TrialResult(
         trial_id="t1",
@@ -616,6 +648,7 @@ def test_work_packet_includes_change_evaluation_digest(tmp_path):
                         "packet_id": "codex_packet_eval",
                         "summary_id": "summary_008",
                         "outcome": "prediction_missed",
+                        "comparability_conditions": _known_eval_conditions(),
                         "mission_candidate_id": "mission-attributed-tool-observation-loss",
                         "mission_failure_category": "tool_observation_loss",
                         "hit_count": 1,
@@ -649,7 +682,7 @@ def test_work_packet_includes_change_evaluation_digest(tmp_path):
     )
 
     packet = WorkPacketBuilder(repo_root=tmp_path).build(
-        failures=[failed_trial()],
+        failures=[_applicable_trial()],
         current_harness={"version": "x"},
     )
 
@@ -1747,6 +1780,7 @@ def test_change_evaluation_digest_counts_expected_classes_as_hits_only_when_supp
                         "packet_id": "codex_packet_supported_eval",
                         "summary_id": "summary_004",
                         "outcome": "prediction_supported",
+                        "comparability_conditions": _known_eval_conditions(),
                         "mission_candidate_id": "mission-attributed-verification-artifact-gap",
                         "mission_failure_category": "verification_artifact_gap",
                         "prediction": {
@@ -1764,7 +1798,7 @@ def test_change_evaluation_digest_counts_expected_classes_as_hits_only_when_supp
     )
 
     packet = WorkPacketBuilder(repo_root=tmp_path).build(
-        failures=[failed_trial()],
+        failures=[_applicable_trial()],
         current_harness={"version": "x"},
     )
 
@@ -6499,6 +6533,7 @@ def test_work_packet_includes_rejected_update_buffer_from_prediction_miss(tmp_pa
                         "summary_id": "summary_003",
                         "evaluated_at": "2026-05-29T00:00:00",
                         "outcome": "prediction_missed",
+                        "comparability_conditions": _known_eval_conditions(),
                         "mission_candidate_id": "mission-attributed-agent-timeout",
                         "mission_failure_category": "agent_execution_timeout",
                         "rollback_recommended": True,
@@ -6561,7 +6596,7 @@ def test_work_packet_includes_rejected_update_buffer_from_prediction_miss(tmp_pa
     )
 
     packet = WorkPacketBuilder(repo_root=tmp_path).build(
-        failures=[failed_trial()],
+        failures=[_applicable_trial()],
         current_harness={"version": "x"},
     )
 
@@ -6637,6 +6672,7 @@ def test_work_packet_includes_rejected_update_buffer_from_mixed_evaluation(tmp_p
                         "packet_id": "codex_packet_mixed",
                         "summary_id": "summary_006",
                         "outcome": "mixed",
+                        "comparability_conditions": _known_eval_conditions(),
                         "hit_count": 2,
                         "miss_count": 2,
                     }
@@ -6646,7 +6682,7 @@ def test_work_packet_includes_rejected_update_buffer_from_mixed_evaluation(tmp_p
     )
 
     packet = WorkPacketBuilder(repo_root=tmp_path).build(
-        failures=[failed_trial()],
+        failures=[_applicable_trial()],
         current_harness={"version": "x"},
     )
 
@@ -13762,6 +13798,7 @@ def test_codex_update_engine_runs_subprocess_reviews_diff_and_rolls_back(tmp_pat
                         "packet_id": "codex_packet_prior_timeout_2",
                         "summary_id": "summary_003",
                         "outcome": "prediction_missed",
+                        "comparability_conditions": _known_eval_conditions(),
                         "rollback_recommended": True,
                         "rollback_applied": True,
                         "hit_count": 0,
@@ -13846,7 +13883,7 @@ def test_codex_update_engine_runs_subprocess_reviews_diff_and_rolls_back(tmp_pat
         allow_dirty_baseline=True,
     )
     result = engine.run_update(
-        failures=[failed_trial()],
+        failures=[_applicable_trial()],
         current_harness={"version": "x"},
         required_validation_commands=[validation_command],
     )
@@ -14731,3 +14768,697 @@ def _init_repo(path):
         check=True,
         capture_output=True,
     )
+
+
+def test_competing_attribution_guidance_and_memory_propagation_to_subsequent_packet(tmp_path):
+    """Issue #166: final_report -> change_manifest -> update_summary -> next packet."""
+    _init_repo(tmp_path)
+    trials_dir = tmp_path / "trials"
+    diffs_dir = trials_dir / "diffs"
+    (trials_dir / "summaries").mkdir(parents=True)
+
+    # Round 1 packet carries on-demand competing attribution guidance without forcing new fields.
+    builder = WorkPacketBuilder(repo_root=tmp_path, memory_path=trials_dir)
+    packet_1 = builder.build(
+        failures=[failed_trial()],
+        current_harness={"version": "0.1.0"},
+    )
+    detailed_schema = packet_1.expected_report_schema["properties"]["memory_record"][
+        "properties"
+    ]["detailed"]["description"]
+    assert "competing" in detailed_schema.lower()
+    assert "noop/rejected" in detailed_schema.lower()
+    guidance_text = "\n".join(
+        packet_1.update_memory_contract["competing_attribution_guidance"]
+    )
+    assert "healthy neighbor" in guidance_text.lower()
+    assert "do not force a second explanation" in guidance_text.lower()
+
+    # Simulate final_report -> change_manifest -> update_summary across 4 scenarios:
+    # (a) ambiguous timeout with competing cause + discriminating observation -> missed eval
+    # (b) unavailable discriminating observation -> noop/rejected
+    # (c) decisive exact interface failure without forced second cause -> accepted
+    # (d) revision/reuse reads prior detailed memory from packet & records invalidation + new evidence
+    validation_ok = tmp_path.parent / f"{tmp_path.name}_validation_ok.py"
+    validation_ok.write_text("print('ok')\n")
+    validation_command = f"{sys.executable} {validation_ok}"
+    mode_file = tmp_path.parent / f"{tmp_path.name}_mode.txt"
+    dominant_label = (
+        (packet_1.failure_pattern_digest.get("dominant_pattern") or {}).get("failure_category")
+        or "entrypoint_miss"
+    )
+    selected_mission_id = (
+        (packet_1.mission_debug.get("evidence_summary") or {}).get("selected_candidate_id")
+        or "mission-attributed-entrypoint-miss"
+    )
+    fake_codex = tmp_path.parent / f"{tmp_path.name}_fake_codex_166.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "final_path = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        f"mode = pathlib.Path({str(mode_file)!r}).read_text().strip()\n"
+        f"label = {dominant_label!r}\n"
+        f"mission_id = {selected_mission_id!r}\n"
+        "if mode == 'ambiguous_timeout':\n"
+        "    pathlib.Path('bench/agent.py').write_text('CODEX_TIMEOUT_166 = True\\n')\n"
+        "    report = {\n"
+        "        'status': 'edited',\n"
+        "        'summary': 'Address worker timeout after distinguishing tool/env vs policy',\n"
+        "        'changed_files': ['bench/agent.py'],\n"
+        f"        'validation_commands': [{validation_command!r}],\n"
+        "        'component_type': 'adapter',\n"
+        "    }\n"
+        "    detailed_mem = (\n"
+        "        f'Selected {mission_id}. Current explanation: worker loop stall (t_fail_1, summary_001). '\n"
+        "        'Competing cause: container dns/env timeout. '\n"
+        "        'Discriminating observation: same input still timed out in healthy neighbor tool env.'\n"
+        "    )\n"
+        "    failed_dirs = ['avoid blind retry']\n"
+        "elif mode == 'external_unknown':\n"
+        "    report = {\n"
+        "        'status': 'noop',\n"
+        "        'summary': 'Discriminating env probe unavailable; keeping attribution unknown',\n"
+        "        'changed_files': [],\n"
+        "        'validation_commands': [],\n"
+        "        'skipped_validation_reason': 'no files changed; discriminating observation unavailable',\n"
+        "        'component_type': 'adapter',\n"
+        "    }\n"
+        "    detailed_mem = (\n"
+        "        f'Selected {mission_id}. Current attribution unknown (t_unknown_1). '\n"
+        "        'Discriminating env probe unavailable; did not mark env or policy ruled out.'\n"
+        "    )\n"
+        "    failed_dirs = ['avoid blind retry']\n"
+        "elif mode == 'revise_with_evidence':\n"
+        "    pathlib.Path('bench/agent.py').write_text('CODEX_REVISED_166 = True\\n')\n"
+        "    report = {\n"
+        "        'status': 'edited',\n"
+        "        'summary': 'Revise prior timeout attribution with new healthy-neighbor probe',\n"
+        "        'changed_files': ['bench/agent.py'],\n"
+        f"        'validation_commands': [{validation_command!r}],\n"
+        "        'component_type': 'adapter',\n"
+        "    }\n"
+        "    detailed_mem = (\n"
+        "        f'Selected {mission_id}. Prior worker-stall hypothesis invalidated by summary_002 miss; '\n"
+        "        'new trace t_fail_2 shows retry loop inside healthy env, confirming adapter recovery bug.'\n"
+        "    )\n"
+        "    failed_dirs = ['avoid blind retry']\n"
+        "else:\n"
+        "    pathlib.Path('bench/agent.py').write_text('CODEX_EXACT_166 = True\\n')\n"
+        "    report = {\n"
+        "        'status': 'edited',\n"
+        "        'summary': 'Fix exact schema mismatch in adapter',\n"
+        "        'changed_files': ['bench/agent.py'],\n"
+        f"        'validation_commands': [{validation_command!r}],\n"
+        "        'component_type': 'adapter',\n"
+        "    }\n"
+        "    detailed_mem = f'Selected {mission_id}. Decisive interface TypeError in adapter (t_iface_1); no second cause needed.'\n"
+        "    failed_dirs = ['avoid blind retry']\n"
+        "final_path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "base = {\n"
+        "  'skipped_validation_reason': '',\n"
+        "  'strategy_confidence': 'medium',\n"
+        "  'loophole_review': ['reviewed scope'],\n"
+        "  'loophole_fixes': ['kept bounded'],\n"
+        "  'implementation_scope': {'primary_layer': report['component_type'], 'architectural_change_considered': True, 'structural_files_changed': report['changed_files'], 'why_prompt_only_is_sufficient': 'structural'},\n"
+        "  'generalization': {'problem_class': label, 'applies_to': [label], 'anti_overfit_checks': ['no task id'], 'why_not_task_specific': 'general'},\n"
+        "  'cross_round_evidence': {'used': True, 'recent_summary_ids': ['summary_001'], 'dominant_patterns': [label], 'selected_problem_class': label, 'why_this_slice_generalizes': 'general'},\n"
+        "  'memory_record': {'concise': report['summary'], 'detailed': detailed_mem, 'failed_directions_to_avoid': failed_dirs, 'supported_directions_to_preserve': []},\n"
+        "  'framework_comparison': {'before': 'before', 'after': 'after', 'expected_effect': 'better', 'rollback_trigger': 'miss'},\n"
+        "  'prediction': {'expected_fixed_task_classes': [label, mission_id], 'risk_task_classes': [], 'expected_metric_delta': 0.5, 'confidence': 'medium', 'falsification_window': 'next summary'},\n"
+        "  'leaderboard_compliance': {'harbor_official_harness_preserved': True, 'self_owned_worker_preserved': True, 'benchmark_integrity_preserved': True, 'timeouts_resources_unchanged': True, 'submit_gate_preserved': True, 'official_dataset_preserved': True, 'five_attempts_per_task_preserved': True, 'no_prohibited_terminal_bench_access': True, 'upload_artifacts_trace_preserved': True},\n"
+        "  'external_research': {'used': False, 'sources': [], 'fetches': [], 'reason': 'local evidence suffices', 'impact': 'none'},\n"
+        "}\n"
+        "base.update(report)\n"
+        "final_path.write_text(json.dumps(base))\n"
+    )
+    fake_codex.chmod(0o755)
+    engine = CodexUpdateEngine(
+        repo_root=tmp_path,
+        codex_bin=str(fake_codex),
+        events_dir=diffs_dir,
+        allow_dirty_baseline=True,
+    )
+
+    import time
+
+    # (a) Ambiguous timeout with discriminating observation
+    mode_file.write_text("ambiguous_timeout")
+    res_a = engine.run_update(
+        failures=[failed_trial().model_copy(update={"trial_id": "t_fail_1"})],
+        current_harness={"version": "0.1.0"},
+        required_validation_commands=[validation_command],
+    )
+    assert res_a.review.accepted is True
+    assert "healthy neighbor tool env" in pathlib.Path(res_a.summary_path).read_text()
+    manifest_a = json.loads((pathlib.Path(res_a.summary_path).parent / "change_manifest.json").read_text())
+    assert "Competing cause: container dns/env timeout" in manifest_a["memory_record"]["detailed"]
+
+    # Record a missed change_evaluation in campaign state referencing res_a's packet_id
+    packet_a_id = manifest_a["packet_id"]
+    (trials_dir / "summaries" / "camp_166_campaign_state.json").write_text(
+        json.dumps(
+            {
+                "campaign_id": "camp_166",
+                "codex_update_events": [
+                    {
+                        "packet_id": packet_a_id,
+                        "summary_id": "summary_001",
+                        "iteration": 1,
+                        "action": "accepted",
+                        "failure_class": dominant_label,
+                        "component_layer": "adapter",
+                        "changed_files": ["bench/agent.py"],
+                    }
+                ],
+                "change_evaluations": [
+                    {
+                        "packet_id": packet_a_id,
+                        "summary_id": "summary_002",
+                        "outcome": "prediction_missed",
+                        "hit_count": 0,
+                        "miss_count": 1,
+                        "rollback_recommended": True,
+                        "prediction": {"expected_fixed_task_classes": [dominant_label]},
+                        "prediction_misses": [
+                            {
+                                "task_id": "task-timeout",
+                                "event": "unchanged_fail",
+                                "reason": "expected fix missed",
+                                "matched_classes": [dominant_label],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    time.sleep(1.05)
+    # (b) External unknown ends cleanly as noop without fabricated edit (distinct failure class so Codex runs)
+    mode_file.write_text("external_unknown")
+    unknown_trial = failed_trial().model_copy(
+        update={
+            "trial_id": "t_unknown_1",
+            "status": TrialStatus.TIMEOUT,
+            "metadata": {"timeout_phase": "agent_execution"},
+        }
+    )
+    res_b = engine.run_update(
+        failures=[unknown_trial],
+        current_harness={"version": "0.1.0"},
+        required_validation_commands=[validation_command],
+    )
+    assert res_b.final_report["status"] == "noop"
+    assert res_b.review.accepted is False
+    assert "did not mark env or policy ruled out" in pathlib.Path(res_b.summary_path).read_text()
+
+    time.sleep(1.05)
+    # (c) Decisive interface failure ends cleanly without forcing a second explanation
+    (tmp_path / "harness" / "tools").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "harness" / "tools" / "bash.py").write_text("original\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add bash tool"], cwd=tmp_path, check=True, capture_output=True)
+    fake_codex.write_text(
+        fake_codex.read_text().replace(
+            "else:\n    pathlib.Path('bench/agent.py').write_text('CODEX_EXACT_166 = True\\n')\n    report = {\n        'status': 'edited',\n        'summary': 'Fix exact schema mismatch in adapter',\n        'changed_files': ['bench/agent.py'],\n        'validation_commands': ['" + validation_command + "'],\n        'component_type': 'adapter',\n    }\n    detailed_mem = f'Selected {mission_id}. Decisive interface TypeError in adapter (t_iface_1); no second cause needed.'\n    failed_dirs = ['avoid blind retry']",
+            f"else:\n    pathlib.Path('harness/tools/bash.py').write_text('CODEX_EXACT_166 = True\\n')\n    report = {{\n        'status': 'edited',\n        'summary': 'Fix exact dependency check in bash tool',\n        'changed_files': ['harness/tools/bash.py'],\n        'validation_commands': [{validation_command!r}],\n        'component_type': 'tool',\n    }}\n    detailed_mem = 'Selected mission-attributed-dependency-issue. Decisive missing-binary TypeError in tool (t_iface_1); no second cause needed.'\n    failed_dirs = ['Do not repeat {packet_a_id} ({dominant_label}) without fresh evidence']",
+        )
+    )
+    # Also update label/mission_id in fake_codex for dependency_issue when mode == 'decisive_interface'
+    fake_codex.write_text(
+        fake_codex.read_text().replace(
+            "'generalization': {'problem_class': label, 'applies_to': [label],",
+            "'generalization': {'problem_class': ('dependency_issue' if mode == 'decisive_interface' else label), 'applies_to': [('dependency_issue' if mode == 'decisive_interface' else label)],",
+        ).replace(
+            "'dominant_patterns': [label], 'selected_problem_class': label,",
+            "'dominant_patterns': [('dependency_issue' if mode == 'decisive_interface' else label)], 'selected_problem_class': ('dependency_issue' if mode == 'decisive_interface' else label),",
+        ).replace(
+            "'expected_fixed_task_classes': [label, mission_id],",
+            "'expected_fixed_task_classes': [('dependency_issue' if mode == 'decisive_interface' else label), ('mission-attributed-dependency-issue' if mode == 'decisive_interface' else mission_id)],",
+        )
+    )
+    mode_file.write_text("decisive_interface")
+    iface_trial = failed_trial().model_copy(
+        update={
+            "trial_id": "t_iface_1",
+            "error_log": ["bash: rg: command not found"],
+            "tool_calls": [{"tool": "bash", "success": False, "error": "command not found"}],
+        }
+    )
+    res_c = engine.run_update(
+        failures=[iface_trial],
+        current_harness={"version": "0.1.0"},
+        required_validation_commands=[validation_command],
+    )
+    assert res_c.review.accepted is True
+    assert "no second cause needed" in pathlib.Path(res_c.summary_path).read_text()
+
+    # Round 2: subsequent WorkPacketBuilder retrieves prior detailed memory & artifact refs!
+    # Also verify revision/reuse scenario: packet_2 includes prior detailed memory, and
+    # round 2 revision references the invalidated prior explanation + new distinguishing evidence.
+    next_packet = WorkPacketBuilder(repo_root=tmp_path, memory_path=trials_dir).build(
+        failures=[failed_trial().model_copy(update={"trial_id": "t_fail_2"})],
+        current_harness={"version": "0.1.1"},
+    )
+    history_by_id = {
+        item["packet_id"]: item for item in next_packet.update_history["recent_codex_updates"]
+    }
+    assert "healthy neighbor tool env" in history_by_id[packet_a_id]["memory_record"]["detailed"]
+    assert history_by_id[packet_a_id]["artifact_refs"]["change_manifest_path"].endswith("change_manifest.json")
+    assert history_by_id[packet_a_id]["artifact_refs"]["update_summary_path"].endswith("update_summary.md")
+
+    eval_by_id = {
+        item["packet_id"]: item
+        for item in next_packet.change_evaluation_digest["recent_evaluations"]
+    }
+    assert "Competing cause: container dns/env timeout" in eval_by_id[packet_a_id]["memory_record"]["detailed"]
+
+    rejected_by_id = {
+        item["packet_id"]: item for item in next_packet.rejected_update_buffer
+    }
+    assert "healthy neighbor tool env" in rejected_by_id[packet_a_id]["memory_record"]["detailed"]
+
+
+def test_change_evaluation_applicability_gates_all_homologous_paths(tmp_path):
+    """Issue #168: applicability scopes miss/risk, rejected, lessons, and pivot policy."""
+    _init_repo(tmp_path)
+    trials_dir = tmp_path / "trials"
+    summaries_dir = trials_dir / "summaries"
+    lessons_dir = trials_dir / "memory" / "component_lessons"
+    diffs_dir = trials_dir / "diffs"
+    summaries_dir.mkdir(parents=True)
+    lessons_dir.mkdir(parents=True)
+
+    # 3 cross-environment failures crossing BOTH discouraged (>=2) and layer_pressure (>=3),
+    # PLUS 1 applicable failure, PLUS 1 candidate/updater-changed applicable evaluation,
+    # PLUS 1 conflicting/unknown evaluation, PLUS 1 old empty-scope evaluation.
+    cross_conds = _known_eval_conditions(model="deepseek-v4-pro")
+    app_conds = _known_eval_conditions(model="deepseek-v4-flash")
+
+    # Packet provenance resolved along packet -> evaluation -> summary/trial:
+    # codex_packet_app_changed has DIFFERENT updater_provenance & candidate_commit, same conditions -> applicable!
+    app_dir = diffs_dir / "codex_packet_app_changed"
+    app_dir.mkdir(parents=True)
+    (app_dir / "change_manifest.json").write_text(
+        json.dumps(
+            {
+                "packet_id": "codex_packet_app_changed",
+                "comparability_conditions": app_conds,
+                "updater_provenance": {"updater_runner": "codex", "updater_model": "gpt-5.3"},
+                "harness_change_identity": {
+                    "base_commit": "abc000",
+                    "candidate_commit": "def111",
+                },
+            }
+        )
+    )
+
+    # Conflicting source: packet says flash, trial says pro -> MUST resolve to unknown (no backfill!).
+    conflict_dir = diffs_dir / "codex_packet_conflict"
+    conflict_dir.mkdir(parents=True)
+    (conflict_dir / "codex_update_packet.json").write_text(
+        json.dumps({"current_harness": {"evaluation_conditions": app_conds}})
+    )
+    write_trial(
+        tmp_path,
+        _applicable_trial(
+            trial_id="t_conflict_after",
+            metadata={"evaluation_conditions": cross_conds},
+        ),
+    )
+
+    # Homologous component lessons (change_evaluation + post_update_rollback) for cross-env & applicable
+    (lessons_dir / "codex_update.md").write_text(
+        "# codex_update\n\n"
+        "## 2026-11-01T10:00:00\n\n"
+        "Codex update outcome evidence.\n"
+        "source: change_evaluation\n"
+        "packet_id: codex_packet_cross_1\n"
+        "outcome: prediction_missed\n"
+        "summary_id: sum_cross_1\n"
+        "rollback_applied: true\n"
+        "reason: cross env miss\n\n"
+        "## 2026-11-01T10:05:00\n\n"
+        "Codex update outcome evidence.\n"
+        "source: post_update_rollback\n"
+        "packet_id: codex_packet_cross_2\n"
+        "outcome: rollback_applied\n"
+        "summary_id: sum_cross_2\n"
+        "rollback_applied: true\n"
+        "reason: change prediction misses exceeded hits for packet codex_packet_cross_2\n\n"
+        "## 2026-11-01T10:10:00\n\n"
+        "Codex update outcome evidence.\n"
+        "source: change_evaluation\n"
+        "packet_id: codex_packet_app_changed\n"
+        "outcome: prediction_missed\n"
+        "summary_id: sum_app\n"
+        "rollback_applied: false\n"
+        "reason: applicable miss\n"
+    )
+
+    (summaries_dir / "camp_campaign_state.json").write_text(
+        json.dumps(
+            {
+                "campaign_id": "camp",
+                "summaries": [
+                    {"summary_id": "sum_conflict", "trial_ids": ["t_conflict_after"]},
+                ],
+                "failure_class_attempts": [
+                    # 3 cross-env attempts with same layer ("prompt") and 2 with same class ("cross_only_class")
+                    # One stored next_eval_result, two inferred from change_evaluations -> must NOT force!
+                    {
+                        "packet_id": "codex_packet_cross_1",
+                        "failure_class": "cross_only_class",
+                        "component_layer": "prompt",
+                        "accepted": True,
+                        "next_eval_result": "prediction_missed",
+                    },
+                    {
+                        "packet_id": "codex_packet_cross_2",
+                        "failure_class": "cross_only_class",
+                        "component_layer": "prompt",
+                        "accepted": True,
+                        "next_eval_result": "",
+                    },
+                    {
+                        "packet_id": "codex_packet_cross_3",
+                        "failure_class": "cross_third_class",
+                        "component_layer": "prompt",
+                        "accepted": True,
+                        "next_eval_result": "",
+                    },
+                    # Empty-scope legacy attempts (must resolve unknown, never compatible even if current were empty)
+                    {
+                        "packet_id": "codex_packet_empty_1",
+                        "failure_class": "empty_scope_class",
+                        "component_layer": "context",
+                        "accepted": True,
+                        "next_eval_result": "prediction_missed",
+                    },
+                    {
+                        "packet_id": "codex_packet_empty_2",
+                        "failure_class": "empty_scope_class",
+                        "component_layer": "context",
+                        "accepted": True,
+                        "next_eval_result": "prediction_missed",
+                    },
+                ],
+                "codex_update_events": [
+                    {
+                        "action": "accepted",
+                        "iteration": 1,
+                        "summary_id": "sum_0",
+                        "packet_id": "codex_packet_cross_1",
+                        "failure_class": "cross_only_class",
+                        "component_layer": "prompt",
+                    },
+                    {
+                        "action": "accepted",
+                        "iteration": 2,
+                        "summary_id": "sum_1",
+                        "packet_id": "codex_packet_app_changed",
+                        "failure_class": "applicable_miss_class",
+                        "component_layer": "adapter",
+                        "updater_provenance": {"updater_model": "gpt-5.3"},
+                        "harness_change_identity": {"candidate_commit": "def111"},
+                    },
+                ],
+                "change_evaluations": [
+                    {
+                        "packet_id": "codex_packet_cross_1",
+                        "summary_id": "sum_cross_1",
+                        "outcome": "prediction_missed",
+                        "rollback_applied": True,
+                        "comparability_conditions": cross_conds,
+                        "prediction": {
+                            "expected_fixed_task_classes": ["cross_only_class"],
+                            "risk_task_classes": ["cross_only_risk"],
+                        },
+                        "prediction_misses": [
+                            {"task_id": "t-c1", "event": "unchanged_fail", "reason": "miss", "matched_classes": ["cross_only_class"]}
+                        ],
+                    },
+                    {
+                        "packet_id": "codex_packet_cross_2",
+                        "summary_id": "sum_cross_2",
+                        "outcome": "prediction_missed",
+                        "rollback_applied": True,
+                        "comparability_conditions": cross_conds,
+                        "prediction": {
+                            "expected_fixed_task_classes": ["cross_only_class"],
+                            "risk_task_classes": [],
+                        },
+                        "prediction_misses": [
+                            {"task_id": "t-c2", "event": "unchanged_fail", "reason": "miss", "matched_classes": ["cross_only_class"]}
+                        ],
+                    },
+                    {
+                        "packet_id": "codex_packet_cross_3",
+                        "summary_id": "sum_cross_3",
+                        "outcome": "prediction_missed",
+                        "comparability_conditions": cross_conds,
+                        "prediction": {
+                            "expected_fixed_task_classes": ["cross_third_class"],
+                            "risk_task_classes": [],
+                        },
+                        "prediction_misses": [],
+                    },
+                    {
+                        "packet_id": "codex_packet_conflict",
+                        "summary_id": "sum_conflict",
+                        "outcome": "prediction_missed",
+                        "prediction": {
+                            "expected_fixed_task_classes": ["conflict_only_class"],
+                            "risk_task_classes": ["conflict_only_risk"],
+                        },
+                        "prediction_misses": [],
+                    },
+                    {
+                        "packet_id": "codex_packet_empty_1",
+                        "summary_id": "sum_e1",
+                        "outcome": "prediction_missed",
+                        "prediction": {
+                            "expected_fixed_task_classes": ["empty_scope_class"],
+                            "risk_task_classes": [],
+                        },
+                        "prediction_misses": [],
+                    },
+                    {
+                        "packet_id": "codex_packet_empty_2",
+                        "summary_id": "sum_e2",
+                        "outcome": "prediction_missed",
+                        "prediction": {
+                            "expected_fixed_task_classes": ["empty_scope_class"],
+                            "risk_task_classes": [],
+                        },
+                        "prediction_misses": [],
+                    },
+                    {
+                        "packet_id": "codex_packet_app_changed",
+                        "summary_id": "sum_app",
+                        "outcome": "prediction_missed",
+                        "prediction": {
+                            "expected_fixed_task_classes": ["applicable_miss_class"],
+                            "risk_task_classes": ["applicable_risk_class"],
+                        },
+                        "prediction_misses": [
+                            {"task_id": "t-app", "event": "unchanged_fail", "reason": "miss", "matched_classes": ["applicable_miss_class"]}
+                        ],
+                    },
+                ],
+            }
+        )
+    )
+
+    # Current run uses flash + updater gpt-5.4 + different commit -> matches ONLY codex_packet_app_changed!
+    packet = WorkPacketBuilder(repo_root=tmp_path, memory_path=trials_dir).build(
+        failures=[_applicable_trial()],
+        current_harness={"version": "0.2.0"},
+    )
+
+    digest = packet.change_evaluation_digest
+    # Full history retained in recent_evaluations
+    assert len(digest["recent_evaluations"]) == 7
+    assert digest["applicability_counts"] == {
+        "applicable": 1,
+        "cross_environment": 3,
+        "unknown": 3,
+    }
+    by_pkt = {item["packet_id"]: item for item in digest["recent_evaluations"]}
+    assert by_pkt["codex_packet_app_changed"]["applicability"]["status"] == "applicable"
+    assert by_pkt["codex_packet_app_changed"]["updater_provenance"]["updater_model"] == "gpt-5.3"
+    assert by_pkt["codex_packet_app_changed"]["harness_change_identity"]["candidate_commit"] == "def111"
+    assert by_pkt["codex_packet_cross_1"]["applicability"]["status"] == "cross_environment"
+    assert by_pkt["codex_packet_conflict"]["applicability"]["status"] == "unknown"
+    assert "conflicting_worker_config" in by_pkt["codex_packet_conflict"]["applicability"]["reasons"]
+    assert by_pkt["codex_packet_empty_1"]["applicability"]["status"] == "unknown"
+
+    # Only applicable miss/risk classes are mandatory; cross-env/unknown are conditional only
+    assert [item["class"] for item in digest["miss_classes"]] == ["applicable_miss_class"]
+    assert [item["class"] for item in digest["risk_classes"]] == ["applicable_risk_class"]
+    assert {item["class"] for item in digest["conditional_miss_classes"]} >= {
+        "cross_only_class",
+        "conflict_only_class",
+        "empty_scope_class",
+    }
+
+    # Rejected update buffer keeps all entries, but cross-env/unknown have avoid_repeating=False & conditional_only=True
+    buf_by_pkt = {item["packet_id"]: item for item in packet.rejected_update_buffer}
+    assert buf_by_pkt["codex_packet_cross_1"]["avoid_repeating"] is False
+    assert buf_by_pkt["codex_packet_cross_1"]["conditional_only"] is True
+    assert "Conditional heuristic only" in buf_by_pkt["codex_packet_cross_1"]["required_mutation"]
+    assert buf_by_pkt["codex_packet_app_changed"]["avoid_repeating"] is True
+
+    # Homologous component lessons (change_evaluation & post_update_rollback) are marked conditional_only when cross-env
+    lessons_by_pkt = {item["packet_id"]: item for item in packet.prior_update_lesson_entries}
+    assert lessons_by_pkt["codex_packet_cross_1"]["conditional_only"] is True
+    assert lessons_by_pkt["codex_packet_cross_2"]["conditional_only"] is True
+    assert not lessons_by_pkt["codex_packet_app_changed"].get("conditional_only")
+
+    # Pivot policy: 3 cross-env prompt failures & 2 empty-scope failures must NOT trigger discouraged or layer_pressure!
+    assert packet.runner_pivot_policy["discouraged"] == []
+    assert packet.runner_pivot_policy["layer_pressure"] == []
+    assert packet.runner_pivot_policy["conditional_evaluation_attempts_count"] == 5
+
+    # Verify summary decision inputs display applicability accurately
+    decision_inputs = codex_update._summary_decision_inputs(packet)
+    assert decision_inputs["change_evaluation_applicability"] == (
+        "applicable=1, cross_environment=3, unknown=3"
+    )
+    assert "conditional:cross_environment" in decision_inputs["prior_update_lessons"]
+    assert "conditional:cross_environment" in decision_inputs["rejected_update_packets"]
+
+    # Gate verification: report covering ONLY applicable constraints (ignoring cross_only_class / cross_only_risk)
+    # MUST pass all evaluation-derived gates!
+    engine = CodexUpdateEngine(repo_root=tmp_path, events_dir=diffs_dir)
+    report_ok = {
+        "status": "edited",
+        "summary": "Fix applicable failure class",
+        "changed_files": ["bench/agent.py"],
+        "validation_commands": ["pytest tests/ -v"],
+        "component_type": "adapter",
+        **contract_report_fields(),
+    }
+    report_ok["memory_record"]["failed_directions_to_avoid"] = [
+        "Do not repeat codex_packet_app_changed change_evaluation direction "
+        "(applicable_miss_class, prediction_missed): name missed task t-app and "
+        "class applicable_miss_class, then apply a concrete Worker/harness mutation."
+    ]
+    report_ok["prediction"]["expected_fixed_task_classes"] = ["applicable_miss_class"]
+    report_ok["prediction"]["risk_task_classes"] = ["applicable_risk_class"]
+
+    review_ok = engine._apply_report_gates(
+        PatchReviewResult(accepted=True, changed_files=["bench/agent.py"]),
+        exit_code=0,
+        final_report=report_ok,
+        required_validation_commands=["pytest tests/ -v"],
+        failure_pattern_digest=packet.failure_pattern_digest,
+        rejected_update_buffer=packet.rejected_update_buffer,
+        runner_pivot_policy=packet.runner_pivot_policy,
+        change_evaluation_digest=packet.change_evaluation_digest,
+        prior_update_lesson_entries=packet.prior_update_lesson_entries,
+    )
+    assert review_ok.accepted is True
+    assert not any(
+        item.rule_id in {
+            "report.memory_failed_directions",
+            "report.change_evaluation_misses",
+            "report.change_evaluation_risks",
+        }
+        for item in review_ok.violations
+    )
+
+    # Empty == empty check: if BOTH current and historical have empty conditions, status MUST still be unknown!
+    packet_empty_curr = WorkPacketBuilder(repo_root=tmp_path, memory_path=trials_dir).build(
+        failures=[failed_trial()],
+        current_harness={"version": "0.2.0"},
+    )
+    assert packet_empty_curr.change_evaluation_digest["miss_classes"] == []
+    assert packet_empty_curr.change_evaluation_digest["risk_classes"] == []
+    assert packet_empty_curr.runner_pivot_policy["discouraged"] == []
+    assert packet_empty_curr.runner_pivot_policy["layer_pressure"] == []
+
+    # Mixed check: cross-env history + missing required summary or integrity violation still rejected by fatal rules!
+    report_bad = {**report_ok, "summary": ""}
+    review_bad = engine._apply_report_gates(
+        PatchReviewResult(accepted=True, changed_files=["bench/agent.py"]),
+        exit_code=0,
+        final_report=report_bad,
+        required_validation_commands=["pytest tests/ -v"],
+        failure_pattern_digest=packet.failure_pattern_digest,
+        rejected_update_buffer=packet.rejected_update_buffer,
+        runner_pivot_policy=packet.runner_pivot_policy,
+        change_evaluation_digest=packet.change_evaluation_digest,
+        prior_update_lesson_entries=packet.prior_update_lesson_entries,
+    )
+    assert review_bad.accepted is False
+    assert any(item.rule_id == "report.basic_fields" for item in review_bad.violations)
+
+
+def test_change_evaluation_same_condition_pivot_thresholds_still_enforce(tmp_path):
+    """Same-condition evaluation attempts crossing 2 (discouraged) & 3 (layer_pressure) still enforce."""
+    trials_dir = tmp_path / "trials"
+    summaries_dir = trials_dir / "summaries"
+    summaries_dir.mkdir(parents=True)
+    app_conds = _known_eval_conditions(model="deepseek-v4-flash")
+    (summaries_dir / "camp_campaign_state.json").write_text(
+        json.dumps(
+            {
+                "campaign_id": "camp",
+                "failure_class_attempts": [
+                    {
+                        "packet_id": "pkt_app_1",
+                        "failure_class": "same_env_class",
+                        "component_layer": "recovery",
+                        "accepted": True,
+                        "next_eval_result": "prediction_missed",
+                    },
+                    {
+                        "packet_id": "pkt_app_2",
+                        "failure_class": "same_env_class",
+                        "component_layer": "recovery",
+                        "accepted": True,
+                        "next_eval_result": "",
+                    },
+                    {
+                        "packet_id": "pkt_app_3",
+                        "failure_class": "other_same_env_class",
+                        "component_layer": "recovery",
+                        "accepted": True,
+                        "next_eval_result": "",
+                    },
+                ],
+                "change_evaluations": [
+                    {
+                        "packet_id": "pkt_app_1",
+                        "summary_id": "s1",
+                        "outcome": "prediction_missed",
+                        "comparability_conditions": app_conds,
+                    },
+                    {
+                        "packet_id": "pkt_app_2",
+                        "summary_id": "s2",
+                        "outcome": "prediction_missed",
+                        "comparability_conditions": app_conds,
+                    },
+                    {
+                        "packet_id": "pkt_app_3",
+                        "summary_id": "s3",
+                        "outcome": "prediction_missed",
+                        "comparability_conditions": app_conds,
+                    },
+                ],
+            }
+        )
+    )
+
+    packet = WorkPacketBuilder(repo_root=tmp_path, memory_path=trials_dir).build(
+        failures=[_applicable_trial()],
+        current_harness={"version": "0.2.0"},
+    )
+    assert len(packet.runner_pivot_policy["discouraged"]) == 1
+    assert packet.runner_pivot_policy["discouraged"][0]["failure_class"] == "same_env_class"
+    assert len(packet.runner_pivot_policy["layer_pressure"]) == 1
+    assert packet.runner_pivot_policy["layer_pressure"][0]["component_layer"] == "recovery"
+
+

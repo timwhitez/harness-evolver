@@ -49,3 +49,12 @@ def test_untyped_patch_review_reason_gets_stable_internal_rule_id():
             "severity": report_contract.FATAL,
         }
     ]
+
+
+def test_applicability_contract_rules_describe_scoped_evaluation_constraints():
+    rules = {rule.id: rule for rule in report_contract.final_report_rules()}
+    assert "applicable" in rules["report.change_evaluation_misses"].description
+    assert "applicable" in rules["report.change_evaluation_risks"].description
+    assert "applicable" in rules["report.memory_failed_directions"].description
+    assert "applicable" in rules["report.prediction_evidence"].description
+

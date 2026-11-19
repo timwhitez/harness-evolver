@@ -220,7 +220,7 @@ _RULES: tuple[ReportContractRule, ...] = (
     _rule(
         "report.memory_failed_directions",
         REPORT,
-        "memory_record.failed_directions_to_avoid should cover rejected updates, pivot pressure, evaluation misses, and prior failed lessons.",
+        "memory_record.failed_directions_to_avoid should cover actionable rejected updates, applicable pivot pressure, applicable evaluation misses, and applicable failed lessons.",
         "memory_failed_directions",
     ),
     _rule(
@@ -250,19 +250,19 @@ _RULES: tuple[ReportContractRule, ...] = (
     _rule(
         "report.change_evaluation_misses",
         REPORT,
-        "memory_record.failed_directions_to_avoid should reference top change_evaluation_digest.miss_classes.",
+        "memory_record.failed_directions_to_avoid should reference top applicable change_evaluation_digest.miss_classes.",
         "change_evaluation_misses",
     ),
     _rule(
         "report.change_evaluation_risks",
         REPORT,
-        "prediction.risk_task_classes should reference top change_evaluation_digest.risk_classes.",
+        "prediction.risk_task_classes should reference top applicable change_evaluation_digest.risk_classes.",
         "change_evaluation_risks",
     ),
     _rule(
         "report.prediction_evidence",
         REPORT,
-        "prediction.expected_fixed_task_classes should reference a concrete packet failure, evaluation, rejected-update, prior-lesson, or mission label.",
+        "prediction.expected_fixed_task_classes should reference a concrete packet failure, applicable evaluation, actionable rejected-update, applicable prior-lesson, or mission label.",
         "prediction_evidence",
     ),
     _rule(
