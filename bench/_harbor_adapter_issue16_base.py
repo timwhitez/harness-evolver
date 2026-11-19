@@ -1652,7 +1652,7 @@ class HLWorkerHarborAgent(BaseAgent):
             api_key_env=self.api_key_env,
             model=self.model_name or config.model,
             reasoning=ReasoningConfig(
-                effort=self.reasoning_effort or "none",
+                effort=self.reasoning_effort,
                 max_tokens=self.reasoning_max_tokens,
             ),
             max_output_tokens=self.max_output_tokens,

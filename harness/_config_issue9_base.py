@@ -25,8 +25,17 @@ from pydantic import (
 )
 
 
-OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
-OPENAI_COMPATIBLE_REASONING_EFFORTS = OPENAI_REASONING_EFFORTS | {"max"}
+from harness.openai_capabilities import (
+    ALL_REASONING_EFFORTS,
+    VALID_OPENAI_APIS,
+    parse_openai_model_spec,
+    resolve_openai_request_api,
+    validate_openai_effort,
+)
+
+
+OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+OPENAI_COMPATIBLE_REASONING_EFFORTS = set(ALL_REASONING_EFFORTS)
 ANTHROPIC_REASONING_EFFORTS = {
     "none",
     "minimal",
@@ -45,12 +54,14 @@ OPENAI_LIKE_PROVIDERS = OPENAI_NATIVE_PROVIDERS | OPENAI_COMPATIBLE_PROVIDERS
 class ReasoningConfig(BaseModel):
     """Provider-neutral reasoning policy.
 
-    OpenAI-style providers use ``effort``. Anthropic-like providers may also
-    use ``max_tokens`` for extended thinking budgets. ``exclude`` is kept as a
+    OpenAI-style providers use ``effort``. ``None`` means unspecified (use the
+    provider/model default and omit the parameter); ``"none"`` explicitly
+    requests reasoning off. Anthropic-like providers may also use
+    ``max_tokens`` for extended thinking budgets. ``exclude`` is kept as a
     provider-neutral switch for providers that support hiding reasoning traces.
     """
 
-    effort: str | None = "none"
+    effort: str | None = None
     max_tokens: int | None = None
     exclude: bool = False
 
@@ -59,8 +70,8 @@ class ReasoningConfig(BaseModel):
     def validate_effort_name(cls, value: str | None) -> str | None:
         if value is None:
             return value
-        normalized = value.lower()
-        allowed = OPENAI_REASONING_EFFORTS | ANTHROPIC_REASONING_EFFORTS
+        normalized = value.strip().lower()
+        allowed = ALL_REASONING_EFFORTS | ANTHROPIC_REASONING_EFFORTS
         if normalized not in allowed:
             raise ValueError(
                 f"Unsupported reasoning effort {value!r}. Allowed: {sorted(allowed)}"
@@ -80,6 +91,7 @@ class RoleModelConfig(BaseModel):
 
     provider: str | None = None
     runner: str | None = None
+    api: str | None = None
     base_url: str | None = None
     api_key_env: str | None = None
     model: str
@@ -98,20 +110,35 @@ class RoleModelConfig(BaseModel):
     def normalize_provider(cls, value: str | None) -> str | None:
         return value.lower() if value else value
 
+    @field_validator("api")
+    @classmethod
+    def validate_api_surface(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in VALID_OPENAI_APIS:
+            raise ValueError(
+                f"Unsupported API surface {value!r}. Allowed: {sorted(VALID_OPENAI_APIS)}"
+            )
+        return normalized
+
     @model_validator(mode="after")
     def validate_provider_reasoning(self) -> "RoleModelConfig":
         provider = self.provider or self.runner or "openai"
         provider = provider.lower()
-        effort = self.reasoning.effort or "none"
+        effort = self.reasoning.effort
 
-        if provider in OPENAI_NATIVE_PROVIDERS and effort not in OPENAI_REASONING_EFFORTS:
-            raise ValueError(
-                f"Provider {provider!r} does not accept reasoning effort {effort!r}; "
-                f"use one of {sorted(OPENAI_REASONING_EFFORTS)}"
+        if provider in OPENAI_NATIVE_PROVIDERS:
+            validate_openai_effort(
+                provider=provider,
+                model=self.model,
+                effort=effort,
+                api=self.api,
             )
 
         if (
             provider in OPENAI_COMPATIBLE_PROVIDERS
+            and effort is not None
             and effort not in OPENAI_COMPATIBLE_REASONING_EFFORTS
         ):
             raise ValueError(
@@ -119,7 +146,11 @@ class RoleModelConfig(BaseModel):
                 f"use one of {sorted(OPENAI_COMPATIBLE_REASONING_EFFORTS)}"
             )
 
-        if provider in ANTHROPIC_LIKE_PROVIDERS and effort not in ANTHROPIC_REASONING_EFFORTS:
+        if (
+            provider in ANTHROPIC_LIKE_PROVIDERS
+            and effort is not None
+            and effort not in ANTHROPIC_REASONING_EFFORTS
+        ):
             raise ValueError(
                 f"Provider {provider!r} does not accept reasoning effort {effort!r}; "
                 f"use one of {sorted(ANTHROPIC_REASONING_EFFORTS)}"
@@ -144,9 +175,45 @@ class RoleModelConfig(BaseModel):
         data.pop("extra", None)
         return data
 
-    def litellm_kwargs(self) -> dict[str, Any]:
-        """Build kwargs for LiteLLM without exposing raw secrets."""
-        kwargs: dict[str, Any] = {"model": self._litellm_model_name()}
+    def litellm_kwargs(self, *, with_tools: bool = False) -> dict[str, Any]:
+        """Build kwargs for LiteLLM without exposing raw secrets.
+
+        Validates API surface / tool-calling capabilities before returning
+        outbound kwargs, distinguishes omitted effort (``None``) from explicit
+        ``"none"``, and routes Responses-required models (such as GPT-6.2 with
+        tools) through LiteLLM's Responses bridge while preserving effort
+        verbatim.
+        """
+        provider = (self.provider or self.runner or "openai").lower()
+        effort = self.reasoning.effort
+        target_api = self.api or "chat"
+        allowed_params: list[str] = []
+
+        if provider in OPENAI_NATIVE_PROVIDERS:
+            target_api, caps = resolve_openai_request_api(
+                provider=provider,
+                model=self.model,
+                api=self.api,
+                with_tools=with_tools,
+            )
+            if target_api == "responses":
+                prefix = "azure/responses" if provider == "azure_openai" else "openai/responses"
+                model_name = f"{prefix}/{caps.base_model}"
+            else:
+                model_name = self._litellm_model_name()
+        elif provider in OPENAI_COMPATIBLE_PROVIDERS:
+            base_model, prefix_api = parse_openai_model_spec(self.model)
+            target_api = self.api or prefix_api or "chat"
+            if target_api == "responses":
+                model_name = f"openai/responses/{base_model}"
+            else:
+                model_name = self._litellm_model_name()
+            caps = None
+        else:
+            model_name = self._litellm_model_name()
+            caps = None
+
+        kwargs: dict[str, Any] = {"model": model_name}
         if self.base_url:
             kwargs["api_base"] = self.base_url
         if self.api_key_env and os.environ.get(self.api_key_env):
@@ -157,14 +224,45 @@ class RoleModelConfig(BaseModel):
             kwargs["timeout"] = self.timeout_seconds
         if self.max_retries is not None:
             kwargs["num_retries"] = self.max_retries
-        if self.reasoning.effort and self.reasoning.effort != "none":
-            kwargs["reasoning_effort"] = self.reasoning.effort
-            if self._is_deepseek_openai_compatible():
-                kwargs["allowed_openai_params"] = ["reasoning_effort", "thinking"]
-                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+
+        if effort is not None:
+            if provider in OPENAI_NATIVE_PROVIDERS:
+                if target_api == "responses":
+                    # LiteLLM 1.98.x Responses bridge preserves dict {"effort": ...}
+                    # verbatim (including "max" and "none"), whereas string "max"
+                    # is silently dropped by _map_reasoning_effort.
+                    kwargs["reasoning_effort"] = {"effort": effort}
+                else:
+                    kwargs["reasoning_effort"] = effort
+                if caps is not None and caps.needs_allowed_reasoning_param:
+                    allowed_params.append("reasoning_effort")
+            elif provider in OPENAI_COMPATIBLE_PROVIDERS:
+                if target_api == "responses":
+                    kwargs["reasoning_effort"] = {"effort": effort}
+                else:
+                    kwargs["reasoning_effort"] = effort
+                allowed_params.append("reasoning_effort")
+                if effort != "none" and self._is_deepseek_openai_compatible():
+                    allowed_params.append("thinking")
+                    kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            elif effort != "none":
+                kwargs["reasoning_effort"] = effort
+
+        if allowed_params:
+            kwargs["allowed_openai_params"] = allowed_params
         if self.reasoning.max_tokens is not None:
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.reasoning.max_tokens}
-        kwargs.update(self.extra)
+
+        if self.extra:
+            extra_copy = dict(self.extra)
+            extra_allowed = extra_copy.pop("allowed_openai_params", None)
+            if isinstance(extra_allowed, list):
+                merged_allowed = list(kwargs.get("allowed_openai_params") or [])
+                for item in extra_allowed:
+                    if item not in merged_allowed:
+                        merged_allowed.append(item)
+                kwargs["allowed_openai_params"] = merged_allowed
+            kwargs.update(extra_copy)
         return kwargs
 
     def _litellm_model_name(self) -> str:

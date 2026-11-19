@@ -464,8 +464,9 @@ class HLAgent:
         tool_schemas: list[dict[str, Any]],
     ) -> dict[str, Any]:
         self.messages = messages
+        has_tools = bool(tool_schemas)
         if self.role_config is not None:
-            kwargs = self.role_config.litellm_kwargs()
+            kwargs = self.role_config.litellm_kwargs(with_tools=has_tools)
         else:
             kwargs = {"model": self.config.model}
         kwargs.update(
